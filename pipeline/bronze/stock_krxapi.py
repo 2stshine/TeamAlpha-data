@@ -59,7 +59,7 @@ def _fetch(svc: str, basdd: str, key: str, tries: int = 4) -> list[dict]:
             raise
         except Exception:  # noqa: BLE001  (네트워크·JSON blip → 재시도)
             time.sleep(2 * (attempt + 1))
-    return []
+    raise RuntimeError(f"KRX stock API failed after {tries} attempts: svc={svc}, date={basdd}")
 
 
 def _weekdays(fromdate: str, todate: str):
@@ -100,7 +100,7 @@ def run(fromdate: str, todate: str, dest: str) -> None:
     except AuthError as exc:
         print(f"[stock_krxapi] 인증 실패로 중단(키 승인/활성 확인): {exc}")
         print("[stock_krxapi] 승인 후 같은 명령 재실행하면 이어서 진행.")
-        return
+        raise
 
     print(f"[stock_krxapi] 완료: 저장 {saved} / 스킵 {skipped} / 빈응답 {empty}")
 

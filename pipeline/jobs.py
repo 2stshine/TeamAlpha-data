@@ -15,9 +15,15 @@ ECS/Fargate 에서 `--mode daily` 를 EventBridge 로 매일 실행. silver 는 
 from __future__ import annotations
 
 import argparse
-from datetime import date
+from datetime import date, datetime, timedelta
 
-from pipeline.bronze import financials, index, stock_krxapi, stock_marcap
+from pipeline.bronze import (
+    corporate_actions,
+    financials,
+    index,
+    stock_krxapi,
+    stock_marcap,
+)
 from pipeline.silver import load
 
 # silver 는 현재 로컬 bronze(./data)를 읽는다 → dest='local' 일 때 end-to-end.
@@ -29,6 +35,11 @@ def run_backfill(fromyear: int, toyear: int, dest: str) -> None:
     stock_marcap.run(fromyear, toyear, dest)                  # 시세 marcap (전종목·전기간)
     index.run(f"{fromyear}0101", f"{toyear}1231", dest)        # 지수 KRX OpenAPI
     financials.run(fromyear, toyear, dest)                     # 재무 DART
+    corporate_actions.run(
+        f"{fromyear}0101",
+        f"{toyear}1231",
+        dest,
+    )
     if dest == "local":
         load.backfill()                                       # silver 전체 (bronze→RDS)
 
@@ -38,6 +49,10 @@ def run_daily(day: str, dest: str) -> None:
     stock_krxapi.run(day, day, dest)                          # 시세 KRX OpenAPI (지정 날짜)
     index.run(day, day, dest)                                  # 지수 KRX OpenAPI (지정 날짜)
     financials.run(int(day[:4]), int(day[:4]), dest, refresh_existing=True)  # 재무: 당해 연도 재조회 → 신규 공시 반영
+    action_from = (
+        datetime.strptime(day, "%Y%m%d").date() - timedelta(days=14)
+    ).strftime("%Y%m%d")
+    corporate_actions.run(action_from, day, dest)
     if dest == "local":
         load.incremental(day)                                 # silver 증분 (bronze→RDS)
 

@@ -10,13 +10,14 @@ from zoneinfo import ZoneInfo
 
 import boto3
 
-from pipeline.bronze import financials, index, stock_krxapi
+from pipeline.bronze import corporate_actions, financials, index, stock_krxapi
 from pipeline.common.paths import base_uri, ymd_to_dash
 from pipeline.silver import load
 
 
 KST = ZoneInfo("Asia/Seoul")
 EXPECTED_STOCK_FILES = {"kospi.parquet", "kosdaq.parquet"}
+EXPECTED_INDEX_FILES = {"krx.parquet", "kospi.parquet", "kosdaq.parquet"}
 
 
 def _target_day() -> str:
@@ -75,10 +76,13 @@ def _assert_complete_daily_market(stock_keys: list[str], index_keys: list[str], 
     if not index_keys and not stock_files:
         return
     missing = EXPECTED_STOCK_FILES - stock_files
-    if missing:
+    index_files = {Path(key).name for key in index_keys}
+    missing_index = EXPECTED_INDEX_FILES - index_files
+    if missing or missing_index:
         raise RuntimeError(
-            f"incomplete stock bronze for {ds}: missing {sorted(missing)} "
-            f"(stock={sorted(stock_files)}, index_files={len(index_keys)})"
+            f"incomplete market bronze for {ds}: "
+            f"missing_stock={sorted(missing)}, missing_index={sorted(missing_index)} "
+            f"(stock={sorted(stock_files)}, index={sorted(index_files)})"
         )
 
 
@@ -94,21 +98,45 @@ def main() -> None:
     changed_financial_uris = financials.run(int(day[:4]), int(day[:4]), "s3", refresh_existing=True)
     changed_financial_keys = [_key_from_s3_uri(uri) for uri in changed_financial_uris]
     print(f"[daily] changed financial files={len(changed_financial_keys)}", flush=True)
+    action_from = (
+        datetime.strptime(day, "%Y%m%d").date() - timedelta(days=14)
+    ).strftime("%Y%m%d")
+    changed_action_uris = corporate_actions.run(action_from, day, "s3")
+    changed_action_keys = [
+        _key_from_s3_uri(uri) for uri in changed_action_uris
+    ]
+    action_disclosure_manifest = (
+        "corporate_actions/dart/manifests/"
+        f"from={action_from}/to={day}/disclosures.json"
+    )
+    if action_disclosure_manifest not in changed_action_keys:
+        changed_action_keys.append(action_disclosure_manifest)
+    print(
+        f"[daily] changed corporate-action files={len(changed_action_keys)}",
+        flush=True,
+    )
 
     stock_keys = _list_prefix(bucket, f"stock/krxapi/date={ds}/")
     index_keys = _list_prefix(bucket, f"index/krxapi/date={ds}/")
     _assert_complete_daily_market(stock_keys, index_keys, ds)
+    market_closed = not stock_keys and not index_keys
 
     keys = ["financials/dart/corpCode.xml"]
     keys += stock_keys
     keys += index_keys
     keys += changed_financial_keys
+    keys += changed_action_keys
 
     local_paths = _download_keys(bucket, keys, root)
     financial_files = [p for p in local_paths if "/financials/dart/year=" in p]
 
     print(f"[silver] incremental start day={day}, financial_files={len(financial_files)}", flush=True)
-    load.incremental(day, "local", financial_files=financial_files)
+    load.incremental(
+        day,
+        "local",
+        financial_files=financial_files,
+        market_closed=market_closed,
+    )
     print(f"[silver] incremental complete day={day}", flush=True)
 
 

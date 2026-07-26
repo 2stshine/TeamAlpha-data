@@ -14,3 +14,15 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "postgres: requires TEST_DATABASE_URL",
+]

@@ -31,7 +31,12 @@ from xml.etree import ElementTree as ET
 import requests
 
 from pipeline.common.paths import base_uri
-from pipeline.common.sink import exists, write_bytes, write_text_if_changed
+from pipeline.common.sink import (
+    exists,
+    read_bytes,
+    write_bytes,
+    write_text_if_changed,
+)
 
 CORPCODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 MULTI_URL = "https://opendart.fss.or.kr/api/fnlttMultiAcnt.json"
@@ -79,12 +84,12 @@ def load_listed_corps_from_bronze(base: str) -> list[tuple[str, str]]:
 def ensure_corp_code_xml(base: str) -> list[tuple[str, str]]:
     """bronze corpCode.xml 이 있으면 읽고, 없으면 다운로드해 저장한 뒤 파싱한다."""
     dest = f"{base}/{CORPCODE_BRONZE_PATH}"
-    if not base.startswith("s3://") and exists(dest):
-        return load_listed_corps_from_bronze(base)
+    existing = read_bytes(dest)
+    if existing is not None:
+        return _parse_listed_corps(existing)
 
     xml_bytes = _download_corp_code_xml()
-    if not exists(dest):
-        write_bytes(xml_bytes, dest)
+    write_bytes(xml_bytes, dest)
     return _parse_listed_corps(xml_bytes)
 
 
@@ -146,7 +151,7 @@ def run(fromyear: int, toyear: int, dest: str, refresh_existing: bool = False) -
     except QuotaExceeded as exc:
         print(f"[financials] 사용한도 초과로 중단: {exc} — 저장 {saved} / 변경없음 {unchanged} / 스킵 {skipped} / 무데이터 {nodata}")
         print("[financials] 내일 같은 명령으로 재개하면 이어서 받음.")
-        return changed_paths
+        raise
 
     print(f"[financials] 완료: 저장 {saved} / 변경없음 {unchanged} / 스킵 {skipped} / 무데이터 {nodata}")
     return changed_paths

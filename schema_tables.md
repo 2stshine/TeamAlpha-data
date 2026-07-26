@@ -3,7 +3,7 @@
 silver(PostgreSQL/RDS)는 bronze(S3)를 정규화해 적재한다. `asset_id`를 중심으로 가격·재무를 연결한다.
 현재 소스는 KRX·DART지만, **`asset_identifier`와 `source` 컬럼으로 소스 추가에 열려 있다.**
 
-**테이블 4.** (구 설계의 `shares_outstanding`은 `price_daily`에 흡수, `dart_fetch_status`·`index_membership`·`fundamental.raw`·뷰는 제거 — 뷰는 필요해지면 추가.)
+핵심 Silver 테이블은 4개이며, 모든 publish는 `dq_run`의 품질 실행과 연결된다.
 
 ```mermaid
 erDiagram
@@ -21,6 +21,8 @@ erDiagram
 | `asset_type` | `TEXT` | `stock` \| `index` |
 | `exchange` | `TEXT` | 예: `KRX` (해외소스 대비) |
 | `currency` | `TEXT` | 예: `KRW` |
+| `quality_run_id` | `UUID` | 이 행을 인증한 `dq_run` |
+| `loaded_at` | `TIMESTAMPTZ` | Silver 반영 시각 |
 
 ## 2. asset_identifier — 소스별 코드 매핑 (확장점)
 
@@ -29,6 +31,7 @@ erDiagram
 | `asset_id` | `BIGINT` | → `asset` |
 | `source` | `TEXT` | `KRX` \| `DART` \| (향후 `YAHOO`·`SEC`…) |
 | `identifier` | `TEXT` | 해당 소스 코드. KRX=`005930`, DART=`00126380` |
+| `quality_run_id` | `UUID` | 이 매핑을 인증한 `dq_run` |
 
 - PK `(asset_id, source, identifier)` · lookup idx `(source, identifier)`
 
@@ -46,6 +49,7 @@ erDiagram
 | `shares` | `BIGINT` | 상장주식수 (index는 NULL) |
 | `market_cap` | `NUMERIC(24,2)` | 시가총액. index는 구성종목 시총 합계 (NULL 아님) |
 | `market` | `TEXT` | 날짜별 시장 구분. `KOSPI` \| `KOSDAQ` \| `KONEX` (index는 NULL) |
+| `quality_run_id` | `UUID` | 이 가격 배치를 인증한 `dq_run` |
 
 - PK `(asset_id, source, trade_date)`
 - **지수**는 `asset_type='index'`로 여기 저장 — `adj_close=close`, `shares`는 NULL. `market_cap`은 구성종목 시총 합계가 들어간다.
@@ -68,8 +72,13 @@ erDiagram
 | `available_date` | `DATE` | PIT 사용가능일 (아래 규칙) |
 | `metric` | `TEXT` | 표준지표. `revenue`·`net_income`·`total_equity`… |
 | `value` | `NUMERIC(20,2)` | 값 |
+| `currency` | `TEXT` | DART 원천의 보고 통화 |
+| `revision_key` | `TEXT` | 수정 공시를 보존하는 버전 키 |
+| `quality_run_id` | `UUID` | 이 재무 배치를 인증한 `dq_run` |
 
-- PK `(asset_id, source, period_end, fiscal_period, fs_type, metric)` · PIT idx `(asset_id, metric, available_date)`
+- PK `(asset_id, source, period_end, fiscal_period, fs_type, revision_key, metric)`
+- `fundamental_current`는 각 metric의 최신 revision 호환 뷰다.
+- PIT idx `(asset_id, metric, available_date)`
 
 **`available_date` 규칙(DART)**: 접수일 있으면 `filed+1일`; 없으면 법정기한+1일(FY=`period_end+90일`, 분기/반기=`period_end+45일`, 주말이면 다음 월요일 보정 후 +1일).
 

@@ -28,7 +28,8 @@ KRX OpenAPI / OpenDART / marcap
 ├── pipeline/                     # 수집, 동기화, silver 적재 코드
 │   ├── bronze/                   # S3 bronze 원천 데이터 수집기
 │   ├── common/                   # 경로, 저장, DB 공통 유틸
-│   └── silver/                   # RDS silver 정규화/적재
+│   ├── silver/                   # RDS silver 후보 생성/적재
+│   └── silver_quality/           # 품질 규칙, DQ 이력, staging/backfill
 ├── sql/schema.sql                # RDS silver schema
 ├── schema_tables.md              # silver 테이블 설계 상세 문서
 ├── pyproject.toml                # Python 프로젝트/의존성 설정
@@ -146,6 +147,26 @@ financials/
         11013.json   # Q1
         11012.json   # Q2
         11014.json   # Q3
+
+corporate_actions/
+  dart/
+    disclosures/
+      year=YYYY/date=YYYY-MM-DD/corp=<ticker>/
+        rcept=<접수번호>.json
+    structured/
+      event=<행사종류>/year=YYYY/corp=<ticker>/
+        rcept=<접수번호>.json
+    documents/
+      year=YYYY/corp=<ticker>/
+        rcept=<접수번호>.zip
+    documents_unavailable/
+      year=YYYY/corp=<ticker>/
+        rcept=<접수번호>.xml  # DART status=014 원문
+    manifests/
+      from=YYYYMMDD/to=YYYYMMDD/
+        disclosures.json
+        structured_complete.json
+        documents_complete.json
 ```
 
 bronze 원칙:
@@ -155,6 +176,15 @@ bronze 원칙:
 - `stock/marcap`은 과거 주식 가격 백필에 사용합니다.
 - `stock/krxapi`, `index/krxapi`는 daily 증분 적재에 사용합니다.
 - `financials/dart/corpCode.xml`은 bronze에 저장하고 silver에서 재사용합니다.
+- DART 공시 목록과 유상·무상증자, 감자, 합병·분할, 주식교환의
+  구조화 API 응답은 JSON 원문으로 저장합니다.
+- 액면분할·병합, 권리락·배당락처럼 가격조정 효력일·비율 확인에 원문이
+  필요한 공시는 `document.xml` 응답인 ZIP도 함께 저장합니다. 배당결정,
+  변경상장, 거래정지·상장폐지는 목록 JSON을 보존하되 ZIP은 받지 않습니다.
+- 목록에는 있지만 DART 원문 파일이 없는 `status=014` 응답은
+  `documents_unavailable`에 원문 XML로 기록하고 재요청하지 않습니다.
+- 기간별 manifest와 단계 완료 marker를 저장해 중단 후 완료된 API 단계를
+  반복 호출하지 않고 재개합니다.
 
 ## RDS Silver 구조
 
@@ -203,8 +233,9 @@ python -m pipeline.daily_full
 1. 대상 날짜의 주식/지수 bronze 데이터를 S3에 저장합니다.
 2. 당해 연도 DART 데이터를 확인하고, 변경된 JSON만 S3에 다시 저장합니다.
 3. 필요한 S3 객체만 ECS 컨테이너의 `/app/data`로 다운로드합니다.
-4. RDS에서 대상 날짜의 기존 `price_daily`를 삭제합니다.
-5. `price_daily`와 변경된 `fundamental`을 upsert합니다.
+4. Silver 후보 데이터를 생성하고 자동 품질 검사를 수행합니다.
+5. Critical/Error가 없을 때만 대상 날짜 교체와 upsert를 하나의 transaction으로 반영합니다.
+6. 실패하면 기존 Silver를 유지하고 `dq_run`·`dq_result`에 원인을 기록합니다.
 
 KRX OpenAPI는 당일 데이터를 안정적으로 제공하지 않기 때문에 다음날 오전에 전날 데이터를 가져옵니다.
 
@@ -246,6 +277,37 @@ aws sso login --profile <aws-profile>
 uv run python -m compileall -q pipeline
 ```
 
+Silver quality DB migration:
+
+```bash
+uv run python -m pipeline.silver_quality.migrate
+```
+
+운영 배포에서는 새 daily task를 실행하기 전에 이 migration을 one-off ECS task로 먼저
+적용해야 합니다. migration이 없으면 daily task는 Silver를 변경하지 않고 즉시 실패합니다.
+
+최초 Silver backfill:
+
+```bash
+uv run python -m pipeline.silver_quality.s3_backfill
+# 실패 원인을 수정한 뒤 같은 S3 candidate에서 재개
+uv run python -m pipeline.silver_quality.s3_backfill --resume <dq-run-uuid>
+```
+
+기존 Silver 품질 감사:
+
+```bash
+uv run python -m pipeline.silver_quality.audit --scope all
+```
+
+최초 backfill은 연도별 Silver 후보를 S3
+`quality/candidates/silver-backfill/run=<run-id>/`에 Parquet으로 고정합니다.
+연도 내부와 전체 기간 검사를 모두 통과한 뒤에만 RDS Silver를 월·연도 단위의
+제한된 트랜잭션으로 적재하고 `CERTIFIED`로 변경합니다. RDS `quality_stage`에는
+전체 후보를 누적하지 않습니다. 일별 `pipeline.daily_full`과 수동 incremental도
+동일한 품질 게이트를 자동 실행하며 우회 옵션은 없습니다. 규칙과 severity는
+[`pipeline/silver_quality/README.md`](pipeline/silver_quality/README.md)에 정리되어 있습니다.
+
 특정 날짜를 production daily 방식으로 실행:
 
 ```bash
@@ -259,6 +321,7 @@ uv run python -m pipeline.bronze.stock_marcap --from 2015 --to 2026 --dest s3
 uv run python -m pipeline.bronze.stock_krxapi --from 20260713 --to 20260713 --dest s3
 uv run python -m pipeline.bronze.index --from 20260713 --to 20260713 --dest s3
 uv run python -m pipeline.bronze.financials --from 2026 --to 2026 --dest s3
+uv run python -m pipeline.bronze.corporate_actions --from 20150101 --to 20260713 --dest s3
 ```
 
 로컬 `./data`에서 silver 적재:
@@ -293,11 +356,12 @@ docker buildx build \
 
 `main` 브랜치에 push하면 다음 작업이 실행됩니다.
 
-1. GitHub OIDC로 AWS deploy role을 assume합니다.
-2. `linux/amd64` Docker 이미지를 빌드합니다.
-3. ECR에 commit SHA 태그와 `latest` 태그를 push합니다.
-4. ECS task definition 새 revision을 등록합니다.
-5. EventBridge Scheduler target을 새 task definition으로 갱신합니다.
+1. PostgreSQL integration test를 포함한 전체 pytest를 실행합니다.
+2. GitHub OIDC로 AWS deploy role을 assume합니다.
+3. `linux/amd64` Docker 이미지를 빌드합니다.
+4. ECR에 commit SHA 태그와 `latest` 태그를 push합니다.
+5. ECS task definition 새 revision을 등록합니다.
+6. EventBridge Scheduler target을 새 task definition으로 갱신합니다.
 
 필요한 GitHub secret:
 

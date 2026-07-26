@@ -339,7 +339,7 @@ def test_reciprocal_share_change_explains_scale_jump_as_krx_structure():
     assert _failed(results, "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT") == 1
 
 
-def test_special_trading_event_keeps_return_warning_but_not_scale_warning():
+def test_special_trading_event_is_info_not_return_or_scale_warning():
     frame = _valid_prices({
         "open": 10.0,
         "high": 10.0,
@@ -377,7 +377,7 @@ def test_special_trading_event_keeps_return_warning_but_not_scale_warning():
     )
 
     assert _failed(results, "PRICE_SCALE_JUMP") == 0
-    assert _failed(results, "PRICE_RETURN_SPIKE") == 1
+    assert _failed(results, "PRICE_RETURN_SPIKE") == 0
     special = next(
         r for r in results if r.rule_code == "SPECIAL_TRADING_EVENT"
     )

@@ -100,6 +100,7 @@ def _attach_special_trading_evidence(
     frame["dart_special_event_confirmed"] = False
     frame["dart_special_event_type"] = None
     frame["dart_special_rcept_no"] = None
+    frame["dart_special_match_days"] = np.nan
     if corporate_actions is None or corporate_actions.empty:
         return frame
     required = {
@@ -124,6 +125,8 @@ def _attach_special_trading_evidence(
             title.str.contains("정리매매", na=False)
             | title.str.contains("거래정지해제", na=False)
             | title.str.contains("상장폐지", na=False)
+            | title.str.contains("재상장", na=False)
+            | title.str.contains("변경상장", na=False)
         )
     ]
     if events.empty:
@@ -132,16 +135,15 @@ def _attach_special_trading_evidence(
         identifier: group.to_dict("records")
         for identifier, group in events.groupby("identifier", sort=False)
     }
-    ratios = frame["close"] / frame["previous_close"].replace(0, np.nan)
-    scale_like = pd.Series(False, index=frame.index)
-    for target in (0.01, 0.1, 10.0, 100.0):
-        scale_like |= ((ratios - target).abs() / target).le(0.005)
-    candidates = frame[frame["asset_type"].eq("stock") & scale_like]
+    candidates = frame[
+        frame["asset_type"].eq("stock")
+        & frame["economic_return"].abs().gt(0.305)
+    ]
     for index, row in candidates.iterrows():
         matches = []
         for event in by_identifier.get(str(row["identifier"]), []):
             distance = (row["trade_date"] - event["announcement_date"]).days
-            if 0 <= distance <= 10:
+            if 0 <= distance <= 30:
                 matches.append((distance, event))
         if not matches:
             continue
@@ -152,6 +154,7 @@ def _attach_special_trading_evidence(
         frame.at[index, "dart_special_event_confirmed"] = True
         frame.at[index, "dart_special_event_type"] = event.get("event_type")
         frame.at[index, "dart_special_rcept_no"] = event.get("rcept_no")
+        frame.at[index, "dart_special_match_days"] = distance
     return frame
 
 
@@ -483,16 +486,16 @@ def check_prices(
         combined,
         corporate_actions,
     )
-    combined = _attach_special_trading_evidence(
-        combined,
-        corporate_actions,
-    )
     adjusted_previous = combined["previous_close"] * (
         combined["source_adjustment_factor"]
         .where(combined["source_factor_applied"], 1.0)
     )
     combined["economic_return"] = (
         combined["close"] / adjusted_previous.replace(0, np.nan) - 1
+    )
+    combined = _attach_special_trading_evidence(
+        combined,
+        corporate_actions,
     )
     combined["previous_economic_return"] = (
         combined.groupby("identifier")["economic_return"].shift(1)
@@ -504,6 +507,11 @@ def check_prices(
     )
     combined["previous_dart_event_confirmed"] = (
         combined.groupby("identifier")["dart_event_confirmed"]
+        .shift(1)
+        .eq(True)
+    )
+    combined["previous_dart_special_event_confirmed"] = (
+        combined.groupby("identifier")["dart_special_event_confirmed"]
         .shift(1)
         .eq(True)
     )
@@ -603,7 +611,13 @@ def check_prices(
         partition_key=partition_key,
     ))
 
-    spike = current[current["economic_return"].abs().gt(0.305)]
+    all_spikes = current[current["economic_return"].abs().gt(0.305)]
+    special_spikes = all_spikes[
+        all_spikes["dart_special_event_confirmed"]
+    ]
+    spike = all_spikes[
+        ~all_spikes["dart_special_event_confirmed"]
+    ]
     checks.append(result(
         "PRICE_RETURN_SPIKE", "price_daily", Severity.WARNING, spike,
         "absolute corporate-action-adjusted return <= 30.5%",
@@ -613,6 +627,8 @@ def check_prices(
         current["previous_economic_return"].abs().gt(0.305)
         & ~current["dart_event_confirmed"]
         & ~current["previous_dart_event_confirmed"]
+        & ~current["dart_special_event_confirmed"]
+        & ~current["previous_dart_special_event_confirmed"]
         & ((current["close"] / current["lag2_close"] - 1).abs().le(0.05))
     ]
     checks.append(result(
@@ -664,15 +680,9 @@ def check_prices(
         samples=inferred_samples,
         partition_key=partition_key,
     ))
-    special_scale = current[
-        scale_mask
-        & current["dart_special_event_confirmed"]
-        & ~current["dart_event_confirmed"]
-        & ~krx_structure_confirmed
-    ]
     special_samples = (
-        special_scale.head(20).astype(object)
-        .where(pd.notna(special_scale.head(20)), None)
+        special_spikes.head(20).astype(object)
+        .where(pd.notna(special_spikes.head(20)), None)
         .to_dict("records")
     )
     checks.append(CheckResult(
@@ -680,8 +690,11 @@ def check_prices(
         dataset="price_daily",
         severity=Severity.INFO,
         status=CheckStatus.PASS,
-        expected="DART delisting/resumption evidence explains an actual scale move",
-        actual=f"observed_events={len(special_scale)}",
+        expected=(
+            "DART delisting/resumption evidence explains an actual "
+            ">30.5% price move"
+        ),
+        actual=f"observed_events={len(special_spikes)}",
         failed_count=0,
         samples=special_samples,
         partition_key=partition_key,

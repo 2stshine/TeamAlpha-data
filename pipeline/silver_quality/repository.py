@@ -233,14 +233,15 @@ def update_status(conn, run_id: UUID, status: str, *, commit: bool = True) -> No
 def recent_price_history(conn, identifiers: list[str], before_date, days: int = 20) -> pd.DataFrame:
     if not identifiers:
         return pd.DataFrame(columns=[
-            "identifier", "trade_date", "close", "adj_close", "market", "asset_type",
+            "identifier", "trade_date", "close", "adj_close", "market",
+            "asset_type", "shares", "market_cap",
         ])
     with conn.cursor() as cur:
         cur.execute(
             """
             WITH ranked AS (
                 SELECT ai.identifier, p.trade_date, p.close, p.adj_close,
-                       p.market, a.asset_type,
+                       p.market, a.asset_type, p.shares, p.market_cap,
                        row_number() OVER (
                            PARTITION BY ai.identifier ORDER BY p.trade_date DESC
                        ) AS rn
@@ -251,7 +252,8 @@ def recent_price_history(conn, identifiers: list[str], before_date, days: int = 
                 WHERE p.source='KRX' AND p.trade_date < %s
                   AND ai.identifier = ANY(%s)
             )
-            SELECT identifier, trade_date, close, adj_close, market, asset_type
+            SELECT identifier, trade_date, close, adj_close, market, asset_type,
+                   shares, market_cap
             FROM ranked WHERE rn <= %s
             """,
             (before_date, identifiers, days),
@@ -259,6 +261,7 @@ def recent_price_history(conn, identifiers: list[str], before_date, days: int = 
         rows = cur.fetchall()
     return pd.DataFrame(rows, columns=[
         "identifier", "trade_date", "close", "adj_close", "market", "asset_type",
+        "shares", "market_cap",
     ])
 
 

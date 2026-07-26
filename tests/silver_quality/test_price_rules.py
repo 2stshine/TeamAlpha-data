@@ -304,6 +304,87 @@ def test_unconfirmed_krx_adjustment_is_warning():
     assert _failed(results, "PRICE_SCALE_JUMP") == 1
 
 
+def test_reciprocal_share_change_explains_scale_jump_as_krx_structure():
+    frame = _valid_prices({
+        "open": 1_000.0,
+        "high": 1_050.0,
+        "low": 950.0,
+        "close": 1_000.0,
+        "adj_close": 1_000.0,
+        "shares": 100,
+        "market_cap": 100_000.0,
+        "prev_diff": 0.0,
+        "fluc_rate": 0.0,
+    })
+    history = pd.DataFrame([{
+        "identifier": "005930",
+        "trade_date": date(2026, 7, 7),
+        "close": 100.0,
+        "adj_close": 1_000.0,
+        "market": "KOSPI",
+        "asset_type": "stock",
+        "shares": 1_000,
+        "market_cap": 100_000.0,
+    }])
+    results = check_prices(frame, target_date=DAY, history=history)
+
+    assert _failed(results, "PRICE_SCALE_JUMP") == 0
+    inferred = next(
+        r for r in results
+        if r.rule_code == "CORPORATE_ACTION_INFERRED_FROM_KRX_STRUCTURE"
+    )
+    assert inferred.status.value == "PASS"
+    assert "observed_events=1" in inferred.actual
+    # DART coverage is still independently visible.
+    assert _failed(results, "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT") == 1
+
+
+def test_special_trading_event_keeps_return_warning_but_not_scale_warning():
+    frame = _valid_prices({
+        "open": 10.0,
+        "high": 10.0,
+        "low": 10.0,
+        "close": 10.0,
+        "adj_close": 10.0,
+        "shares": 1_000,
+        "market_cap": 10_000.0,
+        "prev_diff": -90.0,
+        "fluc_rate": -90.0,
+    })
+    history = pd.DataFrame([{
+        "identifier": "005930",
+        "trade_date": date(2026, 7, 7),
+        "close": 100.0,
+        "adj_close": 100.0,
+        "market": "KOSPI",
+        "asset_type": "stock",
+        "shares": 1_000,
+        "market_cap": 100_000.0,
+    }])
+    action = _action(
+        event_type="delisting",
+        announcement_date=date(2026, 7, 5),
+        effective_date=None,
+        match_window_days=0,
+        expects_price_adjustment=False,
+        report_name="상장폐지에 따른 정리매매 개시",
+    )
+    results = check_prices(
+        frame,
+        target_date=DAY,
+        history=history,
+        corporate_actions=action,
+    )
+
+    assert _failed(results, "PRICE_SCALE_JUMP") == 0
+    assert _failed(results, "PRICE_RETURN_SPIKE") == 1
+    special = next(
+        r for r in results if r.rule_code == "SPECIAL_TRADING_EVENT"
+    )
+    assert special.status.value == "PASS"
+    assert "observed_events=1" in special.actual
+
+
 def test_dart_factor_mismatch_is_warning():
     frame = _valid_prices({
         "open": 1_000.0,

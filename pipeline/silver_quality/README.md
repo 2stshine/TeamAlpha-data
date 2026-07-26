@@ -30,7 +30,9 @@ temporary staging과 단일 publish transaction을 유지한다.
 | `ADJ_CLOSE_POST_PUBLISH` | Critical | 일별 소급조정 후 RDS 직전·당일 행을 commit 전에 재검증 |
 | `PRICE_RETURN_SPIKE` | Warning | KRX 기준가 조정 후 일간 절대수익률 30.5% 초과 |
 | `PRICE_ROUND_TRIP_SPIKE` | Warning | 급등락 후 3일 내 원래 가격 복귀 |
-| `PRICE_SCALE_JUMP` | Warning | 기업행사로 설명되지 않는 10배·100배 단위 변화 |
+| `PRICE_SCALE_JUMP` | Warning | DART·KRX 주식수/시총·특별거래로 설명되지 않는 10배·100배 단위 변화 |
+| `CORPORATE_ACTION_INFERRED_FROM_KRX_STRUCTURE` | Info/Pass | 가격과 주식수가 반대로 10배·100배 변하고 시가총액이 유지된 구조변경 |
+| `SPECIAL_TRADING_EVENT` | Info/Pass | 정리매매·거래재개 공시로 설명되는 실제 큰 가격 변화 |
 | `PRICE_ADJUSTMENT_FACTOR_CHANGE` | Info/Pass | KRX 기준가 수정계수 0.5% 초과 기업행사 기록 |
 | `PRICE_ADJUSTMENT_WITHOUT_DART_EVENT` | Warning | 0.5% 초과 KRX 조정계수에 인접한 DART 기업행사 근거가 없음 |
 | `CORPORATE_ACTION_FACTOR_MISMATCH` | Warning | 계산 가능한 DART 주식수 조정계수와 KRX 계수가 2% 초과 불일치 |

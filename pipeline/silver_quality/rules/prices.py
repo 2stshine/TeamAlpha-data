@@ -91,6 +91,70 @@ def _attach_corporate_action_evidence(
     return frame
 
 
+def _attach_special_trading_evidence(
+    frame: pd.DataFrame,
+    corporate_actions: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """정리매매·거래재개처럼 큰 실제 수익률을 설명하는 DART 근거를 붙인다."""
+    frame = frame.copy()
+    frame["dart_special_event_confirmed"] = False
+    frame["dart_special_event_type"] = None
+    frame["dart_special_rcept_no"] = None
+    if corporate_actions is None or corporate_actions.empty:
+        return frame
+    required = {
+        "identifier",
+        "event_type",
+        "announcement_date",
+        "rcept_no",
+        "report_name",
+    }
+    if not required.issubset(corporate_actions.columns):
+        return frame
+    events = corporate_actions.copy()
+    events["identifier"] = events["identifier"].astype(str)
+    events["announcement_date"] = pd.to_datetime(
+        events["announcement_date"],
+        errors="coerce",
+    ).dt.date
+    title = events["report_name"].astype(str)
+    events = events[
+        events["announcement_date"].notna()
+        & (
+            title.str.contains("정리매매", na=False)
+            | title.str.contains("거래정지해제", na=False)
+            | title.str.contains("상장폐지", na=False)
+        )
+    ]
+    if events.empty:
+        return frame
+    by_identifier = {
+        identifier: group.to_dict("records")
+        for identifier, group in events.groupby("identifier", sort=False)
+    }
+    ratios = frame["close"] / frame["previous_close"].replace(0, np.nan)
+    scale_like = pd.Series(False, index=frame.index)
+    for target in (0.01, 0.1, 10.0, 100.0):
+        scale_like |= ((ratios - target).abs() / target).le(0.005)
+    candidates = frame[frame["asset_type"].eq("stock") & scale_like]
+    for index, row in candidates.iterrows():
+        matches = []
+        for event in by_identifier.get(str(row["identifier"]), []):
+            distance = (row["trade_date"] - event["announcement_date"]).days
+            if 0 <= distance <= 10:
+                matches.append((distance, event))
+        if not matches:
+            continue
+        distance, event = min(
+            matches,
+            key=lambda item: (item[0], str(item[1].get("rcept_no") or "")),
+        )
+        frame.at[index, "dart_special_event_confirmed"] = True
+        frame.at[index, "dart_special_event_type"] = event.get("event_type")
+        frame.at[index, "dart_special_rcept_no"] = event.get("rcept_no")
+    return frame
+
+
 def _dart_actions_without_krx_adjustment(
     frame: pd.DataFrame,
     corporate_actions: pd.DataFrame | None,
@@ -369,7 +433,7 @@ def check_prices(
 
     series_columns = [
         "identifier", "trade_date", "close", "adj_close", "market", "asset_type",
-        "prev_diff",
+        "prev_diff", "shares", "market_cap",
     ]
     combined = prices[series_columns].copy()
     if history is not None and not history.empty:
@@ -382,11 +446,19 @@ def check_prices(
             historic["asset_type"] = "stock"
         if "prev_diff" not in historic:
             historic["prev_diff"] = np.nan
+        if "shares" not in historic:
+            historic["shares"] = np.nan
+        if "market_cap" not in historic:
+            historic["market_cap"] = np.nan
         combined = pd.concat([historic[series_columns], combined], ignore_index=True)
-    for column in ("close", "adj_close", "prev_diff"):
+    for column in ("close", "adj_close", "prev_diff", "shares", "market_cap"):
         combined[column] = pd.to_numeric(combined[column], errors="coerce")
     combined = combined.sort_values(["identifier", "trade_date"])
     combined["previous_close"] = combined.groupby("identifier")["close"].shift(1)
+    combined["previous_shares"] = combined.groupby("identifier")["shares"].shift(1)
+    combined["previous_market_cap"] = (
+        combined.groupby("identifier")["market_cap"].shift(1)
+    )
     combined["lag2_close"] = combined.groupby("identifier")["close"].shift(2)
     combined["return"] = combined["close"] / combined["previous_close"] - 1
     combined["previous_return"] = combined.groupby("identifier")["return"].shift(1)
@@ -408,6 +480,10 @@ def check_prices(
     )
     combined["identifier"] = combined["identifier"].astype(str)
     combined = _attach_corporate_action_evidence(
+        combined,
+        corporate_actions,
+    )
+    combined = _attach_special_trading_evidence(
         combined,
         corporate_actions,
     )
@@ -548,8 +624,73 @@ def check_prices(
     scale_mask = pd.Series(False, index=current.index)
     for target in (0.01, 0.1, 10.0, 100.0):
         scale_mask |= ((ratios - target).abs() / target).le(0.005)
+    share_ratios = (
+        current["shares"]
+        / current["previous_shares"].replace(0, np.nan)
+    )
+    market_cap_ratios = (
+        current["market_cap"]
+        / current["previous_market_cap"].replace(0, np.nan)
+    )
+    krx_structure_confirmed = (
+        current["source_adjustment_event"]
+        & ratios.notna()
+        & share_ratios.notna()
+        & market_cap_ratios.notna()
+        & (ratios * share_ratios).sub(1).abs().le(0.005)
+        & market_cap_ratios.sub(1).abs().le(0.02)
+    )
+    inferred_structure = current[
+        scale_mask
+        & krx_structure_confirmed
+        & ~current["dart_event_confirmed"]
+    ]
+    inferred_samples = (
+        inferred_structure.head(20).astype(object)
+        .where(pd.notna(inferred_structure.head(20)), None)
+        .to_dict("records")
+    )
+    checks.append(CheckResult(
+        rule_code="CORPORATE_ACTION_INFERRED_FROM_KRX_STRUCTURE",
+        dataset="price_daily",
+        severity=Severity.INFO,
+        status=CheckStatus.PASS,
+        expected=(
+            "10x/100x price and reciprocal share-count changes preserve "
+            "market capitalization"
+        ),
+        actual=f"observed_events={len(inferred_structure)}",
+        failed_count=0,
+        samples=inferred_samples,
+        partition_key=partition_key,
+    ))
+    special_scale = current[
+        scale_mask
+        & current["dart_special_event_confirmed"]
+        & ~current["dart_event_confirmed"]
+        & ~krx_structure_confirmed
+    ]
+    special_samples = (
+        special_scale.head(20).astype(object)
+        .where(pd.notna(special_scale.head(20)), None)
+        .to_dict("records")
+    )
+    checks.append(CheckResult(
+        rule_code="SPECIAL_TRADING_EVENT",
+        dataset="price_daily",
+        severity=Severity.INFO,
+        status=CheckStatus.PASS,
+        expected="DART delisting/resumption evidence explains an actual scale move",
+        actual=f"observed_events={len(special_scale)}",
+        failed_count=0,
+        samples=special_samples,
+        partition_key=partition_key,
+    ))
     scale = current[
-        scale_mask & ~current["dart_event_confirmed"]
+        scale_mask
+        & ~current["dart_event_confirmed"]
+        & ~krx_structure_confirmed
+        & ~current["dart_special_event_confirmed"]
     ]
     checks.append(result(
         "PRICE_SCALE_JUMP", "price_daily", Severity.WARNING, scale,

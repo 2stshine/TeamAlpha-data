@@ -28,11 +28,12 @@ temporary staging과 단일 publish transaction을 유지한다.
 | `ADJ_CLOSE_RECONCILIATION` | Error | 전체 시계열 수정종가를 독립 재계산해 소수 4자리 값 대사 |
 | `ADJ_CLOSE_RETURN_CONTINUITY` | Error | 기업행사 전후 수정주가 수익률과 KRX 기준가 수익률 일치 |
 | `ADJ_CLOSE_POST_PUBLISH` | Critical | 일별 소급조정 후 RDS 직전·당일 행을 commit 전에 재검증 |
+| `LISTING_EPISODE_BOUNDARY` | Info/Pass | 동일 ticker가 365일 초과 사라졌다 재등장하면 과거 발행회사와 수정주가·수익률 사슬 분리 |
 | `PRICE_RETURN_SPIKE` | Warning | KRX 기준가 조정 후 일간 절대수익률 30.5% 초과이며 DART 특별거래 공시로 설명되지 않음 |
 | `PRICE_ROUND_TRIP_SPIKE` | Warning | 급등락 후 3일 내 원래 가격 복귀 |
 | `PRICE_SCALE_JUMP` | Warning | DART·KRX 주식수/시총·특별거래로 설명되지 않는 10배·100배 단위 변화 |
 | `CORPORATE_ACTION_INFERRED_FROM_KRX_STRUCTURE` | Info/Pass | 가격과 주식수가 반대로 10배·100배 변하고 시가총액이 유지된 구조변경 |
-| `SPECIAL_TRADING_EVENT` | Info/Pass | 최근 30일 내 정리매매·상장폐지·거래재개·재상장·변경상장 DART 공시로 설명되는 실제 30.5% 초과 가격 변화. 가격값은 수정하지 않음 |
+| `SPECIAL_TRADING_EVENT` | Info/Pass | 최근 120일 내 정리매매·상장폐지·거래재개·재상장·변경상장 DART 공시로 설명되는 실제 30.5% 초과 가격 변화. 보통주 공시는 이름이 유일하게 일치하는 우선주에도 발행회사 근거로 상속하며 가격값은 수정하지 않음 |
 | `PRICE_ADJUSTMENT_FACTOR_CHANGE` | Info/Pass | KRX 기준가 수정계수 0.5% 초과 기업행사 기록 |
 | `PRICE_ADJUSTMENT_WITHOUT_DART_EVENT` | Warning | 0.5% 초과 KRX 조정계수에 인접한 DART 기업행사 근거가 없음 |
 | `CORPORATE_ACTION_FACTOR_MISMATCH` | Warning | 계산 가능한 DART 주식수 조정계수와 KRX 계수가 2% 초과 불일치 |
@@ -41,7 +42,8 @@ temporary staging과 단일 publish transaction을 유지한다.
 | `PRICE_COVERAGE_GROWTH` | Info/Pass | 시장별 종목 수가 20일 median 대비 10% 초과 증가 |
 | `PRICE_DISTRIBUTION_DRIFT` | Warning | 횡단면 수익률 median의 MAD 이상 |
 | `FUNDAMENTAL_PIT_ORDER` | Critical | 공시 및 사용가능일 순서 |
-| `NO_TRADABLE_PRICE_ASSET` | Warning | 전체 가격 기간에 없는 DART-only 기업을 명시적으로 제외하고 건수·표본 기록 |
+| `NO_TRADABLE_PRICE_ASSET` | Info/Pass | 전체 가격 기간에 없는 DART-only 기업을 명시적으로 제외하고 건수·표본 기록 |
+| `DART_FULL_STATEMENT_SUPPLEMENT` | Info/Pass | DART 주요계정에 없는 business key만 전체 재무제표의 BS·IS/CIS 계정으로 보강한 행·파일 수 기록 |
 | `FUNDAMENTAL_CURRENCY_CONSISTENCY` | Error | filing 내 통화 일관성 |
 | `FUNDAMENTAL_ACCOUNTING_EQUATION` | Warning | 회계식 상대오차 1% |
 | `FUNDAMENTAL_MAJOR_METRIC_COVERAGE` | Warning | 공시 revision별 자산·매출·순이익 중 하나 이상 존재 |

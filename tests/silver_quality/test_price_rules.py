@@ -8,6 +8,7 @@ from pipeline.silver.prices import (
     _normalize_incomplete_ohlc,
     _rescale_history_for_events,
     _verify_adj_close_post_publish,
+    _with_adj_close,
 )
 from pipeline.silver_quality.rules.prices import check_prices
 
@@ -120,6 +121,36 @@ def test_assets_without_supported_price_history_are_excluded():
     )
     assert set(retained_assets["natural_key"]) == {"005930", "1028"}
     assert set(retained_identifiers["natural_key"]) == {"005930", "1028"}
+
+
+def test_preferred_share_maps_to_unique_common_issuer_name():
+    frame = pd.DataFrame([
+        {"natural_key": "001520", "name": "동양", "asset_type": "stock"},
+        {"natural_key": "001529", "name": "동양3우B", "asset_type": "stock"},
+        {"natural_key": "1028", "name": "KOSPI200", "asset_type": "index"},
+    ])
+    assert assets.preferred_share_issuer_map(frame) == {
+        "001529": "001520",
+    }
+
+
+def test_adjusted_close_resets_after_long_ticker_absence():
+    frame = pd.DataFrame([
+        {
+            "ticker": "036220",
+            "trade_date": date(2016, 5, 1),
+            "close": 100.0,
+            "prev_diff": 0.0,
+        },
+        {
+            "ticker": "036220",
+            "trade_date": date(2024, 3, 13),
+            "close": 500.0,
+            "prev_diff": 0.0,
+        },
+    ])
+    adjusted = _with_adj_close(frame)
+    assert adjusted["adj_close"].tolist() == [100.0, 500.0]
 
 
 def test_duplicate_price_blocks():
@@ -335,8 +366,9 @@ def test_reciprocal_share_change_explains_scale_jump_as_krx_structure():
     )
     assert inferred.status.value == "PASS"
     assert "observed_events=1" in inferred.actual
-    # DART coverage is still independently visible.
-    assert _failed(results, "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT") == 1
+    # KRX 가격·주식수·시총의 독립 구조 근거가 있으므로 DART 미대사
+    # 경고를 중복 발생시키지 않는다.
+    assert _failed(results, "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT") == 0
 
 
 def test_special_trading_event_is_info_not_return_or_scale_warning():
@@ -383,6 +415,43 @@ def test_special_trading_event_is_info_not_return_or_scale_warning():
     )
     assert special.status.value == "PASS"
     assert "observed_events=1" in special.actual
+
+
+def test_special_trading_episode_accepts_notice_up_to_120_days_before():
+    frame = _valid_prices({
+        "close": 50.0,
+        "adj_close": 50.0,
+        "open": 50.0,
+        "high": 50.0,
+        "low": 50.0,
+        "prev_diff": -50.0,
+        "market_cap": 50_000.0,
+    })
+    history = pd.DataFrame([{
+        "identifier": "005930",
+        "trade_date": date(2026, 7, 7),
+        "close": 100.0,
+        "adj_close": 100.0,
+        "market": "KOSPI",
+        "asset_type": "stock",
+        "shares": 1_000,
+        "market_cap": 100_000.0,
+    }])
+    action = _action(
+        event_type="delisting",
+        announcement_date=date(2026, 4, 9),
+        effective_date=None,
+        match_window_days=0,
+        expects_price_adjustment=False,
+        report_name="상장폐지 관련 정리매매",
+    )
+    results = check_prices(
+        frame,
+        target_date=DAY,
+        history=history,
+        corporate_actions=action,
+    )
+    assert _failed(results, "PRICE_RETURN_SPIKE") == 0
 
 
 def test_dart_factor_mismatch_is_warning():
@@ -554,7 +623,7 @@ class _RescaleCursor:
             self.rowcount = 1
 
     def fetchone(self):
-        return (100.0, 100.0)
+        return (date(2026, 7, 7), 100.0, 100.0)
 
 
 class _RescaleConnection:
@@ -580,6 +649,30 @@ def test_small_source_adjustment_rescales_published_history():
     assert target_date == DAY
 
 
+class _LongGapRescaleCursor(_RescaleCursor):
+    def fetchone(self):
+        return (date(2024, 1, 1), 100.0, 100.0)
+
+
+class _LongGapRescaleConnection:
+    def __init__(self):
+        self._cursor = _LongGapRescaleCursor()
+
+    def cursor(self):
+        return self._cursor
+
+
+def test_long_listing_gap_does_not_rescale_old_issuer_history():
+    connection = _LongGapRescaleConnection()
+    stock = pd.DataFrame([{
+        "asset_id": 1,
+        "close": 101.0,
+        "prev_diff": 0.9,
+    }])
+    assert _rescale_history_for_events(connection, stock, DAY) == 0
+    assert connection._cursor.update_params is None
+
+
 class _FakeCursor:
     def __init__(self, current_adj_close):
         self.current_adj_close = current_adj_close
@@ -598,7 +691,7 @@ class _FakeCursor:
         if "trade_date=%s" in self.query:
             return [(1, 1_000.0, self.current_adj_close)]
         if "trade_date < %s" in self.query:
-            return [(1, 100.0, 1_000.0)]
+            return [(1, date(2026, 7, 7), 100.0, 1_000.0)]
         return []
 
 
@@ -610,6 +703,20 @@ class _FakeConnection:
         return _FakeCursor(self.current_adj_close)
 
 
+class _LongGapFakeCursor(_FakeCursor):
+    def fetchall(self):
+        if "trade_date=%s" in self.query:
+            return [(1, 1_000.0, self.current_adj_close)]
+        if "trade_date < %s" in self.query:
+            return [(1, date(2024, 1, 1), 100.0, 100.0)]
+        return []
+
+
+class _LongGapFakeConnection(_FakeConnection):
+    def cursor(self):
+        return _LongGapFakeCursor(self.current_adj_close)
+
+
 def test_post_publish_adj_close_verification():
     candidates = pd.DataFrame([{
         "asset_id": 1,
@@ -618,6 +725,19 @@ def test_post_publish_adj_close_verification():
     }])
     _verify_adj_close_post_publish(
         _FakeConnection(1_000.0),
+        candidates,
+        DAY,
+    )
+
+
+def test_post_publish_resets_adj_close_at_new_listing_episode():
+    candidates = pd.DataFrame([{
+        "asset_id": 1,
+        "asset_type": "stock",
+        "prev_diff": 900.0,
+    }])
+    _verify_adj_close_post_publish(
+        _LongGapFakeConnection(1_000.0),
         candidates,
         DAY,
     )

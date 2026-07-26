@@ -84,3 +84,39 @@ def test_combined_offering_does_not_infer_factor_from_bonus_leg_only(tmp_path):
 
     assert events.iloc[0]["event_type"] == "combined_offering"
     assert pd.isna(events.iloc[0]["expected_factor"])
+
+
+def test_ex_dividend_notice_is_evidence_not_required_price_adjustment(tmp_path):
+    manifest = (
+        tmp_path
+        / "corporate_actions/dart/manifests"
+        / "from=20260701/to=20260708/disclosures.json"
+    )
+    _write_json(manifest, [{
+        "stock_code": "005930",
+        "rcept_no": "20260707000005",
+        "rcept_dt": "20260707",
+        "report_nm": "배당락",
+    }])
+    events, _ = corporate_actions.prepare(str(tmp_path))
+    event = events.iloc[0]
+    assert event["event_type"] == "ex_dividend"
+    assert event["confirms_price_adjustment"]
+    assert not event["expects_price_adjustment"]
+    assert event["effective_date"] == date(2026, 7, 7)
+
+
+def test_common_issuer_events_are_inherited_by_preferred_share():
+    event = pd.DataFrame([{
+        "identifier": "001520",
+        "event_type": "delisting",
+        "rcept_no": "20260707000006",
+    }])
+    expanded, stats = corporate_actions.inherit_issuer_events(
+        event,
+        {"001529": "001520"},
+    )
+    inherited = expanded[expanded["identifier"].eq("001529")].iloc[0]
+    assert inherited["issuer_event_inherited"]
+    assert inherited["issuer_parent_identifier"] == "001520"
+    assert stats["inherited_event_count"] == 1

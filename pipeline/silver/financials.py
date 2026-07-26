@@ -27,6 +27,22 @@ METRIC_MAP = {
     "당기순이익": "net_income", "당기순이익(손실)": "net_income",
     "총포괄손익": "comprehensive_income",
 }
+SUPPLEMENT_STATEMENT_BY_METRIC = {
+    "total_assets": {"BS"},
+    "current_assets": {"BS"},
+    "noncurrent_assets": {"BS"},
+    "total_liabilities": {"BS"},
+    "current_liabilities": {"BS"},
+    "noncurrent_liabilities": {"BS"},
+    "total_equity": {"BS"},
+    "capital_stock": {"BS"},
+    "retained_earnings": {"BS"},
+    "revenue": {"IS", "CIS"},
+    "operating_income": {"IS", "CIS"},
+    "pretax_income": {"IS", "CIS"},
+    "net_income": {"IS", "CIS"},
+    "comprehensive_income": {"IS", "CIS"},
+}
 # reprt_code → (fiscal_period, 12월 결산 기준 종료 월, 일). thstrm_dt 를 못 읽을 때만 쓰는 fallback.
 REPRT = {"11011": ("FY", 12, 31), "11013": ("Q1", 3, 31), "11012": ("Q2", 6, 30), "11014": ("Q3", 9, 30)}
 _DT_RE = re.compile(r"(\d{4})\.(\d{2})\.(\d{2})")
@@ -84,7 +100,15 @@ def _iter_files(base: str, years: set[int] | None, files: list[str] | None) -> l
     if files is not None:
         return files
     out = []
-    for f in glob.glob(f"{base}/financials/dart/year=*/corp=*/*.json"):
+    patterns = (
+        f"{base}/financials/dart/year=*/corp=*/*.json",
+        f"{base}/financials/dart_full/year=*/corp=*/*.json",
+    )
+    for f in (
+        path
+        for pattern in patterns
+        for path in glob.glob(pattern)
+    ):
         year = int(f.split("year=")[1].split("/")[0])
         if years is None or year in years:
             out.append(f)
@@ -118,9 +142,22 @@ def prepare(
     unexpected_duplicate_rows = unexpected_duplicate_groups = 0
     known_duplicate_samples: list[dict] = []
     unexpected_duplicate_samples: list[dict] = []
-    selected_files = _iter_files(base, years, files)
+    selected_files = sorted(
+        _iter_files(base, years, files),
+        key=lambda path: (
+            "/financials/dart_full/" in path.replace("\\", "/"),
+            path,
+        ),
+    )
+    primary_period_ends: dict[tuple[str, str, str, str], date] = {}
     for f in selected_files:
         ticker, reprt = _file_meta(f)
+        supplemental = "/financials/dart_full/" in f.replace("\\", "/")
+        supplemental_fs_type = (
+            Path(f).stem.rsplit("-", 1)[-1]
+            if supplemental
+            else None
+        )
         if reprt not in REPRT:
             rejected_rows += 1
             continue
@@ -130,11 +167,24 @@ def prepare(
         file_groups: dict[tuple, list[dict]] = {}
         for r in rows:
             input_rows += 1
-            if str(r.get("stock_code") or "") != ticker or str(r.get("reprt_code") or "") != reprt:
+            row_ticker = (
+                ticker if supplemental else str(r.get("stock_code") or "")
+            )
+            row_fs_type = (
+                supplemental_fs_type if supplemental else r.get("fs_div")
+            )
+            if row_ticker != ticker or str(r.get("reprt_code") or "") != reprt:
                 rejected_rows += 1
                 continue
             metric = METRIC_MAP.get(r.get("account_nm"))
             if not metric:
+                excluded_rows += 1
+                continue
+            if (
+                supplemental
+                and str(r.get("sj_div") or "") not in
+                SUPPLEMENT_STATEMENT_BY_METRIC[metric]
+            ):
                 excluded_rows += 1
                 continue
             raw_amount = (r.get("thstrm_amount") or "").strip()
@@ -145,8 +195,15 @@ def prepare(
                 else:
                     rejected_rows += 1
                 continue
-            period_end = _period_end_from_dt(r.get("thstrm_dt")) or date(int(r["bsns_year"]), mm, dd)
             rcept = r.get("rcept_no", "") or ""
+            scope_key = (ticker, reprt, str(row_fs_type or ""), rcept)
+            period_end = (
+                _period_end_from_dt(r.get("thstrm_dt"))
+                or primary_period_ends.get(scope_key)
+                or date(int(r["bsns_year"]), mm, dd)
+            )
+            if not supplemental:
+                primary_period_ends[scope_key] = period_end
             filed = _filed_from_rcept(rcept)
             available = _available_date(period_end, fp, filed)
             revision_key = rcept or (
@@ -154,12 +211,13 @@ def prepare(
                 f"{r.get('fs_div')}:{available.isoformat()}"
             )
             candidate = (
-                ticker, "DART", period_end, fp, r.get("fs_div"),
+                ticker, "DART", period_end, fp, row_fs_type,
                 rcept or None, filed, available, metric, val,
                 (r.get("currency") or "").strip().upper(), revision_key, f,
+                supplemental,
             )
             exact_key = (
-                ticker, "DART", period_end, fp, r.get("fs_div"),
+                ticker, "DART", period_end, fp, row_fs_type,
                 revision_key, metric, val,
                 (r.get("currency") or "").strip().upper(),
             )
@@ -254,8 +312,27 @@ def prepare(
         "identifier", "source", "period_end", "fiscal_period", "fs_type",
         "filing_id", "filed", "available_date", "metric", "value",
         "currency", "revision_key", "source_file",
+        "_supplemental",
     ]
     df = pd.DataFrame(recs, columns=candidate_cols)
+    business_key = [
+        "identifier", "source", "period_end", "fiscal_period",
+        "fs_type", "revision_key", "metric",
+    ]
+    primary = df[~df["_supplemental"]].copy()
+    supplemental_df = df[df["_supplemental"]].copy()
+    if not supplemental_df.empty:
+        primary_index = pd.MultiIndex.from_frame(primary[business_key])
+        supplemental_index = pd.MultiIndex.from_frame(
+            supplemental_df[business_key]
+        )
+        already_present = supplemental_index.isin(primary_index)
+        excluded_rows += int(already_present.sum())
+        supplemental_df = supplemental_df[~already_present]
+    supplemented_rows = len(supplemental_df)
+    df = pd.concat([primary, supplemental_df], ignore_index=True).drop(
+        columns="_supplemental",
+    )
     return df, {
         "input_rows": input_rows,
         "transformed_rows": len(df),
@@ -272,6 +349,13 @@ def prepare(
             "samples": unexpected_duplicate_samples,
         },
         "source_file_count": len(selected_files),
+        "full_statement_supplement": {
+            "row_count": supplemented_rows,
+            "file_count": sum(
+                "/financials/dart_full/" in path.replace("\\", "/")
+                for path in selected_files
+            ),
+        },
     }
 
 

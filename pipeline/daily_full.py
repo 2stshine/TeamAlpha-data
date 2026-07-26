@@ -128,7 +128,13 @@ def main() -> None:
     keys += changed_action_keys
 
     local_paths = _download_keys(bucket, keys, root)
-    financial_files = [p for p in local_paths if "/financials/dart/year=" in p]
+    financial_files = [
+        p for p in local_paths
+        if (
+            "/financials/dart/year=" in p
+            or "/financials/dart_full/year=" in p
+        )
+    ]
 
     print(f"[silver] incremental start day={day}, financial_files={len(financial_files)}", flush=True)
     load.incremental(

@@ -25,6 +25,7 @@ COLUMNS = [
     "effective_date",
     "match_window_days",
     "expected_factor",
+    "confirms_price_adjustment",
     "expects_price_adjustment",
     "confidence",
     "rcept_no",
@@ -156,6 +157,11 @@ def _structured_row(
         "effective_date": effective_date,
         "match_window_days": 7 if effective_date else 0,
         "expected_factor": _structured_expected_factor(event_type, row),
+        "confirms_price_adjustment": (
+            event_type in PRICE_ADJUSTING_STRUCTURED
+            and effective_date is not None
+            and not related_company_event
+        ),
         "expects_price_adjustment": (
             event_type in PRICE_ADJUSTING_STRUCTURED
             and effective_date is not None
@@ -174,7 +180,10 @@ def _disclosure_type(report_name: object) -> tuple[str, bool, int] | None:
     if "권리락" in title:
         return "rights_detachment", True, 3
     if "배당락" in title:
-        return "ex_dividend", True, 3
+        # 배당락 공시는 현금배당처럼 KRX 기준가격 조정계수가 생기지 않는
+        # 경우가 있다. 관측된 기준가 변경의 근거로는 쓰되, 역방향으로
+        # 모든 배당락에 가격조정을 요구하지 않는다.
+        return "ex_dividend", False, 0
     if "액면분할" in title or "주식분할" in title:
         executed = "변경상장" in title or "거래정지해제" in title
         cancelled = "철회" in title or "부결" in title
@@ -211,17 +220,23 @@ def _disclosure_row(path: str, row: dict) -> dict | None:
     announced = _parse_date(row.get("rcept_dt")) or _announcement_date(row)
     if not ticker or announced is None:
         return None
+    confirms_adjustment = expects_adjustment or event_type == "ex_dividend"
+    effective_date = announced if confirms_adjustment else None
+    match_window_days = 3 if event_type == "ex_dividend" else window
     return {
         "identifier": ticker,
         "event_type": event_type,
         "announcement_date": announced,
         # 거래소의 권리락·배당락·변경상장 공시는 효력일에 근접해
         # 제출되므로 직접 공시일을 좁은 매칭 창의 기준으로 사용한다.
-        "effective_date": announced if expects_adjustment else None,
-        "match_window_days": window,
+        "effective_date": effective_date,
+        "match_window_days": match_window_days,
         "expected_factor": None,
+        "confirms_price_adjustment": confirms_adjustment,
         "expects_price_adjustment": expects_adjustment,
-        "confidence": "EXCHANGE_NOTICE" if expects_adjustment else "ANNOUNCEMENT_ONLY",
+        "confidence": (
+            "EXCHANGE_NOTICE" if confirms_adjustment else "ANNOUNCEMENT_ONLY"
+        ),
         "rcept_no": str(row.get("rcept_no") or ""),
         "report_name": row.get("report_nm"),
         "source": "DART_DISCLOSURE",
@@ -325,4 +340,36 @@ def prepare(
         "disclosure_event_count": disclosure_count,
         "effective_date_count": int(events["effective_date"].notna().sum()),
         "expected_factor_count": int(events["expected_factor"].notna().sum()),
+    }
+
+
+def inherit_issuer_events(
+    events: pd.DataFrame,
+    preferred_to_common: dict[str, str],
+) -> tuple[pd.DataFrame, dict]:
+    """보통주 DART 행사를 동일 발행회사의 우선주에 증거로 복제한다."""
+    if events.empty or not preferred_to_common:
+        return events, {"preferred_ticker_count": 0, "inherited_event_count": 0}
+    inherited = []
+    identifiers = events["identifier"].astype(str)
+    for preferred, common in sorted(preferred_to_common.items()):
+        rows = events[identifiers.eq(str(common))].copy()
+        if rows.empty:
+            continue
+        rows["issuer_parent_identifier"] = str(common)
+        rows["issuer_event_inherited"] = True
+        rows["identifier"] = str(preferred)
+        inherited.append(rows)
+    original = events.copy()
+    original["issuer_parent_identifier"] = None
+    original["issuer_event_inherited"] = False
+    if not inherited:
+        return original, {
+            "preferred_ticker_count": 0,
+            "inherited_event_count": 0,
+        }
+    expanded = pd.concat([original, *inherited], ignore_index=True)
+    return expanded, {
+        "preferred_ticker_count": len(inherited),
+        "inherited_event_count": len(expanded) - len(original),
     }

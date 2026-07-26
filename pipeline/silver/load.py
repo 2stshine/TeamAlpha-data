@@ -36,6 +36,7 @@ def _build_candidates(
     financial_files: list[str] | None,
 ) -> CandidateBundle:
     asset_df, identifier_df = assets.prepare(base)
+    preferred_to_common = assets.preferred_share_issuer_map(asset_df)
     price_df, price_stats = prices.prepare(base, target_date=target_date)
     all_price_identifiers = set(
         asset_df.loc[
@@ -63,6 +64,11 @@ def _build_candidates(
         base,
         target_date=target_date,
     )
+    action_df, inherited_action_stats = corporate_actions.inherit_issuer_events(
+        action_df,
+        preferred_to_common,
+    )
+    action_stats["issuer_inheritance"] = inherited_action_stats
     return CandidateBundle(
         assets=asset_df,
         identifiers=identifier_df,

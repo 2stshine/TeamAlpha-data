@@ -24,6 +24,7 @@ COLS = ["asset_id", "source", "trade_date", "open", "high", "low", "close",
 # 두 소스를 같은 값으로 맞춘다.
 MARKET_NORM = {"KOSDAQ GLOBAL": "KOSDAQ"}
 UNSUPPORTED_MARKETS = {"KONEX"}
+LISTING_EPISODE_GAP_DAYS = 365
 
 
 def _num(s):
@@ -137,13 +138,24 @@ def _read_krxapi(base: str) -> pd.DataFrame:
 def _with_adj_close(df: pd.DataFrame) -> pd.DataFrame:
     """티커별 시계열에 adj_close 컬럼 추가 (가격수정 누적계수)."""
     df = df.sort_values(["ticker", "trade_date"]).reset_index(drop=True)
-    prev = df.groupby("ticker")["close"].shift(1)
+    previous_date = df.groupby("ticker")["trade_date"].shift(1)
+    gap_days = (
+        pd.to_datetime(df["trade_date"])
+        - pd.to_datetime(previous_date)
+    ).dt.days
+    df["_listing_episode"] = (
+        gap_days.gt(LISTING_EPISODE_GAP_DAYS)
+        .groupby(df["ticker"])
+        .cumsum()
+    )
+    series_keys = [df["ticker"], df["_listing_episode"]]
+    prev = df.groupby(series_keys)["close"].shift(1)
     adj_prev = df["close"] - df["prev_diff"].fillna(0)
     m = np.where((prev > 0) & (adj_prev > 0), adj_prev / prev, 1.0)
     m = np.where(np.abs(m - 1) < 1e-9, 1.0, m)  # 정상일 정수라 정확히 1 — 부동소수 잡음 제거
     df["_m"] = m
-    C = df.groupby("ticker")["_m"].cumprod()
-    C_last = C.groupby(df["ticker"]).transform("last")
+    C = df.groupby(series_keys)["_m"].cumprod()
+    C_last = C.groupby(series_keys).transform("last")
     df["adj_close"] = (df["close"] * (C_last / C)).round(4)
     return df
 
@@ -178,15 +190,20 @@ def _rescale_history_for_events(
             if adj_prev <= 0:
                 continue
             cur.execute(
-                "SELECT close, adj_close FROM price_daily "
+                "SELECT trade_date, close, adj_close FROM price_daily "
                 "WHERE asset_id=%s AND source='KRX' AND trade_date < %s "
                 "ORDER BY trade_date DESC LIMIT 1",
                 (int(aid), target_date),
             )
             got = cur.fetchone()
-            if not got or not got[0] or float(got[0]) <= 0:
+            if (
+                not got
+                or (target_date - got[0]).days > LISTING_EPISODE_GAP_DAYS
+                or not got[1]
+                or float(got[1]) <= 0
+            ):
                 continue
-            prev_close, prev_adj = float(got[0]), got[1]
+            prev_close, prev_adj = float(got[1]), got[2]
             k = adj_prev / prev_close
             if abs(k - 1) <= apply_tolerance:
                 continue  # 원천 조정계수가 정확히 1인 정상일
@@ -232,7 +249,7 @@ def _verify_adj_close_post_publish(
         cur.execute(
             """
             SELECT DISTINCT ON (asset_id)
-                   asset_id, close, adj_close
+                   asset_id, trade_date, close, adj_close
             FROM price_daily
             WHERE source='KRX' AND trade_date < %s
               AND asset_id = ANY(%s)
@@ -241,8 +258,8 @@ def _verify_adj_close_post_publish(
             (target_date, asset_ids),
         )
         previous = {
-            int(asset_id): (float(close), float(adj_close))
-            for asset_id, close, adj_close in cur.fetchall()
+            int(asset_id): (trade_date, float(close), float(adj_close))
+            for asset_id, trade_date, close, adj_close in cur.fetchall()
         }
         cur.execute(
             """
@@ -284,7 +301,19 @@ def _verify_adj_close_post_publish(
                 })
             continue
 
-        _, previous_adj_close = previous[asset_id]
+        previous_date, _, previous_adj_close = previous[asset_id]
+        if (target_date - previous_date).days > LISTING_EPISODE_GAP_DAYS:
+            if abs(stored_adj_close - stored_close) > max(
+                0.0002,
+                abs(stored_close) * 1e-7,
+            ):
+                failures.append({
+                    "asset_id": asset_id,
+                    "reason": "listing episode first row must have adj_close=close",
+                    "close": stored_close,
+                    "adj_close": stored_adj_close,
+                })
+            continue
         if pd.isna(row.prev_diff):
             failures.append({
                 "asset_id": asset_id,

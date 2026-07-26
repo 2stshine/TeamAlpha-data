@@ -76,6 +76,11 @@ def _candidate_bundle(base: str) -> CandidateBundle:
         all_price_identifiers - supported_price_identifiers,
     )
     action_df, action_stats = corporate_actions.prepare(base)
+    action_df, inherited_action_stats = corporate_actions.inherit_issuer_events(
+        action_df,
+        assets.preferred_share_issuer_map(asset_df),
+    )
+    action_stats["issuer_inheritance"] = inherited_action_stats
     return CandidateBundle(
         assets=asset_df,
         identifiers=identifier_df,

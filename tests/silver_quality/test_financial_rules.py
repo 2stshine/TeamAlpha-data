@@ -94,13 +94,15 @@ def test_dart_only_rows_are_explicitly_excluded_and_reported():
         fundamentals=retained,
         stats={"fundamental": updated},
     ))
-    warning = next(
+    exclusion = next(
         result for result in results
         if result.rule_code == "NO_TRADABLE_PRICE_ASSET"
     )
-    assert warning.failed_count == 3
-    assert warning.samples[0]["identifier"] == "016830"
-    assert not warning.blocks_publish
+    assert exclusion.failed_count == 0
+    assert exclusion.status.value == "PASS"
+    assert exclusion.severity.value == "INFO"
+    assert exclusion.samples[0]["identifier"] == "016830"
+    assert "excluded_rows=3" in exclusion.actual
     excluded_market = next(
         result for result in results
         if result.rule_code == "UNSUPPORTED_MARKET_ASSET_EXCLUDED"
@@ -228,3 +230,49 @@ def test_plain_net_income_label_maps_to_signed_net_income(tmp_path):
     assert frame.iloc[0]["metric"] == "net_income"
     assert frame.iloc[0]["value"] == 100.0
     assert stats["known_net_income_ord_duplicate"]["row_count"] == 0
+
+
+def test_full_statement_only_fills_missing_primary_metrics(tmp_path):
+    primary = _write_dart_file(
+        tmp_path,
+        [_dart_row(ord_value="1", account_nm="유동자산")],
+    )
+    supplemental = (
+        tmp_path
+        / "financials"
+        / "dart_full"
+        / "year=2026"
+        / "corp=005930"
+        / "11011-CFS.json"
+    )
+    supplemental.parent.mkdir(parents=True)
+    supplemental_rows = [
+        _dart_row(ord_value="1", account_nm="유동자산"),
+        _dart_row(ord_value="5", account_nm="자산총계"),
+        _dart_row(ord_value="9", account_nm="당기순이익"),
+    ]
+    for row in supplemental_rows:
+        row["sj_div"] = (
+            "BS" if row["account_nm"] in {"유동자산", "자산총계"} else "CF"
+        )
+        row.pop("stock_code")
+        row.pop("fs_div")
+        row.pop("thstrm_dt")
+    supplemental.write_text(
+        json.dumps(supplemental_rows, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    frame, stats = financials.prepare(
+        str(tmp_path),
+        files=[str(primary), str(supplemental)],
+    )
+
+    assert sorted(frame["metric"]) == ["current_assets", "total_assets"]
+    assert stats["full_statement_supplement"]["row_count"] == 1
+    assert stats["excluded_rows"] == 2
+    assert stats["input_rows"] == (
+        stats["transformed_rows"]
+        + stats["excluded_rows"]
+        + stats["rejected_rows"]
+    )

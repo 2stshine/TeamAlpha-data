@@ -40,10 +40,17 @@ from pipeline.common.sink import (
 
 CORPCODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 MULTI_URL = "https://opendart.fss.or.kr/api/fnlttMultiAcnt.json"
+SINGLE_ALL_URL = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
 REPRT_CODES = ["11011", "11013", "11012", "11014"]  # 사업(FY)/1분기/반기/3분기
 BATCH = 100          # 한 콜에 넣을 회사 수
 CALL_GAP_SEC = 0.3
 CORPCODE_BRONZE_PATH = "financials/dart/corpCode.xml"
+MAJOR_ACCOUNT_NAMES = {
+    "자산총계",
+    "매출액",
+    "당기순이익",
+    "당기순이익(손실)",
+}
 
 
 class QuotaExceeded(Exception):
@@ -109,10 +116,57 @@ def _fetch_multi(corp_codes: list[str], year: int, reprt: str, tries: int = 4) -
     return "?", None
 
 
+def _fetch_single_all(
+    corp_code: str,
+    year: int,
+    reprt: str,
+    fs_div: str,
+    tries: int = 4,
+) -> tuple[str, dict | None]:
+    params = {
+        "crtfc_key": os.environ["DART_API_KEY"],
+        "corp_code": corp_code,
+        "bsns_year": str(year),
+        "reprt_code": reprt,
+        "fs_div": fs_div,
+    }
+    for attempt in range(tries):
+        try:
+            payload = requests.get(
+                SINGLE_ALL_URL,
+                params=params,
+                timeout=60,
+            ).json()
+            return payload.get("status", "?"), payload
+        except Exception:  # noqa: BLE001
+            time.sleep(2 * (attempt + 1))
+    return "?", None
+
+
+def _missing_major_scopes(rows: list[dict]) -> list[str]:
+    """주요계정 응답에서 핵심 계정이 하나도 없는 CFS/OFS를 찾는다."""
+    missing = []
+    fs_divisions = sorted({
+        str(row.get("fs_div") or "").strip()
+        for row in rows
+        if str(row.get("fs_div") or "").strip() in {"CFS", "OFS"}
+    })
+    for fs_div in fs_divisions:
+        names = {
+            str(row.get("account_nm") or "").strip()
+            for row in rows
+            if str(row.get("fs_div") or "").strip() == fs_div
+        }
+        if not names & MAJOR_ACCOUNT_NAMES:
+            missing.append(fs_div)
+    return missing
+
+
 def run(fromyear: int, toyear: int, dest: str, refresh_existing: bool = False) -> list[str]:
     base = base_uri(dest)
     corps = ensure_corp_code_xml(base)
     corp_to_stock = dict(corps)
+    stock_to_corp = {stock: corp for corp, stock in corps}
     universe = [cc for cc, _ in corps]
     batches = [universe[i:i + BATCH] for i in range(0, len(universe), BATCH)]
     print(f"[financials] {fromyear}~{toyear}, 상장사 {len(universe)}개 → 배치 {len(batches)}개 "
@@ -147,6 +201,42 @@ def run(fromyear: int, toyear: int, dest: str, refresh_existing: bool = False) -
                             saved += 1
                         else:
                             unchanged += 1
+                        for fs_div in _missing_major_scopes(rows):
+                            full_path = (
+                                f"{base}/financials/dart_full/year={year}/"
+                                f"corp={tkr}/{reprt}-{fs_div}.json"
+                            )
+                            if exists(full_path) and not refresh_existing:
+                                changed_paths.append(full_path)
+                                continue
+                            status_full, full_payload = _fetch_single_all(
+                                stock_to_corp[tkr],
+                                year,
+                                reprt,
+                                fs_div,
+                            )
+                            if status_full == "020":
+                                raise QuotaExceeded(
+                                    f"full-statement {year} {reprt} "
+                                    f"{tkr} {fs_div}"
+                                )
+                            if (
+                                status_full == "000"
+                                and full_payload
+                                and full_payload.get("list")
+                            ):
+                                if write_text_if_changed(
+                                    json.dumps(
+                                        full_payload["list"],
+                                        ensure_ascii=False,
+                                    ),
+                                    full_path,
+                                ):
+                                    saved += 1
+                                else:
+                                    unchanged += 1
+                                changed_paths.append(full_path)
+                                time.sleep(CALL_GAP_SEC)
                     time.sleep(CALL_GAP_SEC)
     except QuotaExceeded as exc:
         print(f"[financials] 사용한도 초과로 중단: {exc} — 저장 {saved} / 변경없음 {unchanged} / 스킵 {skipped} / 무데이터 {nodata}")

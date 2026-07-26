@@ -321,6 +321,8 @@ uv run python -m pipeline.bronze.stock_marcap --from 2015 --to 2026 --dest s3
 uv run python -m pipeline.bronze.stock_krxapi --from 20260713 --to 20260713 --dest s3
 uv run python -m pipeline.bronze.index --from 20260713 --to 20260713 --dest s3
 uv run python -m pipeline.bronze.financials --from 2026 --to 2026 --dest s3
+uv run python -m pipeline.bronze.financials_full \
+  --scope 004990:2015:11011:CFS --dest s3
 uv run python -m pipeline.bronze.corporate_actions --from 20150101 --to 20260713 --dest s3
 ```
 

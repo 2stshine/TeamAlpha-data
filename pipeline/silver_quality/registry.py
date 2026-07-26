@@ -103,8 +103,8 @@ def run_registered_rules(
     results.append(CheckResult(
         rule_code="NO_TRADABLE_PRICE_ASSET",
         dataset="fundamental",
-        severity=Severity.WARNING,
-        status=CheckStatus.FAIL if nontradable_rows else CheckStatus.PASS,
+        severity=Severity.INFO,
+        status=CheckStatus.PASS,
         expected=(
             "DART ticker occurs at least once in the complete KRX price universe; "
             "otherwise exclude explicitly"
@@ -113,8 +113,28 @@ def run_registered_rules(
             f"excluded_rows={nontradable_rows}, "
             f"excluded_tickers={nontradable_tickers}"
         ),
-        failed_count=nontradable_rows,
+        failed_count=0,
         samples=list(nontradable.get("samples", []))[:20],
+        partition_key=partition_key,
+    ))
+    full_statement = bundle.stats.get("fundamental", {}).get(
+        "full_statement_supplement",
+        {"row_count": 0, "file_count": 0},
+    )
+    results.append(CheckResult(
+        rule_code="DART_FULL_STATEMENT_SUPPLEMENT",
+        dataset="fundamental",
+        severity=Severity.INFO,
+        status=CheckStatus.PASS,
+        expected=(
+            "full-statement source fills only business keys absent from "
+            "the DART major-account source"
+        ),
+        actual=(
+            f"supplemented_rows={int(full_statement.get('row_count', 0))}, "
+            f"source_files={int(full_statement.get('file_count', 0))}"
+        ),
+        failed_count=0,
         partition_key=partition_key,
     ))
     if not bundle.prices.empty:

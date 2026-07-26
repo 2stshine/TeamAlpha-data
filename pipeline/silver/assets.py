@@ -9,6 +9,7 @@ DART corp_code: bronze corpCode.xml 로 티커→corp_code 매핑해 DART identi
 from __future__ import annotations
 
 import glob
+import re
 
 import pandas as pd
 from uuid import UUID
@@ -17,6 +18,7 @@ from pipeline.bronze import financials
 
 # IDX_NM → (asset name, KRX 지수코드)
 BENCHMARKS = {"코스피 200": ("KOSPI200", "1028"), "코스닥 150": ("KOSDAQ150", "2203")}
+_PREFERRED_SUFFIX = re.compile(r"(?:\d*우(?:[A-Z])?|우선주)$")
 
 
 def _stock_universe(base: str) -> dict[str, str]:
@@ -104,6 +106,38 @@ def restrict_to_price_universe(
         identifier_candidates["natural_key"].astype(str).isin(retained_keys)
     ].reset_index(drop=True)
     return retained_assets, retained_identifiers
+
+
+def preferred_share_issuer_map(
+    asset_candidates: pd.DataFrame,
+) -> dict[str, str]:
+    """우선주 KRX ticker를 동일 이름의 보통주 ticker에 결정적으로 연결한다.
+
+    DART corpCode는 통상 보통주 코드만 제공한다. 이름에서 명확한 우선주
+    접미사를 제거한 결과가 정확히 하나의 보통주명과 일치할 때만 상속한다.
+    모호하거나 보통주가 없는 경우에는 추정하지 않는다.
+    """
+    if asset_candidates.empty:
+        return {}
+    stocks = asset_candidates[
+        asset_candidates["asset_type"].eq("stock")
+    ][["natural_key", "name"]].copy()
+    stocks["natural_key"] = stocks["natural_key"].astype(str)
+    stocks["name"] = stocks["name"].astype(str).str.strip()
+    common_by_name: dict[str, list[str]] = {}
+    for row in stocks.itertuples(index=False):
+        if not _PREFERRED_SUFFIX.search(row.name):
+            common_by_name.setdefault(row.name, []).append(row.natural_key)
+
+    mapping: dict[str, str] = {}
+    for row in stocks.itertuples(index=False):
+        base_name = _PREFERRED_SUFFIX.sub("", row.name).strip()
+        if base_name == row.name:
+            continue
+        matches = common_by_name.get(base_name, [])
+        if len(matches) == 1:
+            mapping[row.natural_key] = matches[0]
+    return mapping
 
 
 def publish(

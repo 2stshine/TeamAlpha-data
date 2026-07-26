@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from pipeline.silver.prices import LISTING_EPISODE_GAP_DAYS
 from pipeline.silver_quality.models import CheckResult, CheckStatus, Severity
 from pipeline.silver_quality.rules.common import (
     duplicate_keys,
@@ -31,6 +32,8 @@ def _attach_corporate_action_evidence(
     frame["dart_effective_date"] = None
     frame["dart_expected_factor"] = np.nan
     frame["dart_match_days"] = np.nan
+    frame["dart_event_inherited"] = False
+    frame["dart_issuer_parent_identifier"] = None
     if corporate_actions is None or corporate_actions.empty:
         return frame
 
@@ -50,37 +53,46 @@ def _attach_corporate_action_evidence(
         events["effective_date"],
         errors="coerce",
     ).dt.date
+    confirmation = (
+        events["confirms_price_adjustment"]
+        if "confirms_price_adjustment" in events
+        else events["expects_price_adjustment"]
+    )
     events = events[
-        events["expects_price_adjustment"].fillna(False)
+        confirmation.fillna(False)
         & events["effective_date"].notna()
     ]
     if events.empty:
         return frame
 
-    by_identifier = {
-        identifier: group.to_dict("records")
-        for identifier, group in events.groupby("identifier", sort=False)
-    }
     adjustment_rows = frame[
         frame["asset_type"].eq("stock")
         & frame["source_adjustment_event"].fillna(False)
     ]
+    by_identifier = {
+        identifier: group.to_dict("records")
+        for identifier, group in events.groupby(
+            "identifier",
+            sort=False,
+        )
+    }
     for index, row in adjustment_rows.iterrows():
         matches = []
         for event in by_identifier.get(str(row["identifier"]), []):
             distance = abs((row["trade_date"] - event["effective_date"]).days)
             window = int(event.get("match_window_days") or 0)
             if distance <= window:
-                matches.append((distance, event))
+                matches.append((
+                    distance,
+                    0 if pd.notna(event.get("expected_factor")) else 1,
+                    str(event.get("rcept_no") or ""),
+                    event,
+                ))
         if not matches:
             continue
-        distance, event = min(
+        distance, _, _, event = min(
             matches,
-            key=lambda item: (
-                item[0],
-                0 if pd.notna(item[1].get("expected_factor")) else 1,
-                str(item[1].get("rcept_no") or ""),
-            ),
+            key=lambda item: (item[0], item[1], item[2]),
         )
         frame.at[index, "dart_event_confirmed"] = True
         frame.at[index, "dart_event_type"] = event.get("event_type")
@@ -88,6 +100,12 @@ def _attach_corporate_action_evidence(
         frame.at[index, "dart_effective_date"] = event.get("effective_date")
         frame.at[index, "dart_expected_factor"] = event.get("expected_factor")
         frame.at[index, "dart_match_days"] = distance
+        frame.at[index, "dart_event_inherited"] = bool(
+            event.get("issuer_event_inherited") or False
+        )
+        frame.at[index, "dart_issuer_parent_identifier"] = event.get(
+            "issuer_parent_identifier"
+        )
     return frame
 
 
@@ -101,6 +119,8 @@ def _attach_special_trading_evidence(
     frame["dart_special_event_type"] = None
     frame["dart_special_rcept_no"] = None
     frame["dart_special_match_days"] = np.nan
+    frame["dart_special_event_inherited"] = False
+    frame["dart_special_issuer_parent_identifier"] = None
     if corporate_actions is None or corporate_actions.empty:
         return frame
     required = {
@@ -143,7 +163,7 @@ def _attach_special_trading_evidence(
         matches = []
         for event in by_identifier.get(str(row["identifier"]), []):
             distance = (row["trade_date"] - event["announcement_date"]).days
-            if 0 <= distance <= 30:
+            if 0 <= distance <= 120:
                 matches.append((distance, event))
         if not matches:
             continue
@@ -155,6 +175,12 @@ def _attach_special_trading_evidence(
         frame.at[index, "dart_special_event_type"] = event.get("event_type")
         frame.at[index, "dart_special_rcept_no"] = event.get("rcept_no")
         frame.at[index, "dart_special_match_days"] = distance
+        frame.at[index, "dart_special_event_inherited"] = bool(
+            event.get("issuer_event_inherited") or False
+        )
+        frame.at[index, "dart_special_issuer_parent_identifier"] = event.get(
+            "issuer_parent_identifier"
+        )
     return frame
 
 
@@ -198,6 +224,10 @@ def _dart_actions_without_krx_adjustment(
         events["expects_price_adjustment"].fillna(False)
         & events["effective_date"].notna()
     ].drop_duplicates(["identifier", "event_type", "effective_date"])
+    if "issuer_event_inherited" in events:
+        events = events[
+            ~events["issuer_event_inherited"].fillna(False)
+        ]
     stock = frame[frame["asset_type"].eq("stock")]
     by_identifier = {
         identifier: group
@@ -457,14 +487,31 @@ def check_prices(
     for column in ("close", "adj_close", "prev_diff", "shares", "market_cap"):
         combined[column] = pd.to_numeric(combined[column], errors="coerce")
     combined = combined.sort_values(["identifier", "trade_date"])
-    combined["previous_close"] = combined.groupby("identifier")["close"].shift(1)
-    combined["previous_shares"] = combined.groupby("identifier")["shares"].shift(1)
-    combined["previous_market_cap"] = (
-        combined.groupby("identifier")["market_cap"].shift(1)
+    unsegmented_previous_date = (
+        combined.groupby("identifier")["trade_date"].shift(1)
     )
-    combined["lag2_close"] = combined.groupby("identifier")["close"].shift(2)
+    combined["listing_gap_days"] = (
+        pd.to_datetime(combined["trade_date"])
+        - pd.to_datetime(unsegmented_previous_date)
+    ).dt.days
+    combined["listing_episode_boundary"] = combined[
+        "listing_gap_days"
+    ].gt(LISTING_EPISODE_GAP_DAYS)
+    combined["listing_episode"] = (
+        combined["listing_episode_boundary"]
+        .groupby(combined["identifier"])
+        .cumsum()
+    )
+    series_keys = [combined["identifier"], combined["listing_episode"]]
+    series = combined.groupby(series_keys)
+    combined["previous_close"] = series["close"].shift(1)
+    combined["previous_shares"] = series["shares"].shift(1)
+    combined["previous_market_cap"] = (
+        series["market_cap"].shift(1)
+    )
+    combined["lag2_close"] = series["close"].shift(2)
     combined["return"] = combined["close"] / combined["previous_close"] - 1
-    combined["previous_return"] = combined.groupby("identifier")["return"].shift(1)
+    combined["previous_return"] = series["return"].shift(1)
     combined["source_reference"] = combined["close"] - combined["prev_diff"]
     combined["source_adjustment_factor"] = (
         combined["source_reference"]
@@ -498,27 +545,29 @@ def check_prices(
         corporate_actions,
     )
     combined["previous_economic_return"] = (
-        combined.groupby("identifier")["economic_return"].shift(1)
+        combined.groupby(series_keys)["economic_return"].shift(1)
     )
     combined["previous_source_adjustment_event"] = (
-        combined.groupby("identifier")["source_adjustment_event"]
+        combined.groupby(series_keys)["source_adjustment_event"]
         .shift(1)
         .eq(True)
     )
     combined["previous_dart_event_confirmed"] = (
-        combined.groupby("identifier")["dart_event_confirmed"]
+        combined.groupby(series_keys)["dart_event_confirmed"]
         .shift(1)
         .eq(True)
     )
     combined["previous_dart_special_event_confirmed"] = (
-        combined.groupby("identifier")["dart_special_event_confirmed"]
+        combined.groupby(series_keys)["dart_special_event_confirmed"]
         .shift(1)
         .eq(True)
     )
     combined["adjustment_factor"] = combined["adj_close"] / combined["close"]
-    combined["previous_factor"] = combined.groupby("identifier")["adjustment_factor"].shift(1)
+    combined["previous_factor"] = (
+        combined.groupby(series_keys)["adjustment_factor"].shift(1)
+    )
     combined["previous_adj_close"] = (
-        combined.groupby("identifier")["adj_close"].shift(1)
+        combined.groupby(series_keys)["adj_close"].shift(1)
     )
     current_index = pd.MultiIndex.from_frame(
         prices.assign(identifier=prices["identifier"].astype(str))[
@@ -529,6 +578,26 @@ def check_prices(
         combined[["identifier", "trade_date"]]
     )
     current = combined[combined_index.isin(current_index)]
+    episode_boundaries = current[current["listing_episode_boundary"]]
+    episode_samples = (
+        episode_boundaries.head(20).astype(object)
+        .where(pd.notna(episode_boundaries.head(20)), None)
+        .to_dict("records")
+    )
+    checks.append(CheckResult(
+        rule_code="LISTING_EPISODE_BOUNDARY",
+        dataset="price_daily",
+        severity=Severity.INFO,
+        status=CheckStatus.PASS,
+        expected=(
+            f"price adjustment and return chains reset after >"
+            f"{LISTING_EPISODE_GAP_DAYS}-day ticker absence"
+        ),
+        actual=f"observed_boundaries={len(episode_boundaries)}",
+        failed_count=0,
+        samples=episode_samples,
+        partition_key=partition_key,
+    ))
 
     # 전체 backfill에서는 변환 코드와 독립적으로 수정계수를 다시 누적해
     # 저장 후보 adj_close를 4자리 정밀도로 대사한다. 연도/일자 파티션은
@@ -548,11 +617,9 @@ def check_prices(
             1.0,
         )
         cumulative_factor = recomputed_event_factor.groupby(
-            combined["identifier"],
+            series_keys,
         ).cumprod()
-        final_factor = cumulative_factor.groupby(
-            combined["identifier"],
-        ).transform("last")
+        final_factor = cumulative_factor.groupby(series_keys).transform("last")
         combined["expected_adj_close"] = (
             combined["close"] * final_factor / cumulative_factor
         ).round(4)
@@ -657,8 +724,7 @@ def check_prices(
         & market_cap_ratios.sub(1).abs().le(0.02)
     )
     inferred_structure = current[
-        scale_mask
-        & krx_structure_confirmed
+        krx_structure_confirmed
         & ~current["dart_event_confirmed"]
     ]
     inferred_samples = (
@@ -713,6 +779,7 @@ def check_prices(
     corporate_action = current[current["source_adjustment_event"]]
     unconfirmed_action = corporate_action[
         ~corporate_action["dart_event_confirmed"]
+        & ~krx_structure_confirmed.loc[corporate_action.index]
     ]
     checks.append(result(
         "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT",
@@ -732,6 +799,7 @@ def check_prices(
     ).abs() / expected_factor.replace(0, np.nan)
     factor_mismatch = corporate_action[
         corporate_action["dart_event_confirmed"]
+        & corporate_action["dart_match_days"].eq(0)
         & expected_factor.notna()
         & factor_relative_error.gt(0.02)
     ]

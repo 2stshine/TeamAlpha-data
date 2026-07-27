@@ -35,7 +35,7 @@ def _normalize_incomplete_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     """원천의 O/H/L 0 sentinel을 결측으로 보존한다.
 
     종가로 임의 보정하지 않는다. 세 값이 모두 결측인 행은 quality gate에서
-    SOURCE_INCOMPLETE_OHLC Warning으로 기록하고, 일부만 결측이면 차단한다.
+    SOURCE_INCOMPLETE_OHLC Explained로 기록하고, 일부만 결측이면 차단한다.
     """
     for column in ("open", "high", "low"):
         numeric = pd.to_numeric(df[column], errors="coerce")

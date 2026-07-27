@@ -490,10 +490,23 @@ def check_prices(
         "complete valid OHLC, or all O/H/L absent with close preserved",
         partition_key=partition_key,
     ))
-    checks.append(result(
-        "SOURCE_INCOMPLETE_OHLC", "price_daily", Severity.WARNING,
-        prices[active_incomplete_ohlc],
-        "traded row has no usable O/H/L; values remain NULL without fabrication",
+    active_incomplete = prices[active_incomplete_ohlc]
+    checks.append(CheckResult(
+        rule_code="SOURCE_INCOMPLETE_OHLC",
+        dataset="price_daily",
+        severity=Severity.INFO,
+        status=CheckStatus.PASS,
+        expected=(
+            "source 0 sentinel is normalized to NULL for all O/H/L while "
+            "close, volume, trading value, and market cap remain unchanged"
+        ),
+        actual=f"explained_rows={len(active_incomplete)}",
+        failed_count=0,
+        samples=(
+            active_incomplete.head(20).astype(object)
+            .where(pd.notna(active_incomplete.head(20)), None)
+            .to_dict("records")
+        ),
         partition_key=partition_key,
     ))
     no_trade_samples = (

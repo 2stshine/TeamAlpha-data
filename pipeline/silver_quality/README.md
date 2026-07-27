@@ -18,7 +18,7 @@ temporary staging과 단일 publish transaction을 유지한다.
 | `PRICE_OHLC_LOGIC` | Error | 일부 O/H/L 누락과 OHLC 대소관계 오류 |
 | `UNSUPPORTED_MARKET_EXCLUDED` | Info/Pass | KONEX 가격을 Silver 유니버스에서 명시적으로 제외하고 건수·표본 기록 |
 | `UNSUPPORTED_MARKET_ASSET_EXCLUDED` | Info/Pass | KONEX 가격 이력만 있는 자산의 재무를 명시적으로 제외 |
-| `SOURCE_INCOMPLETE_OHLC` | Warning | 거래가 발생했지만 O/H/L 전체 누락; NULL을 유지하고 임의 보정하지 않음 |
+| `SOURCE_INCOMPLETE_OHLC` | Explained(Info/Pass) | 거래가 발생했지만 원천 O/H/L이 모두 0인 행. Silver에서는 NULL을 유지하고 close·거래량·거래대금·시총은 원본 그대로 보존 |
 | `SOURCE_NO_TRADE_OHLC` | Info/Pass | 거래량·거래대금 0인 무거래 행의 O/H/L 누락 기록 |
 | `PRICE_SOURCE_PARTITION_DATE` | Error | S3 날짜 파티션과 내부 거래일 일치 |
 | `PRICE_MARKET_COMPLETENESS` | Critical | 거래일마다 KOSPI·KOSDAQ 종목 존재 |

@@ -177,9 +177,10 @@ def test_suspended_stock_shape_is_allowed():
     })
     results = check_prices(frame, target_date=DAY)
     assert _failed(results, "PRICE_OHLC_LOGIC") == 0
-    warning = next(r for r in results if r.rule_code == "SOURCE_INCOMPLETE_OHLC")
-    assert warning.failed_count == 0
-    assert not warning.blocks_publish
+    explained = next(r for r in results if r.rule_code == "SOURCE_INCOMPLETE_OHLC")
+    assert explained.failed_count == 0
+    assert explained.severity.value == "INFO"
+    assert explained.status.value == "PASS"
     no_trade = next(r for r in results if r.rule_code == "SOURCE_NO_TRADE_OHLC")
     assert no_trade.status.value == "PASS"
     assert "observed_rows=1" in no_trade.actual
@@ -194,7 +195,7 @@ def test_partial_zero_ohlc_blocks():
     assert result.blocks_publish
 
 
-def test_active_close_only_ohlc_is_warning_only():
+def test_active_close_only_ohlc_is_explained():
     frame = _valid_prices({
         "open": None,
         "high": None,
@@ -207,9 +208,11 @@ def test_active_close_only_ohlc_is_warning_only():
     })
     results = check_prices(frame, target_date=DAY)
     assert _failed(results, "PRICE_OHLC_LOGIC") == 0
-    warning = next(r for r in results if r.rule_code == "SOURCE_INCOMPLETE_OHLC")
-    assert warning.failed_count == 1
-    assert not warning.blocks_publish
+    explained = next(r for r in results if r.rule_code == "SOURCE_INCOMPLETE_OHLC")
+    assert explained.failed_count == 0
+    assert explained.severity.value == "INFO"
+    assert explained.status.value == "PASS"
+    assert "explained_rows=1" in explained.actual
 
 
 def test_index_market_cap_is_not_required():

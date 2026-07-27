@@ -39,6 +39,19 @@ def main() -> None:
             input_fingerprint=fingerprint,
         )
         bundle = _candidate_bundle(str(root))
+        if os.environ.get("RUN_WARNING_ANALYSIS") == "1":
+            from pipeline.silver_quality.warning_analysis import analyze_bundle
+
+            print(
+                "WARNING_ANALYSIS "
+                + json.dumps(
+                    analyze_bundle(bundle, fingerprint),
+                    ensure_ascii=False,
+                    default=str,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         results = evaluate(bundle) + _required_backfill_results(bundle)
         print_summary(results)
         assert_publishable(results)

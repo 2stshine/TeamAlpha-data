@@ -7,6 +7,7 @@ adj_close: KRX 등락률·전일대비가 조정기준 → 일별 계수 m = (cl
 from __future__ import annotations
 
 import glob
+import re
 from datetime import date
 from uuid import UUID
 
@@ -25,6 +26,7 @@ COLS = ["asset_id", "source", "trade_date", "open", "high", "low", "close",
 MARKET_NORM = {"KOSDAQ GLOBAL": "KOSDAQ"}
 UNSUPPORTED_MARKETS = {"KONEX"}
 LISTING_EPISODE_GAP_DAYS = 365
+_PARTITION_DATE = re.compile(r"/date=(\d{4}-\d{2}-\d{2})(?:/|$)")
 
 
 def _num(s):
@@ -87,9 +89,53 @@ def _exclude_unsupported_markets(
     }
 
 
-def _read_marcap(base: str) -> pd.DataFrame:
+def _paths_in_period(
+    pattern: str,
+    start_date: date | None,
+    end_date: date | None,
+) -> list[str]:
+    """Return deterministic date-partition paths without reading other years."""
+    selected: list[str] = []
+    for path in sorted(glob.glob(pattern)):
+        match = _PARTITION_DATE.search(path)
+        if match is None:
+            continue
+        partition_date = date.fromisoformat(match.group(1))
+        if start_date is not None and partition_date < start_date:
+            continue
+        if end_date is not None and partition_date > end_date:
+            continue
+        selected.append(path)
+    return selected
+
+
+def available_years(base: str) -> list[int]:
+    """List price partition years without materializing any price rows."""
+    patterns = (
+        f"{base}/stock/marcap/date=*/all.parquet",
+        f"{base}/stock/krxapi/date=*/*.parquet",
+        f"{base}/index/krxapi/date=*/*.parquet",
+    )
+    years: set[int] = set()
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            match = _PARTITION_DATE.search(path)
+            if match is not None:
+                years.add(date.fromisoformat(match.group(1)).year)
+    return sorted(years)
+
+
+def _read_marcap(
+    base: str,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> pd.DataFrame:
     frames = []
-    for f in sorted(glob.glob(f"{base}/stock/marcap/date=*/all.parquet")):
+    for f in _paths_in_period(
+        f"{base}/stock/marcap/date=*/all.parquet",
+        start_date,
+        end_date,
+    ):
         frame = pd.read_parquet(f, columns=[
             "Code", "Date", "Open", "High", "Low", "Close", "Volume", "Amount",
             "Stocks", "Marcap", "Changes", "Market"])
@@ -112,9 +158,17 @@ def _read_marcap(base: str) -> pd.DataFrame:
     return out
 
 
-def _read_krxapi(base: str) -> pd.DataFrame:
+def _read_krxapi(
+    base: str,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> pd.DataFrame:
     frames = []
-    for f in sorted(glob.glob(f"{base}/stock/krxapi/date=*/*.parquet")):
+    for f in _paths_in_period(
+        f"{base}/stock/krxapi/date=*/*.parquet",
+        start_date,
+        end_date,
+    ):
         frame = pd.read_parquet(f)
         frame["_source_file"] = f
         frames.append(frame)
@@ -352,10 +406,18 @@ def _verify_adj_close_post_publish(
     )
 
 
-def _read_index(base: str) -> pd.DataFrame:
+def _read_index(
+    base: str,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> pd.DataFrame:
     """벤치마크 지수(코스피200·코스닥150) → 종목시세와 같은 스키마. adj_close=close."""
     frames = []
-    for f in glob.glob(f"{base}/index/krxapi/date=*/*.parquet"):
+    for f in _paths_in_period(
+        f"{base}/index/krxapi/date=*/*.parquet",
+        start_date,
+        end_date,
+    ):
         df = pd.read_parquet(f)
         df["_source_file"] = f
         frames.append(df)
@@ -382,14 +444,43 @@ def _read_index(base: str) -> pd.DataFrame:
     return out
 
 
-def prepare(base: str, target_date: date | None = None) -> tuple[pd.DataFrame, dict]:
+def prepare(
+    base: str,
+    target_date: date | None = None,
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> tuple[pd.DataFrame, dict]:
     """Bronze를 price 후보로 변환한다. 중복과 invalid row를 제거하지 않는다."""
+    if target_date is not None:
+        start_date = target_date
+        end_date = target_date
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise ValueError("start_date must be on or before end_date")
     source_files = (
-        glob.glob(f"{base}/stock/marcap/date=*/all.parquet")
-        + glob.glob(f"{base}/stock/krxapi/date=*/*.parquet")
-        + glob.glob(f"{base}/index/krxapi/date=*/*.parquet")
+        _paths_in_period(
+            f"{base}/stock/marcap/date=*/all.parquet",
+            start_date,
+            end_date,
+        )
+        + _paths_in_period(
+            f"{base}/stock/krxapi/date=*/*.parquet",
+            start_date,
+            end_date,
+        )
+        + _paths_in_period(
+            f"{base}/index/krxapi/date=*/*.parquet",
+            start_date,
+            end_date,
+        )
     )
-    stock = pd.concat([_read_marcap(base), _read_krxapi(base)], ignore_index=True)
+    stock = pd.concat(
+        [
+            _read_marcap(base, start_date, end_date),
+            _read_krxapi(base, start_date, end_date),
+        ],
+        ignore_index=True,
+    )
     stock_input_rows = len(stock)
     if not stock.empty:
         stock = _normalize_incomplete_ohlc(stock)
@@ -405,7 +496,7 @@ def prepare(base: str, target_date: date | None = None) -> tuple[pd.DataFrame, d
     stock["identifier"] = stock["ticker"].astype(str)
     stock["asset_type"] = "stock"
     # 지수
-    idx = _read_index(base)
+    idx = _read_index(base, start_date, end_date)
     index_input_rows = int(idx.attrs.get("input_rows", len(idx)))
     if not idx.empty:
         if target_date is not None:

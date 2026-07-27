@@ -187,6 +187,40 @@ def save_metrics(conn, run_id: UUID, bundle) -> None:
             )
 
 
+def save_price_partition_metrics(
+    conn,
+    run_id: UUID,
+    *,
+    row_count: int,
+    instrument_count: int,
+    year_row_counts: dict[int, int],
+) -> None:
+    """Persist bounded-memory price audit metrics without a full DataFrame."""
+    rows = [
+        ("row_count", {}, row_count),
+        ("distinct_instrument_count", {}, instrument_count),
+    ]
+    rows.extend(
+        ("row_count_by_year", {"year": year}, count)
+        for year, count in sorted(year_row_counts.items())
+    )
+    with conn.cursor() as cur:
+        for metric_name, dimension, value in rows:
+            cur.execute(
+                """
+                INSERT INTO dq_metric(
+                    run_id,dataset_name,metric_name,dimension,metric_value
+                ) VALUES (%s,'price_daily',%s,%s::jsonb,%s)
+                """,
+                (
+                    run_id,
+                    metric_name,
+                    json.dumps(dimension, ensure_ascii=False),
+                    float(value),
+                ),
+            )
+
+
 def finish_run(
     conn,
     context: BatchContext,

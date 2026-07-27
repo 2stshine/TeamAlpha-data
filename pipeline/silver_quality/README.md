@@ -10,6 +10,10 @@ Silver는 정규화된 데이터가 아니라 이 폴더의 규칙을 통과한 
 temporary staging과 단일 publish transaction을 유지한다.
 
 운영 S3 전체 감사는 가격·재무 전체 후보를 같은 프로세스에 보유하지 않는다.
+가격은 달력 연도별로 읽고 직전 20거래일과 다음 해 1월의 기업행사 대사 창만
+유지한다. 따라서 중복·OHLC·시장 completeness·수익률·coverage·기업행사
+규칙은 연도 경계까지 이어지지만, 전 기간 가격 DataFrame은 만들지 않는다.
+연도별 행 수와 전체 종목 수는 `dq_metric`에 저장한다.
 
 ```bash
 uv run python -m pipeline.silver_quality.s3_domain_audit --action init

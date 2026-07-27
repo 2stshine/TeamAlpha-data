@@ -1,8 +1,14 @@
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from pipeline.silver_quality import s3_domain_audit
+from pipeline.silver_quality.models import (
+    CheckResult,
+    CheckStatus,
+    Severity,
+)
 
 
 def test_price_universes_streams_supported_market_tickers(tmp_path):
@@ -177,3 +183,62 @@ def test_price_bundle_does_not_prepare_fundamentals(monkeypatch):
 
     assert bundle.fundamentals.empty
     assert len(bundle.prices) == 1
+
+
+def test_price_history_tail_keeps_only_last_twenty_trading_days():
+    frame = pd.DataFrame({
+        "identifier": ["005930"] * 25,
+        "trade_date": [
+            date(2025, 12, day) for day in range(1, 26)
+        ],
+        "close": range(25),
+    })
+
+    tail = s3_domain_audit._price_history_tail(
+        pd.DataFrame(),
+        frame,
+    )
+
+    assert len(tail) == 20
+    assert tail["trade_date"].min() == date(2025, 12, 6)
+
+
+def test_align_history_adj_close_matches_first_current_return():
+    history = pd.DataFrame([{
+        "identifier": "005930",
+        "trade_date": date(2025, 12, 30),
+        "close": 100.0,
+        "adj_close": 100.0,
+    }])
+    current = pd.DataFrame([{
+        "identifier": "005930",
+        "trade_date": date(2026, 1, 2),
+        "close": 55.0,
+        "adj_close": 55.0,
+        "prev_diff": 5.0,
+    }])
+
+    aligned = s3_domain_audit._align_history_adj_close(history, current)
+
+    # KRX reference is 50, so the economic return is 10%.
+    assert aligned.iloc[0]["adj_close"] == pytest.approx(50.0)
+
+
+def test_warning_totals_sum_repeated_annual_rules():
+    results = [
+        CheckResult(
+            rule_code="PRICE_WARNING",
+            dataset="price_daily",
+            severity=Severity.WARNING,
+            status=CheckStatus.FAIL,
+            expected="fixture",
+            actual="fixture",
+            failed_count=count,
+            partition_key=f"year:{year}",
+        )
+        for year, count in ((2025, 2), (2026, 3))
+    ]
+
+    assert s3_domain_audit._warning_totals(results) == {
+        "PRICE_WARNING": 5,
+    }

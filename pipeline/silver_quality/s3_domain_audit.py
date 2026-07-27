@@ -10,6 +10,7 @@ import argparse
 import gc
 import json
 import os
+from datetime import date
 from pathlib import Path
 from uuid import UUID
 
@@ -24,6 +25,7 @@ from pipeline.silver_quality.models import (
     CandidateBundle,
     CheckResult,
     CheckStatus,
+    QualityGateError,
     Severity,
 )
 from pipeline.silver_quality.runner import (
@@ -53,6 +55,19 @@ def _required(name: str) -> str:
     if not value:
         raise RuntimeError(f"required environment variable is missing: {name}")
     return value
+
+
+def _warning_totals(results: list[CheckResult]) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for item in results:
+        if (
+            item.severity == Severity.WARNING
+            and item.status == CheckStatus.FAIL
+        ):
+            totals[item.rule_code] = (
+                totals.get(item.rule_code, 0) + item.failed_count
+            )
+    return totals
 
 
 def _manifest_fingerprint() -> str:
@@ -143,6 +158,196 @@ def _price_bundle(base: str) -> CandidateBundle:
     )
 
 
+def _price_static_bundle(base: str) -> CandidateBundle:
+    """Prepare only bounded price-domain inputs shared by annual partitions."""
+    asset_df, identifier_df = assets.prepare(base)
+    _, supported = _price_universes(base)
+    asset_df, identifier_df = assets.restrict_to_price_universe(
+        asset_df,
+        identifier_df,
+        supported,
+    )
+    action_df, action_stats = corporate_actions.prepare(base)
+    action_df, inheritance = corporate_actions.inherit_issuer_events(
+        action_df,
+        assets.preferred_share_issuer_map(asset_df),
+    )
+    action_stats["issuer_inheritance"] = inheritance
+    return CandidateBundle(
+        assets=asset_df,
+        identifiers=identifier_df,
+        stats={
+            "corporate_action": action_stats,
+            "_corporate_actions": action_df,
+        },
+    )
+
+
+def _price_history_tail(
+    previous: pd.DataFrame,
+    current: pd.DataFrame,
+    trading_days: int = 20,
+) -> pd.DataFrame:
+    """Keep only the rows needed for cross-year lags and 20-day baselines."""
+    combined = pd.concat([previous, current], ignore_index=True)
+    if combined.empty:
+        return combined
+    dates = sorted(combined["trade_date"].dropna().unique())
+    keep_dates = set(dates[-trading_days:])
+    return combined[combined["trade_date"].isin(keep_dates)].copy()
+
+
+def _align_history_adj_close(
+    history: pd.DataFrame,
+    current: pd.DataFrame,
+) -> pd.DataFrame:
+    """Align prior-year tail scale to the independently normalized year.
+
+    Annual preparation intentionally normalizes adj_close at each year end.
+    Only the last prior observation is used to verify the first current
+    observation's adjusted-return recurrence, so rescale that anchor from the
+    KRX reference return. Close-based spike and drift rules are unaffected.
+    """
+    if history.empty or current.empty:
+        return history
+    aligned = history.copy()
+    first = (
+        current.sort_values(["identifier", "trade_date"])
+        .groupby("identifier", sort=False)
+        .head(1)
+        .set_index("identifier")
+    )
+    last_indices = (
+        aligned.sort_values(["identifier", "trade_date"])
+        .groupby("identifier", sort=False)
+        .tail(1)
+        .index
+    )
+    for index in last_indices:
+        identifier = str(aligned.at[index, "identifier"])
+        if identifier not in first.index:
+            continue
+        row = first.loc[identifier]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        previous_close = pd.to_numeric(
+            pd.Series([aligned.at[index, "close"]]),
+            errors="coerce",
+        ).iloc[0]
+        close = pd.to_numeric(pd.Series([row["close"]]), errors="coerce").iloc[0]
+        prev_diff = pd.to_numeric(
+            pd.Series([row["prev_diff"]]),
+            errors="coerce",
+        ).iloc[0]
+        current_adj = pd.to_numeric(
+            pd.Series([row["adj_close"]]),
+            errors="coerce",
+        ).iloc[0]
+        reference = close - prev_diff
+        if (
+            pd.isna(previous_close)
+            or pd.isna(reference)
+            or pd.isna(current_adj)
+            or previous_close <= 0
+            or reference <= 0
+        ):
+            continue
+        economic_return = close / reference - 1
+        aligned.at[index, "adj_close"] = current_adj / (1 + economic_return)
+    return aligned
+
+
+def _run_price_partitions(
+    base: str,
+) -> tuple[list[CheckResult], int, set[str], dict[int, int]]:
+    """Evaluate the complete cutoff one calendar year at a time."""
+    static = _price_static_bundle(base)
+    years = prices.available_years(base)
+    if not years:
+        return [], 0, set(), {}
+    results: list[CheckResult] = []
+    history = pd.DataFrame()
+    row_count = 0
+    identifiers: set[str] = set()
+    year_row_counts: dict[int, int] = {}
+    final_year = years[-1]
+    for year in years:
+        frame, stats = prices.prepare(
+            base,
+            start_date=date(year, 1, 1),
+            end_date=date(year, 12, 31),
+        )
+        aligned_history = _align_history_adj_close(history, frame)
+        lookahead = pd.DataFrame()
+        if year < final_year:
+            # Corporate actions at year end may be reflected on the first
+            # trading day of the next year. Keep a small forward window so
+            # event-centric checks have the same evidence as a full scan.
+            lookahead, _ = prices.prepare(
+                base,
+                start_date=date(year + 1, 1, 1),
+                end_date=date(year + 1, 1, 31),
+            )
+        evaluation_context = pd.concat(
+            [aligned_history, lookahead],
+            ignore_index=True,
+        )
+        bundle = CandidateBundle(
+            assets=static.assets,
+            identifiers=static.identifiers,
+            prices=frame,
+            stats={
+                "price_daily": stats,
+                "corporate_action": static.stats["corporate_action"],
+                "_corporate_actions": static.stats["_corporate_actions"],
+            },
+        )
+        partition_key = f"year:{year}"
+        partition_results = evaluate(
+            bundle,
+            history=evaluation_context,
+            partition_key=partition_key,
+        )
+        results.extend(partition_results)
+        try:
+            assert_publishable(partition_results)
+        except QualityGateError:
+            raise QualityGateError(results)
+        rows = len(frame)
+        row_count += rows
+        year_row_counts[year] = rows
+        identifiers.update(frame["identifier"].astype(str))
+        history = _price_history_tail(history, frame)
+        print(
+            json.dumps({
+                "domain": "prices",
+                "partition_key": partition_key,
+                "rows": rows,
+                "cumulative_rows": row_count,
+            }, sort_keys=True),
+            flush=True,
+        )
+        del (
+            aligned_history,
+            evaluation_context,
+            lookahead,
+            bundle,
+            frame,
+            partition_results,
+        )
+        gc.collect()
+    results.append(CheckResult(
+        rule_code="PARTITIONED_PRICE_AUDIT_COMPLETE",
+        dataset="price_daily",
+        severity=Severity.CRITICAL,
+        status=CheckStatus.PASS,
+        expected="every discovered price year is evaluated exactly once",
+        actual=f"years={years}, row_count={row_count}",
+        partition_key="domain:prices",
+    ))
+    return results, row_count, identifiers, year_row_counts
+
+
 def _fundamental_bundle(base: str) -> CandidateBundle:
     asset_df, identifier_df = assets.prepare(base)
     all_identifiers, supported = _price_universes(base)
@@ -231,40 +436,59 @@ def run_domain(domain: str, parent_run_id: UUID) -> UUID:
             partition_key=f"domain:{domain}",
             input_fingerprint=fingerprint,
         )
-        bundle = (
-            _price_bundle(str(root))
-            if domain == "prices"
-            else _fundamental_bundle(str(root))
-        )
-        results = evaluate(
-            bundle,
-            partition_key=f"domain:{domain}",
-        )
-        results.append(_required_domain_result(domain, bundle))
+        if domain == "prices":
+            (
+                results,
+                row_count,
+                price_identifiers,
+                year_row_counts,
+            ) = _run_price_partitions(str(root))
+            required = CheckResult(
+                rule_code="SPLIT_AUDIT_REQUIRED_DATASET",
+                dataset="price_daily",
+                severity=Severity.CRITICAL,
+                status=CheckStatus.PASS if row_count else CheckStatus.FAIL,
+                expected="non-empty prices candidate for split audit",
+                actual=f"row_count={row_count}",
+                failed_count=0 if row_count else 1,
+                partition_key="domain:prices",
+            )
+            results.append(required)
+            bundle = None
+        else:
+            bundle = _fundamental_bundle(str(root))
+            results = evaluate(
+                bundle,
+                partition_key=f"domain:{domain}",
+            )
+            results.append(_required_domain_result(domain, bundle))
+            row_count = len(bundle.fundamentals)
         print_summary(results)
         assert_publishable(results)
         gc.collect()
-        repository.save_metrics(conn, context.run_id, bundle)
+        if domain == "prices":
+            repository.save_price_partition_metrics(
+                conn,
+                context.run_id,
+                row_count=row_count,
+                instrument_count=len(price_identifiers),
+                year_row_counts=year_row_counts,
+            )
+        else:
+            repository.save_metrics(conn, context.run_id, bundle)
         repository.finish_run(conn, context, "CERTIFIED", results)
         print(json.dumps({
             "domain": domain,
             "run_id": str(context.run_id),
             "parent_run_id": str(parent_run_id),
             "fingerprint": fingerprint,
-            "rows": (
-                len(bundle.prices)
-                if domain == "prices"
-                else len(bundle.fundamentals)
-            ),
-            "warnings": {
-                item.rule_code: item.failed_count
-                for item in results
-                if item.severity == Severity.WARNING
-                and item.status == CheckStatus.FAIL
-            },
+            "rows": row_count,
+            "warnings": _warning_totals(results),
         }, ensure_ascii=False, sort_keys=True), flush=True)
         return context.run_id
     except Exception as exc:
+        if isinstance(exc, QualityGateError):
+            results = exc.results
         try:
             conn.rollback()
             if context is not None:
@@ -390,12 +614,7 @@ def finalize(parent_run_id: UUID) -> None:
                 domain: str(child[0])
                 for domain, child in resolved.items()
             },
-            "warnings": {
-                item.rule_code: item.failed_count
-                for item in results
-                if item.severity == Severity.WARNING
-                and item.status == CheckStatus.FAIL
-            },
+            "warnings": _warning_totals(results),
         }, ensure_ascii=False, sort_keys=True), flush=True)
     except Exception as exc:
         conn.rollback()

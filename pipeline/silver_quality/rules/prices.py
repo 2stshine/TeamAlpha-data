@@ -1,6 +1,8 @@
 """price_daily 결정적 규칙과 통계적 경고."""
 from __future__ import annotations
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 
@@ -418,6 +420,26 @@ def check_prices(
     ]
     if prices.empty:
         return checks
+    scoped_corporate_actions = corporate_actions
+    if (
+        partition_key is not None
+        and partition_key.startswith("year:")
+        and corporate_actions is not None
+        and not corporate_actions.empty
+        and "effective_date" in corporate_actions
+    ):
+        audit_year = int(partition_key.split(":", 1)[1])
+        scoped_corporate_actions = corporate_actions.copy()
+        effective_date = pd.to_datetime(
+            scoped_corporate_actions.get("effective_date"),
+            errors="coerce",
+        )
+        scoped_corporate_actions = scoped_corporate_actions[
+            effective_date.between(
+                pd.Timestamp(date(audit_year, 1, 1)),
+                pd.Timestamp(date(audit_year, 12, 31)),
+            )
+        ]
 
     if target_date is not None:
         bad_date = prices[prices["trade_date"] != target_date]
@@ -1010,7 +1032,10 @@ def check_prices(
     # DART 감자 전/후 발행주식 수는 가격계수가 아니다. 균등병합만 효력일
     # 주변 전체 KRX 상장주식 수 변화와 비교하고 나머지는 Explained로 남긴다.
     share_factor_mismatch, non_comparable_reductions = (
-        _dart_share_count_factor_results(combined, corporate_actions)
+        _dart_share_count_factor_results(
+            combined,
+            scoped_corporate_actions,
+        )
     )
     checks.append(result(
         "DART_SHARE_COUNT_FACTOR_MISMATCH",
@@ -1044,7 +1069,7 @@ def check_prices(
 
     missing_krx_adjustment = _dart_actions_without_krx_adjustment(
         combined,
-        corporate_actions,
+        scoped_corporate_actions,
         set(prices["trade_date"]),
     )
     checks.append(result(

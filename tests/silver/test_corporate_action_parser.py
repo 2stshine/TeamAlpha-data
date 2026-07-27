@@ -68,7 +68,13 @@ def test_capital_reduction_share_factor_is_not_a_price_factor(tmp_path):
     assert events.iloc[0]["event_type"] == "capital_reduction"
     assert pd.isna(events.iloc[0]["expected_factor"])
     assert events.iloc[0]["share_count_factor"] == pytest.approx(8.0)
+    assert events.iloc[0]["share_count_before"] == pytest.approx(8_000)
+    assert events.iloc[0]["share_count_after"] == pytest.approx(1_000)
     assert events.iloc[0]["share_count_factor_comparable"]
+    assert (
+        events.iloc[0]["share_count_comparison_reason"]
+        == "UNIFORM_REDUCTION"
+    )
     assert events.iloc[0]["action_method"] == "보통주식 8대 1 무상감자"
 
 
@@ -107,6 +113,40 @@ def test_combined_offering_does_not_infer_factor_from_bonus_leg_only(tmp_path):
 
     assert events.iloc[0]["event_type"] == "combined_offering"
     assert pd.isna(events.iloc[0]["expected_factor"])
+
+
+def test_simultaneous_financing_makes_reduction_ratio_not_comparable(tmp_path):
+    reduction = (
+        tmp_path
+        / "corporate_actions/dart/structured/event=capital_reduction/year=2026"
+        / "corp=005930/rcept=20260601000010.json"
+    )
+    financing = (
+        tmp_path
+        / "corporate_actions/dart/structured/event=paid_increase/year=2026"
+        / "corp=005930/rcept=20260601000011.json"
+    )
+    _write_json(reduction, {
+        "rcept_no": "20260601000010",
+        "cr_std": "2026년 07월 08일",
+        "bfcr_tisstk_ostk": "8,000",
+        "atcr_tisstk_ostk": "1,000",
+        "cr_mth": "보통주식 8대 1 무상감자",
+    })
+    _write_json(financing, {
+        "rcept_no": "20260601000011",
+    })
+
+    events, _ = corporate_actions.prepare(str(tmp_path))
+
+    reduction_event = events[
+        events["event_type"].eq("capital_reduction")
+    ].iloc[0]
+    assert not reduction_event["share_count_factor_comparable"]
+    assert (
+        reduction_event["share_count_comparison_reason"]
+        == "SIMULTANEOUS_FINANCING_DISCLOSURE"
+    )
 
 
 def test_ex_dividend_notice_is_evidence_not_required_price_adjustment(tmp_path):

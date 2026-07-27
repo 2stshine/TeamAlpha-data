@@ -26,7 +26,10 @@ COLUMNS = [
     "match_window_days",
     "expected_factor",
     "share_count_factor",
+    "share_count_before",
+    "share_count_after",
     "share_count_factor_comparable",
+    "share_count_comparison_reason",
     "action_method",
     "confirms_price_adjustment",
     "expects_price_adjustment",
@@ -174,6 +177,96 @@ def _share_count_factor_comparable(event_type: str, row: dict) -> bool:
     return not any(marker in method for marker in non_comparable)
 
 
+def _classify_share_count_comparability(
+    events: pd.DataFrame,
+) -> pd.DataFrame:
+    """Exclude reductions whose isolated DART ratio cannot match KRX shares."""
+    if events.empty:
+        return events
+    classified = events.copy()
+    classified["share_count_comparison_reason"] = None
+    reductions = classified["event_type"].eq("capital_reduction")
+    classified.loc[
+        reductions
+        & ~classified["share_count_factor_comparable"].fillna(False),
+        "share_count_comparison_reason",
+    ] = "ACTION_METHOD_NOT_UNIFORM"
+
+    by_identifier = {
+        str(identifier): group
+        for identifier, group in classified.groupby(
+            classified["identifier"].astype(str),
+            sort=False,
+        )
+    }
+    financing_types = {
+        "paid_increase",
+        "combined_offering",
+        "bonus_issue",
+    }
+    for index, reduction in classified[reductions].iterrows():
+        if not bool(reduction["share_count_factor_comparable"]):
+            continue
+        peers = by_identifier.get(str(reduction["identifier"]))
+        if peers is None:
+            continue
+        announcement = reduction["announcement_date"]
+        effective = reduction["effective_date"]
+        simultaneous_financing = peers[
+            peers["event_type"].isin(financing_types)
+            & peers["announcement_date"].notna()
+            & (
+                peers["announcement_date"].map(
+                    lambda value: abs((value - announcement).days)
+                    if pd.notna(announcement)
+                    else 9999
+                ).le(3)
+            )
+        ]
+        simultaneous_split = peers[
+            peers["event_type"].eq("stock_split")
+            & (
+                peers.apply(
+                    lambda row: min(
+                        abs((value - effective).days)
+                        for value in (
+                            row["effective_date"],
+                            row["announcement_date"],
+                        )
+                        if pd.notna(value) and pd.notna(effective)
+                    )
+                    if (
+                        pd.notna(effective)
+                        and (
+                            pd.notna(row["effective_date"])
+                            or pd.notna(row["announcement_date"])
+                        )
+                    )
+                    else 9999,
+                    axis=1,
+                ).le(30)
+            )
+        ]
+        if not simultaneous_split.empty:
+            classified.at[index, "share_count_factor_comparable"] = False
+            classified.at[
+                index,
+                "share_count_comparison_reason",
+            ] = "SIMULTANEOUS_STOCK_SPLIT"
+        elif not simultaneous_financing.empty:
+            classified.at[index, "share_count_factor_comparable"] = False
+            classified.at[
+                index,
+                "share_count_comparison_reason",
+            ] = "SIMULTANEOUS_FINANCING_DISCLOSURE"
+        else:
+            classified.at[
+                index,
+                "share_count_comparison_reason",
+            ] = "UNIFORM_REDUCTION"
+    return classified
+
+
 def _structured_row(
     path: str,
     row: dict,
@@ -202,10 +295,21 @@ def _structured_row(
         "match_window_days": 7 if effective_date else 0,
         "expected_factor": _structured_expected_factor(event_type, row),
         "share_count_factor": _structured_share_count_factor(event_type, row),
+        "share_count_before": (
+            _number(row.get("bfcr_tisstk_ostk"))
+            if event_type == "capital_reduction"
+            else None
+        ),
+        "share_count_after": (
+            _number(row.get("atcr_tisstk_ostk"))
+            if event_type == "capital_reduction"
+            else None
+        ),
         "share_count_factor_comparable": _share_count_factor_comparable(
             event_type,
             row,
         ),
+        "share_count_comparison_reason": None,
         "action_method": row.get("cr_mth") if event_type == "capital_reduction" else None,
         "confirms_price_adjustment": (
             event_type in PRICE_ADJUSTING_STRUCTURED
@@ -283,7 +387,10 @@ def _disclosure_row(path: str, row: dict) -> dict | None:
         "match_window_days": match_window_days,
         "expected_factor": None,
         "share_count_factor": None,
+        "share_count_before": None,
+        "share_count_after": None,
         "share_count_factor_comparable": False,
+        "share_count_comparison_reason": None,
         "action_method": None,
         "confirms_price_adjustment": confirms_adjustment,
         "expects_price_adjustment": expects_adjustment,
@@ -379,6 +486,7 @@ def prepare(
         ["identifier", "event_type", "rcept_no", "source"],
         keep="last",
     ).reset_index(drop=True)
+    events = _classify_share_count_comparability(events)
     if target_date is not None:
         lower = target_date - pd.Timedelta(days=180)
         upper = target_date + pd.Timedelta(days=30)

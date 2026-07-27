@@ -23,6 +23,14 @@ uv run python -m pipeline.silver_quality.s3_domain_audit \
   --action domain --domain fundamentals --parent-run-id <run-id>
 uv run python -m pipeline.silver_quality.s3_domain_audit \
   --action finalize --parent-run-id <run-id>
+
+# 기존 Silver와 immutable Bronze를 전 기간·저메모리 방식으로 독립 대사
+uv run python -m pipeline.silver_quality.streaming_adj_close \
+  --base <bronze-cutoff-root>
+
+# 운영 다운로드 없이 로컬 cutoff의 Warning을 연도별로 원인 분석
+uv run python -m pipeline.silver_quality.warning_analysis \
+  --base <bronze-cutoff-root> --domain prices
 ```
 
 - `prices`는 stock/index, asset/identifier, DART 기업행사만 읽는다.
@@ -50,23 +58,26 @@ uv run python -m pipeline.silver_quality.s3_domain_audit \
 | `ADJ_CLOSE_SOURCE_FIELDS` | Error | 수정종가 검증에 필요한 전일대비·등락률 존재 |
 | `ADJ_CLOSE_RECONCILIATION` | Error | 전체 시계열 수정종가를 독립 재계산해 소수 4자리 값 대사 |
 | `ADJ_CLOSE_RETURN_CONTINUITY` | Error | 기업행사 전후 수정주가 수익률과 KRX 기준가 수익률 일치 |
+| `ADJ_CLOSE_FULL_SERIES_STREAMING_RECONCILIATION` | Error | Bronze 전 기간을 2회 연도별 순회해 listing episode별 누적 KRX 계수를 독립 재계산하고, Silver의 모든 close·adj_close 키와 값을 대사 |
 | `ADJ_CLOSE_POST_PUBLISH` | Critical | 일별 소급조정 후 RDS 직전·당일 행을 commit 전에 재검증 |
 | `LISTING_EPISODE_BOUNDARY` | Info/Pass | 동일 ticker가 365일 초과 사라졌다 재등장하면 과거 발행회사와 수정주가·수익률 사슬 분리 |
 | `PRICE_RETURN_SPIKE` | Warning | KRX 기준가 조정 후 일간 절대수익률 30.5% 초과이며 DART 특별거래 공시로 설명되지 않음 |
 | `PRICE_ROUND_TRIP_SPIKE` | Warning | 급등락 후 3일 내 원래 가격 복귀 |
 | `SETTLEMENT_TRADING_PRICE_SPIKE` | Explained(Info/Pass) | 전수 검토된 상장폐지 종목의 종료된 시계열 마지막 7거래일 급변을 가격제한폭 없는 정리매매로 설명 |
 | `PRICE_SCALE_JUMP` | Warning | DART·KRX 주식수/시총·특별거래로 설명되지 않는 10배·100배 단위 변화 |
-| `CORPORATE_ACTION_INFERRED_FROM_KRX_STRUCTURE` | Info/Pass | 가격과 주식수가 반대로 10배·100배 변하고 시가총액이 유지된 구조변경 |
+| `CORPORATE_ACTION_INFERRED_FROM_KRX_STRUCTURE` | Info/Pass | KRX 비교기준가 조정계수와 실제 상장주식 수 변화가 2% 이내에서 역수 관계인 구조변경 |
 | `SPECIAL_TRADING_EVENT` | Info/Pass | 최근 120일 내 정리매매·상장폐지·거래재개·재상장·변경상장 DART 공시로 설명되는 실제 30.5% 초과 가격 변화. 보통주 공시는 이름이 유일하게 일치하는 우선주에도 발행회사 근거로 상속하며 가격값은 수정하지 않음 |
 | `PRICE_ADJUSTMENT_FACTOR_CHANGE` | Info/Pass | KRX 기준가 수정계수 0.5% 초과 기업행사 기록 |
 | `PRICE_ADJUSTMENT_WITHOUT_DART_EVENT` | Warning | 0.5% 초과 KRX 조정계수에 인접한 DART 기업행사 근거가 없음 |
 | `CORPORATE_ACTION_FACTOR_MISMATCH` | Warning | DART가 실제 가격계수를 제공하는 행사와 KRX 가격계수가 2% 초과 불일치. 감자 전후 주식 수는 비교하지 않음 |
-| `DART_SHARE_COUNT_FACTOR_MISMATCH` | Warning | DART 감자 전후 보통주 수 비율과 KRX 실제 상장주식 수 변화가 2% 초과 불일치 |
-| `DART_SHARE_COUNT_FACTOR_NOT_COMPARABLE` | Explained(Info/Pass) | 특정주주 소각·유상/액면감자·동시 주식분할 등 DART 감자비율과 전체 KRX 상장주식 수를 직접 비교할 수 없는 행사 |
-| `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` | Warning | 가격조정형 DART 효력일 근처에 KRX 조정계수가 없음 |
+| `DART_SHARE_COUNT_FACTOR_MISMATCH` | Warning | DART 발행주식 수와 KRX 상장주식 수의 행사 전후 scope가 각각 2% 이내로 일치하는 균등감자에 한해 두 변화율이 2% 초과 불일치 |
+| `DART_SHARE_COUNT_FACTOR_NOT_COMPARABLE` | Explained(Info/Pass) | 특정주주 소각·액면가 감소·동시 증자/주식분할·DART 발행주식과 KRX 상장주식 scope 차이·관측 부재로 직접 비교할 수 없는 행사 |
+| `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` | Warning | 비교 가능한 가격조정형 DART 효력일 근처 또는 장기 거래정지 후 첫 거래일에 KRX 조정계수가 없음 |
 | `PRICE_COVERAGE_DRIFT` | Warning | 시장별 종목 수가 20일 median 대비 10% 초과 감소 |
 | `PRICE_COVERAGE_GROWTH` | Info/Pass | 시장별 종목 수가 20일 median 대비 10% 초과 증가 |
 | `PRICE_DISTRIBUTION_DRIFT` | Warning | 횡단면 수익률 median의 MAD 이상 |
+| `PRICE_DISTRIBUTION_DRIFT_BENCHMARK_CONSISTENCY` | Error | drift일에 코스피200·코스닥150이 모두 같은 방향이고 주식 종목의 60% 이상도 같은 방향인지 검사 |
+| `PRICE_DISTRIBUTION_DRIFT_MARKET_CONFIRMED` | Info/Pass | 위 독립 시장 근거로 확인된 drift 날짜를 기록하되 원래 drift는 Warning으로 유지 |
 | `FUNDAMENTAL_PIT_ORDER` | Critical | 공시 및 사용가능일 순서 |
 | `NO_TRADABLE_PRICE_ASSET` | Info/Pass | 전체 가격 기간에 없는 DART-only 기업을 명시적으로 제외하고 건수·표본 기록 |
 | `DART_FULL_STATEMENT_SUPPLEMENT` | Info/Pass | DART 주요계정에 없는 business key만 전체 재무제표의 BS·IS/CIS 계정으로 보강한 행·파일 수 기록 |

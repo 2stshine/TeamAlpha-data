@@ -235,6 +235,15 @@ def _dart_actions_without_krx_adjustment(
         events["expects_price_adjustment"].fillna(False)
         & events["effective_date"].notna()
     ].drop_duplicates(["identifier", "event_type", "effective_date"])
+    # 비균등 감자·자기주식 소각·액면가 감소 등은 모든 상장주식에
+    # 적용되는 하나의 가격조정계수를 기대할 수 없다. 주식수 비교 가능성
+    # 규칙에서 별도로 기록하고, "KRX 가격조정 누락"으로 판정하지 않는다.
+    if "share_count_factor_comparable" in events:
+        noncomparable_reduction = (
+            events["event_type"].eq("capital_reduction")
+            & ~events["share_count_factor_comparable"].fillna(False)
+        )
+        events = events[~noncomparable_reduction]
     if "issuer_event_inherited" in events:
         events = events[
             ~events["issuer_event_inherited"].fillna(False)
@@ -261,6 +270,21 @@ def _dart_actions_without_krx_adjustment(
         # 조정계수를 놓치므로, 허용 창 전체에 조정 행이 하나라도 있는지 본다.
         if in_window["source_adjustment_event"].fillna(False).any():
             continue
+        # 감자·병합 중 장기 거래정지가 있으면 효력일 근처에 거래행이
+        # 존재하지 않는다. 효력일 전 마지막 거래와 이후 첫 거래가 같은
+        # listing episode(365일 이내)에 속할 때 거래재개 행의 KRX
+        # 기준가 조정도 해당 행사의 관측치로 인정한다.
+        before = group[group["trade_date"] < event["effective_date"]].tail(1)
+        after = group[group["trade_date"] >= event["effective_date"]].head(1)
+        if not before.empty and not after.empty:
+            suspension_days = (
+                after.iloc[0]["trade_date"] - before.iloc[0]["trade_date"]
+            ).days
+            if (
+                suspension_days <= LISTING_EPISODE_GAP_DAYS
+                and bool(after.iloc[0]["source_adjustment_event"])
+            ):
+                continue
         nearest_index = distances.loc[in_window.index].idxmin()
         nearest = group.loc[nearest_index]
         if nearest["trade_date"] not in candidate_dates:
@@ -319,6 +343,12 @@ def _dart_share_count_factor_results(
         events["share_count_factor"],
         errors="coerce",
     )
+    for column in ("share_count_before", "share_count_after"):
+        if column in events:
+            events[column] = pd.to_numeric(
+                events[column],
+                errors="coerce",
+            )
     events = events[
         events["event_type"].eq("capital_reduction")
         & events["effective_date"].notna()
@@ -347,31 +377,57 @@ def _dart_share_count_factor_results(
             "action_method": event.get("action_method"),
             "dart_share_count_factor": event["share_count_factor"],
         }
+        comparison_reason = event.get("share_count_comparison_reason")
         if not bool(event.get("share_count_factor_comparable")):
             excluded.append({
                 **base,
-                "reason": "non-uniform or non-share-count-comparable reduction",
+                "reason": (
+                    str(comparison_reason)
+                    if pd.notna(comparison_reason)
+                    else "non-uniform or non-share-count-comparable reduction"
+                ),
             })
             continue
         group = by_identifier.get(event["identifier"])
         if group is None or group.empty:
             continue
+        before = group[group["trade_date"] < event["effective_date"]].tail(1)
+        after = group[group["trade_date"] >= event["effective_date"]].head(1)
+        if before.empty or after.empty:
+            excluded.append({
+                **base,
+                "reason": "no before/after KRX listed-share observations",
+            })
+            continue
+        dart_before = event.get("share_count_before")
+        dart_after = event.get("share_count_after")
+        if pd.notna(dart_before) and pd.notna(dart_after):
+            before_scope_error = abs(
+                float(before.iloc[0]["shares"]) - float(dart_before)
+            ) / float(dart_before)
+            after_scope_error = abs(
+                float(after.iloc[0]["shares"]) - float(dart_after)
+            ) / float(dart_after)
+            if before_scope_error > 0.02 or after_scope_error > 0.02:
+                excluded.append({
+                    **base,
+                    "reason": (
+                        "DART issued-share scope differs from KRX listed "
+                        "shares at event boundary"
+                    ),
+                })
+                continue
         window = int(event.get("match_window_days") or 0)
         distances = group["trade_date"].map(
             lambda value: abs((value - event["effective_date"]).days)
         )
         nearby = group.loc[distances.le(window)].copy()
         nearby = nearby[
+            nearby["trade_date"].ge(event["effective_date"])
+            &
             nearby["previous_shares"].gt(0)
             & nearby["shares"].gt(0)
         ]
-        if nearby.empty:
-            excluded.append({
-                **base,
-                "reason": "no comparable KRX listed-share observations in window",
-            })
-            continue
-
         # 일별 변경과 허용 창 전체의 누적 변경을 모두 후보로 본다.
         observed: list[tuple[float, object]] = [
             (
@@ -380,12 +436,30 @@ def _dart_share_count_factor_results(
             )
             for row in nearby.itertuples()
         ]
-        first = nearby.iloc[0]
-        last = nearby.iloc[-1]
-        observed.append((
-            float(first["previous_shares"]) / float(last["shares"]),
-            last["trade_date"],
-        ))
+        if not nearby.empty:
+            first = nearby.iloc[0]
+            last = nearby.iloc[-1]
+            observed.append((
+                float(first["previous_shares"]) / float(last["shares"]),
+                last["trade_date"],
+            ))
+        # 거래정지로 효력일 주변 일별 행이 없을 때는 효력일 전 마지막
+        # 관측치와 거래재개 후 첫 관측치를 직접 비교한다.
+        suspension_days = (
+            after.iloc[0]["trade_date"] - before.iloc[0]["trade_date"]
+        ).days
+        if suspension_days <= LISTING_EPISODE_GAP_DAYS:
+            observed.append((
+                float(before.iloc[0]["shares"])
+                / float(after.iloc[0]["shares"]),
+                after.iloc[0]["trade_date"],
+            ))
+        if not observed:
+            excluded.append({
+                **base,
+                "reason": "no comparable KRX listed-share observations",
+            })
+            continue
         expected = float(event["share_count_factor"])
         actual, observed_date = min(
             observed,
@@ -404,6 +478,71 @@ def _dart_share_count_factor_results(
         pd.DataFrame(mismatches, columns=output_columns),
         pd.DataFrame(excluded, columns=output_columns),
     )
+
+
+def _distribution_drift_confirmation(
+    combined: pd.DataFrame,
+    distribution_bad: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Cross-check statistical drift against stock breadth and benchmarks."""
+    if distribution_bad.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    drift_dates = set(distribution_bad["trade_date"])
+    drift_direction = distribution_bad.set_index(
+        "trade_date",
+    )["median_return"]
+    stock_returns = combined[
+        combined["asset_type"].eq("stock")
+        & combined["trade_date"].isin(drift_dates)
+    ].copy()
+    stock_returns["direction_match"] = (
+        np.sign(stock_returns["return"])
+        == np.sign(stock_returns["trade_date"].map(drift_direction))
+    )
+    breadth = stock_returns.groupby(
+        "trade_date",
+    )["direction_match"].mean()
+
+    benchmark = combined[
+        combined["asset_type"].eq("index")
+        & combined["identifier"].isin(["1028", "2203"])
+        & combined["trade_date"].isin(drift_dates)
+    ].copy()
+    benchmark["direction_match"] = (
+        np.sign(benchmark["return"])
+        == np.sign(
+            benchmark["trade_date"].map(drift_direction)
+        )
+    )
+    benchmark_summary = benchmark.groupby("trade_date").agg(
+        benchmark_count=("identifier", "nunique"),
+        matching_benchmarks=("direction_match", "sum"),
+    )
+
+    confirmation = distribution_bad[
+        ["trade_date", "median_return"]
+    ].copy()
+    confirmation["same_direction_breadth"] = (
+        confirmation["trade_date"].map(breadth)
+    )
+    confirmation["benchmark_count"] = (
+        confirmation["trade_date"].map(
+            benchmark_summary["benchmark_count"]
+        ).fillna(0)
+    )
+    confirmation["matching_benchmarks"] = (
+        confirmation["trade_date"].map(
+            benchmark_summary["matching_benchmarks"]
+        ).fillna(0)
+    )
+    inconsistent = confirmation[
+        confirmation["same_direction_breadth"].isna()
+        | confirmation["same_direction_breadth"].lt(0.60)
+        | confirmation["benchmark_count"].ne(2)
+        | confirmation["matching_benchmarks"].ne(2)
+    ]
+    return confirmation, inconsistent
 
 
 def check_prices(
@@ -910,17 +1049,12 @@ def check_prices(
         current["shares"]
         / current["previous_shares"].replace(0, np.nan)
     )
-    market_cap_ratios = (
-        current["market_cap"]
-        / current["previous_market_cap"].replace(0, np.nan)
-    )
     krx_structure_confirmed = (
         current["source_adjustment_event"]
-        & ratios.notna()
         & share_ratios.notna()
-        & market_cap_ratios.notna()
-        & (ratios * share_ratios).sub(1).abs().le(0.005)
-        & market_cap_ratios.sub(1).abs().le(0.02)
+        & (
+            current["source_adjustment_factor"] * share_ratios
+        ).sub(1).abs().le(0.02)
     )
     inferred_structure = current[
         krx_structure_confirmed
@@ -937,8 +1071,8 @@ def check_prices(
         severity=Severity.INFO,
         status=CheckStatus.PASS,
         expected=(
-            "10x/100x price and reciprocal share-count changes preserve "
-            "market capitalization"
+            "KRX reference-price factor and listed-share change are "
+            "reciprocal within 2%"
         ),
         actual=f"observed_events={len(inferred_structure)}",
         failed_count=0,
@@ -1173,6 +1307,39 @@ def check_prices(
         "PRICE_DISTRIBUTION_DRIFT", "price_daily", Severity.WARNING,
         distribution_bad,
         "cross-sectional median return within max(5%, 5×rolling MAD)",
+        partition_key=partition_key,
+    ))
+    confirmation, inconsistent_drift = _distribution_drift_confirmation(
+        combined,
+        distribution_bad,
+    )
+    checks.append(result(
+        "PRICE_DISTRIBUTION_DRIFT_BENCHMARK_CONSISTENCY",
+        "price_daily",
+        Severity.ERROR,
+        inconsistent_drift,
+        (
+            "drift dates have both benchmark returns in the same direction "
+            "and at least 60% same-direction stock breadth"
+        ),
+        partition_key=partition_key,
+    ))
+    checks.append(CheckResult(
+        rule_code="PRICE_DISTRIBUTION_DRIFT_MARKET_CONFIRMED",
+        dataset="price_daily",
+        severity=Severity.INFO,
+        status=CheckStatus.PASS,
+        expected=(
+            "statistical drift remains a warning while independent market "
+            "breadth and benchmark evidence is recorded"
+        ),
+        actual=f"confirmed_dates={len(confirmation) - len(inconsistent_drift)}",
+        failed_count=0,
+        samples=(
+            confirmation.head(20).astype(object)
+            .where(pd.notna(confirmation.head(20)), None)
+            .to_dict("records")
+        ),
         partition_key=partition_key,
     ))
     return checks

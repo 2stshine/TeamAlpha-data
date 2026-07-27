@@ -6,14 +6,17 @@ Silver를 수정하지 않고 immutable Bronze cutoff를 내려받아 후보를 
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from collections import Counter
+from datetime import date
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from pipeline.silver import assets, corporate_actions, prices as price_loader
 from pipeline.silver.prices import LISTING_EPISODE_GAP_DAYS
 from pipeline.silver_quality.backfill import _candidate_bundle
 from pipeline.silver_quality.ecs_backfill import _sync_cutoff
@@ -111,28 +114,23 @@ def _nearest_dart_distance(
 def _price_adjustment_analysis(
     combined: pd.DataFrame,
     actions: pd.DataFrame,
+    candidate_dates: set | None = None,
 ) -> dict:
     attached = _attach_corporate_action_evidence(combined, actions)
     current = attached[attached["source_adjustment_event"]].copy()
-    close_ratio = current["close"] / current["previous_close"].replace(0, np.nan)
+    if candidate_dates is not None:
+        current = current[current["trade_date"].isin(candidate_dates)]
     share_ratio = current["shares"] / current["previous_shares"].replace(0, np.nan)
-    cap_ratio = (
-        current["market_cap"]
-        / current["previous_market_cap"].replace(0, np.nan)
-    )
     structure = (
-        close_ratio.notna()
-        & share_ratio.notna()
-        & cap_ratio.notna()
-        & (close_ratio * share_ratio).sub(1).abs().le(0.005)
-        & cap_ratio.sub(1).abs().le(0.02)
+        share_ratio.notna()
+        & (
+            current["source_adjustment_factor"] * share_ratio
+        ).sub(1).abs().le(0.02)
     )
     missing = current[
         ~current["dart_event_confirmed"] & ~structure
     ].copy()
-    missing["share_ratio"] = (
-        missing["shares"] / missing["previous_shares"].replace(0, np.nan)
-    )
+    missing["share_ratio"] = share_ratio.loc[missing.index]
     missing["reciprocal_share_error"] = (
         missing["source_adjustment_factor"] * missing["share_ratio"] - 1
     ).abs()
@@ -163,6 +161,17 @@ def _price_adjustment_analysis(
                 missing["trade_date"].map(lambda value: value.year)
             ).size().items()
         },
+        "samples": (
+            missing[[
+                "identifier",
+                "trade_date",
+                "source_adjustment_factor",
+                "share_ratio",
+                "nearest_dart_days",
+            ]]
+            .head(20)
+            .to_dict("records")
+        ),
         "nearest_dart_days": _buckets(
             missing["nearest_dart_days"], [7, 14, 30, 60, 180]
         ),
@@ -188,6 +197,7 @@ def _dart_without_krx_analysis(
     detail_columns = [
         "identifier", "event_type", "effective_date", "rcept_no",
         "source", "report_name", "action_method",
+        "share_count_factor_comparable",
     ]
     details = actions[[c for c in detail_columns if c in actions]].copy()
     details["identifier"] = details["identifier"].astype(str)
@@ -239,6 +249,10 @@ def _dart_without_krx_analysis(
             causes.append("SHARE_CHANGE_WITHOUT_KRX_REFERENCE_RESET")
         else:
             causes.append("NO_OBSERVED_PRICE_OR_SHARE_ADJUSTMENT")
+    missing["cause"] = causes
+    missing["share_count_factor_comparable"] = (
+        missing["share_count_factor_comparable"].fillna(False).astype(bool)
+    )
     return {
         "count": len(missing),
         "cause": dict(Counter(causes)),
@@ -250,12 +264,45 @@ def _dart_without_krx_analysis(
             str(key): int(value)
             for key, value in missing["source"].fillna("UNKNOWN").value_counts().items()
         },
+        "event_type_by_cause": {
+            f"{event_type}:{cause}": int(count)
+            for (event_type, cause), count in missing.groupby(
+                ["event_type", "cause"],
+                dropna=False,
+            ).size().items()
+        },
+        "comparable_by_cause": {
+            f"{'COMPARABLE' if comparable else 'NOT_COMPARABLE'}:{cause}": int(count)
+            for (comparable, cause), count in missing.groupby(
+                ["share_count_factor_comparable", "cause"],
+                dropna=False,
+            ).size().items()
+        },
         "by_year": {
             str(year): int(count)
             for year, count in missing.groupby(
                 missing["effective_date"].map(lambda value: value.year)
             ).size().items()
         },
+        "samples": (
+            missing[[
+                column
+                for column in (
+                    "identifier",
+                    "event_type",
+                    "effective_date",
+                    "rcept_no",
+                    "source",
+                    "report_name",
+                    "action_method",
+                    "share_count_factor_comparable",
+                    "cause",
+                )
+                if column in missing
+            ]]
+            .head(20)
+            .to_dict("records")
+        ),
     }
 
 
@@ -314,6 +361,13 @@ def _share_mismatch_analysis(
             mismatches["share_factor_relative_error"],
             [0.02, 0.05, 0.10, 0.25, 0.50, 1.0],
         ) if not mismatches.empty else {},
+        "methods": {
+            str(method): int(count)
+            for method, count in mismatches["action_method"].fillna(
+                "UNKNOWN"
+            ).value_counts().head(20).items()
+        },
+        "samples": mismatches.head(20).to_dict("records"),
     }
 
 
@@ -347,6 +401,178 @@ def _distribution_analysis(prices: pd.DataFrame) -> dict:
             ["trade_date", "median_return", "baseline", "mad", "direction"]
         ].to_dict("records"),
     }
+
+
+def _merge_counts(target: dict[str, int], source: dict[str, int]) -> None:
+    for key, value in source.items():
+        target[key] = target.get(key, 0) + int(value)
+
+
+def _price_partition_warning_analysis(base: str) -> dict:
+    """Analyze every price warning with bounded memory and boundary context."""
+    asset_frame, _ = assets.prepare(base)
+    actions, _ = corporate_actions.prepare(base)
+    actions, _ = corporate_actions.inherit_issuer_events(
+        actions,
+        assets.preferred_share_issuer_map(asset_frame),
+    )
+    years = price_loader.available_years(base)
+    history = pd.DataFrame()
+    annual: dict[str, dict] = {}
+    totals = {
+        "price_adjustment_without_dart": {
+            "count": 0,
+            "cause": {},
+            "nearest_dart_days": {},
+            "factor_abs_change": {},
+            "samples": [],
+        },
+        "dart_action_without_krx": {
+            "count": 0,
+            "cause": {},
+            "event_type": {},
+            "source": {},
+            "event_type_by_cause": {},
+            "comparable_by_cause": {},
+            "samples": [],
+        },
+        "dart_share_count_mismatch": {
+            "warning_count": 0,
+            "explained_count": 0,
+            "wider_window_cause": {},
+            "relative_error": {},
+            "methods": {},
+            "samples": [],
+        },
+        "price_distribution_drift": {
+            "count": 0,
+            "direction": {},
+            "dates": [],
+        },
+    }
+    for year in years:
+        current, _ = price_loader.prepare(
+            base,
+            start_date=date(year, 1, 1),
+            end_date=date(year, 12, 31),
+        )
+        lookahead = pd.DataFrame()
+        if year < years[-1]:
+            lookahead, _ = price_loader.prepare(
+                base,
+                start_date=date(year + 1, 1, 1),
+                end_date=date(year + 1, 1, 31),
+            )
+        context = pd.concat([history, current, lookahead], ignore_index=True)
+        combined = _combined_prices(context)
+        candidate_dates = set(current["trade_date"])
+        effective = pd.to_datetime(
+            actions["effective_date"],
+            errors="coerce",
+        )
+        scoped_actions = actions[
+            effective.between(
+                pd.Timestamp(date(year, 1, 1)),
+                pd.Timestamp(date(year, 12, 31)),
+            )
+        ]
+        report = {
+            "price_adjustment_without_dart": _price_adjustment_analysis(
+                combined,
+                actions,
+                candidate_dates,
+            ),
+            "dart_action_without_krx": _dart_without_krx_analysis(
+                combined,
+                scoped_actions,
+                candidate_dates,
+            ),
+            "dart_share_count_mismatch": _share_mismatch_analysis(
+                combined,
+                scoped_actions,
+            ),
+            "price_distribution_drift": _distribution_analysis(context),
+        }
+        report["price_distribution_drift"]["dates"] = [
+            item
+            for item in report["price_distribution_drift"].get("dates", [])
+            if item["trade_date"] in candidate_dates
+        ]
+        report["price_distribution_drift"]["count"] = len(
+            report["price_distribution_drift"]["dates"]
+        )
+        report["price_distribution_drift"]["direction"] = dict(Counter(
+            item["direction"]
+            for item in report["price_distribution_drift"]["dates"]
+        ))
+        annual[str(year)] = report
+
+        price_adjustment = report["price_adjustment_without_dart"]
+        totals["price_adjustment_without_dart"]["count"] += int(
+            price_adjustment["count"]
+        )
+        for key in ("cause", "nearest_dart_days", "factor_abs_change"):
+            _merge_counts(
+                totals["price_adjustment_without_dart"][key],
+                price_adjustment.get(key, {}),
+            )
+        totals["price_adjustment_without_dart"]["samples"].extend(
+            price_adjustment.get("samples", [])
+        )
+        totals["price_adjustment_without_dart"]["samples"] = (
+            totals["price_adjustment_without_dart"]["samples"][:20]
+        )
+        dart_missing = report["dart_action_without_krx"]
+        totals["dart_action_without_krx"]["count"] += int(
+            dart_missing.get("count", 0)
+        )
+        for key in (
+            "cause",
+            "event_type",
+            "source",
+            "event_type_by_cause",
+            "comparable_by_cause",
+        ):
+            _merge_counts(
+                totals["dart_action_without_krx"][key],
+                dart_missing.get(key, {}),
+            )
+        totals["dart_action_without_krx"]["samples"].extend(
+            dart_missing.get("samples", [])
+        )
+        totals["dart_action_without_krx"]["samples"] = (
+            totals["dart_action_without_krx"]["samples"][:20]
+        )
+        share = report["dart_share_count_mismatch"]
+        for key in ("warning_count", "explained_count"):
+            totals["dart_share_count_mismatch"][key] += int(
+                share.get(key, 0)
+            )
+        for key in ("wider_window_cause", "relative_error", "methods"):
+            _merge_counts(
+                totals["dart_share_count_mismatch"][key],
+                share.get(key, {}),
+            )
+        totals["dart_share_count_mismatch"]["samples"].extend(
+            share.get("samples", [])
+        )
+        totals["dart_share_count_mismatch"]["samples"] = (
+            totals["dart_share_count_mismatch"]["samples"][:20]
+        )
+        drift = report["price_distribution_drift"]
+        totals["price_distribution_drift"]["count"] += int(
+            drift["count"]
+        )
+        _merge_counts(
+            totals["price_distribution_drift"]["direction"],
+            drift["direction"],
+        )
+        totals["price_distribution_drift"]["dates"].extend(drift["dates"])
+
+        dates = sorted(current["trade_date"].dropna().unique())
+        tail_dates = set(dates[-60:])
+        history = current[current["trade_date"].isin(tail_dates)].copy()
+    return {"totals": totals, "annual": annual}
 
 
 def _accounting_analysis(fundamentals: pd.DataFrame) -> dict:
@@ -452,10 +678,51 @@ def analyze_bundle(bundle, fingerprint: str) -> dict:
 
 
 def main() -> None:
-    root = Path(os.environ.get("BACKFILL_DATA_ROOT", "/app/data"))
-    fingerprint = _sync_cutoff(root)
-    bundle = _candidate_bundle(str(root))
-    report = analyze_bundle(bundle, fingerprint)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--base",
+        help=(
+            "existing immutable Bronze cutoff root; when omitted the cutoff "
+            "is synchronized from S3 into BACKFILL_DATA_ROOT"
+        ),
+    )
+    parser.add_argument(
+        "--domain",
+        choices=("prices", "fundamentals", "all"),
+        default="all",
+    )
+    args = parser.parse_args()
+
+    root = Path(
+        args.base
+        or os.environ.get("BACKFILL_DATA_ROOT", "/app/data")
+    )
+    if args.base:
+        marker = root / ".bronze-input-fingerprint"
+        if not marker.exists():
+            raise RuntimeError(
+                f"immutable Bronze fingerprint marker is missing: {marker}"
+            )
+        fingerprint = marker.read_text(encoding="utf-8").strip()
+    else:
+        fingerprint = _sync_cutoff(root)
+
+    report = {"fingerprint": fingerprint}
+    if args.domain in {"prices", "all"}:
+        report["prices"] = _price_partition_warning_analysis(str(root))
+    if args.domain in {"fundamentals", "all"}:
+        # Import lazily so a price-only audit does not load the fundamental
+        # candidate path or retain both domains in one process.
+        from pipeline.silver_quality.s3_domain_audit import (
+            _fundamental_bundle,
+        )
+
+        bundle = _fundamental_bundle(str(root))
+        report["fundamentals"] = {
+            "accounting_equation": _accounting_analysis(
+                bundle.fundamentals
+            ),
+        }
     print("WARNING_ANALYSIS " + _json(report), flush=True)
 
 

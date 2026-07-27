@@ -10,7 +10,10 @@ from pipeline.silver.prices import (
     _verify_adj_close_post_publish,
     _with_adj_close,
 )
-from pipeline.silver_quality.rules.prices import check_prices
+from pipeline.silver_quality.rules.prices import (
+    _distribution_drift_confirmation,
+    check_prices,
+)
 
 
 DAY = date(2026, 7, 8)
@@ -69,6 +72,55 @@ def _action(**overrides):
     }
     row.update(overrides)
     return pd.DataFrame([row])
+
+
+def test_distribution_drift_requires_both_benchmarks_and_market_breadth():
+    drift = pd.DataFrame([{
+        "trade_date": DAY,
+        "median_return": -0.10,
+    }])
+    confirmed = pd.DataFrame([
+        {
+            "identifier": identifier,
+            "asset_type": "stock",
+            "trade_date": DAY,
+            "return": value,
+        }
+        for identifier, value in (
+            ("000001", -0.10),
+            ("000002", -0.08),
+            ("000003", -0.05),
+            ("000004", 0.01),
+        )
+    ] + [
+        {
+            "identifier": identifier,
+            "asset_type": "index",
+            "trade_date": DAY,
+            "return": -0.07,
+        }
+        for identifier in ("1028", "2203")
+    ])
+
+    evidence, inconsistent = _distribution_drift_confirmation(
+        confirmed,
+        drift,
+    )
+
+    assert len(evidence) == 1
+    assert evidence.iloc[0]["same_direction_breadth"] == 0.75
+    assert inconsistent.empty
+
+    confirmed.loc[confirmed["identifier"].eq("2203"), "return"] = 0.07
+    _, inconsistent = _distribution_drift_confirmation(confirmed, drift)
+    assert len(inconsistent) == 1
+
+    benchmarks_only = confirmed[confirmed["asset_type"].eq("index")]
+    _, inconsistent = _distribution_drift_confirmation(
+        benchmarks_only,
+        drift,
+    )
+    assert len(inconsistent) == 1
 
 
 def test_zero_ohl_is_normalized_to_null_without_changing_other_values():
@@ -649,6 +701,46 @@ def test_non_uniform_reduction_is_explained_not_compared():
             source="DART_STRUCTURED",
         ),
     )
+    assert _failed(results, "DART_SHARE_COUNT_FACTOR_MISMATCH") == 0
+    assert _failed(results, "DART_ACTION_WITHOUT_KRX_ADJUSTMENT") == 0
+    explained = next(
+        r for r in results
+        if r.rule_code == "DART_SHARE_COUNT_FACTOR_NOT_COMPARABLE"
+    )
+    assert "explained_events=1" in explained.actual
+
+
+def test_dart_issued_share_scope_difference_is_not_factor_mismatch():
+    frame = _valid_prices({
+        "shares": 100,
+        "market_cap": 10_500.0,
+    })
+    history = pd.DataFrame([{
+        "identifier": "005930",
+        "trade_date": date(2026, 7, 7),
+        "close": 100.0,
+        "adj_close": 100.0,
+        "market": "KOSPI",
+        "asset_type": "stock",
+        "shares": 800,
+        "market_cap": 80_000.0,
+    }])
+    results = check_prices(
+        frame,
+        target_date=DAY,
+        history=history,
+        corporate_actions=_action(
+            event_type="capital_reduction",
+            share_count_factor=8.0,
+            share_count_before=8_000,
+            share_count_after=1_000,
+            share_count_factor_comparable=True,
+            share_count_comparison_reason="UNIFORM_REDUCTION",
+            action_method="보통주식 8대 1 무상감자",
+            source="DART_STRUCTURED",
+        ),
+    )
+
     assert _failed(results, "DART_SHARE_COUNT_FACTOR_MISMATCH") == 0
     explained = next(
         r for r in results

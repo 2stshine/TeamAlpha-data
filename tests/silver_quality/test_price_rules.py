@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 
@@ -10,7 +10,10 @@ from pipeline.silver.prices import (
     _verify_adj_close_post_publish,
     _with_adj_close,
 )
+from pipeline.silver_quality.models import CheckStatus
 from pipeline.silver_quality.rules.prices import (
+    ADJUSTMENT_SEARCH_WINDOW_DAYS,
+    _dart_actions_without_krx_adjustment,
     _distribution_drift_confirmation,
     check_prices,
 )
@@ -388,6 +391,124 @@ def test_unconfirmed_krx_adjustment_is_warning():
     results = check_prices(frame, target_date=DAY, history=history)
     assert _failed(results, "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT") == 1
     assert _failed(results, "PRICE_SCALE_JUMP") == 1
+
+
+def _resumption_reset_setup():
+    frame = _valid_prices({
+        "open": 300.0,
+        "high": 310.0,
+        "low": 290.0,
+        "close": 300.0,
+        "adj_close": 300.0,
+        "market_cap": 300_000.0,
+        "prev_diff": 0.0,
+        "fluc_rate": 0.0,
+    })
+    history = pd.DataFrame([{
+        "identifier": "005930",
+        "trade_date": date(2026, 7, 7),
+        "close": 100.0,
+        "adj_close": 100.0,
+        "market": "KOSPI",
+        "asset_type": "stock",
+    }])
+    return frame, history
+
+
+def _result(results, code):
+    return next(r for r in results if r.rule_code == code)
+
+
+def test_resumption_reset_is_explained_not_warning():
+    # 거래재개 기준가 리셋(factor 3배)은 economic_return이 0에 가까워
+    # SPECIAL_TRADING_EVENT로는 안 잡히지만 정지해제 공시로 설명돼야 한다.
+    frame, history = _resumption_reset_setup()
+    resumption = _action(
+        event_type="trading_halt",
+        report_name="주권매매거래정지해제(상장적격성 실질심사)",
+        effective_date=None,
+        expects_price_adjustment=False,
+        expected_factor=None,
+    )
+    results = check_prices(
+        frame,
+        target_date=DAY,
+        history=history,
+        corporate_actions=resumption,
+    )
+    assert _failed(results, "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT") == 0
+    explained = _result(results, "REFERENCE_RESET_BY_RESUMPTION")
+    assert explained.status == CheckStatus.PASS
+    assert "explained_events=1" in explained.actual
+
+
+def test_resumption_reset_detected_by_suspension_signature():
+    # 정지해제 공시가 없어도 직전 거래일이 무거래(volume=0)면 거래재개로
+    # 결정적으로 식별해 설명한다(공시 비의존 시그니처).
+    frame, _ = _resumption_reset_setup()
+    history = pd.DataFrame([{
+        "identifier": "005930",
+        "trade_date": date(2026, 7, 7),
+        "close": 100.0,
+        "adj_close": 100.0,
+        "market": "KOSPI",
+        "asset_type": "stock",
+        "volume": 0,
+    }])
+    results = check_prices(frame, target_date=DAY, history=history)
+    assert _failed(results, "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT") == 0
+    explained = _result(results, "REFERENCE_RESET_BY_RESUMPTION")
+    assert "explained_events=1" in explained.actual
+    assert "SUSPENSION_SIGNATURE" in explained.actual
+
+
+def test_reference_reset_without_resumption_stays_warning():
+    # 정지해제 공시도 무거래 시그니처도 없으면 여전히 Warning으로 남는다.
+    frame, history = _resumption_reset_setup()
+    results = check_prices(frame, target_date=DAY, history=history)
+    assert _failed(results, "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT") == 1
+    assert "explained_events=0" in _result(
+        results, "REFERENCE_RESET_BY_RESUMPTION"
+    ).actual
+
+
+def _dart_action_frame(reset_offset_days):
+    # 005930 주식: 효력일(07-08) 근처엔 리셋이 없고, reset_offset_days만큼
+    # 떨어진 날에 KRX 기준가 리셋(source_adjustment_event=True)이 있다.
+    eff = date(2026, 7, 8)
+    rows = [
+        {"identifier": "005930", "asset_type": "stock",
+         "trade_date": date(2026, 7, 1),
+         "source_adjustment_event": False, "source_adjustment_factor": 1.0},
+        {"identifier": "005930", "asset_type": "stock",
+         "trade_date": eff,
+         "source_adjustment_event": False, "source_adjustment_factor": 1.0},
+        {"identifier": "005930", "asset_type": "stock",
+         "trade_date": eff + timedelta(days=reset_offset_days),
+         "source_adjustment_event": True, "source_adjustment_factor": 0.8},
+    ]
+    frame = pd.DataFrame(rows)
+    actions = pd.DataFrame([{
+        "identifier": "005930", "event_type": "rights_detachment",
+        "effective_date": eff, "match_window_days": 3,
+        "expects_price_adjustment": True, "rcept_no": "r1",
+    }])
+    candidate_dates = set(frame["trade_date"])
+    return _dart_actions_without_krx_adjustment(frame, actions, candidate_dates)
+
+
+def test_dart_action_misaligned_reset_within_window_is_not_flagged():
+    # 실제 KRX 리셋이 효력일에서 며칠 어긋나도 ±15일 창 안이면 반영으로 본다.
+    missing = _dart_action_frame(reset_offset_days=8)
+    assert missing.empty
+
+
+def test_dart_action_with_no_nearby_reset_is_flagged():
+    # 리셋이 ±15일 창 밖(22일)이면 진짜 조정 누락으로 남긴다.
+    assert 22 > ADJUSTMENT_SEARCH_WINDOW_DAYS
+    missing = _dart_action_frame(reset_offset_days=22)
+    assert len(missing) == 1
+    assert missing.iloc[0]["identifier"] == "005930"
 
 
 def test_reciprocal_share_change_explains_scale_jump_as_krx_structure():

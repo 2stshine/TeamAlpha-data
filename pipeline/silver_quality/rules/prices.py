@@ -23,6 +23,10 @@ NUMERIC = [
     "open", "high", "low", "close", "adj_close", "volume",
     "trading_value", "shares", "market_cap",
 ]
+# DART가 기록한 효력일(신주배정기준일·감자 효력일 등)은 KRX가 실제로
+# 기준가를 조정하는 권리락일과 며칠 어긋날 수 있다. 이 창 안에 실제 KRX
+# 기준가 리셋이 있으면 그 행사가 반영된 것으로 보고 "조정 누락"으로 보지 않는다.
+ADJUSTMENT_SEARCH_WINDOW_DAYS = 15
 
 
 def _attach_corporate_action_evidence(
@@ -195,6 +199,108 @@ def _attach_special_trading_evidence(
     return frame
 
 
+def _attach_resumption_reset_evidence(
+    frame: pd.DataFrame,
+    corporate_actions: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """거래정지 해제(거래재개)로 설명되는 KRX 기준가 리셋에 근거를 붙인다.
+
+    장기 거래정지 후 거래재개 시 KRX가 기준가를 재설정하면 정지 전 종가와
+    재개일 기준가가 달라 `source_adjustment_factor`가 1에서 벗어난다. 이때
+    재개일 economic_return은 계수가 점프를 흡수해 작을 수 있어
+    `_attach_special_trading_evidence`(30.5% 초과 수익률 대상)로는 근거가
+    붙지 않는다. 두 경로로 기준가 리셋(`source_adjustment_event`) 행을 설명한다.
+
+    1. 거래정지 시그니처(공시 비의존): 직전 in-series 거래일이 무거래
+       (`volume==0`)이면 이 행은 거래재개 첫 거래다. marcap은 정지일을
+       `volume==0` 행으로 보존하므로, 기준가 리셋과 결합하면 거래재개를
+       공시 없이 결정적으로 식별한다. 정상 거래 중 급락하는 펀드 원금상환·
+       분배는 직전일 `volume>0`이라 자연히 제외된다.
+    2. 거래정지해제 공시 대사: 위 시그니처가 없어도 정지해제 공시가
+       [t-1, t+5]에 있으면 근거로 인정한다.
+
+    값은 수정하지 않는다.
+    """
+    frame = frame.copy()
+    frame["reset_resumption_confirmed"] = False
+    frame["reset_resumption_rcept_no"] = None
+    frame["reset_resumption_match_days"] = np.nan
+    frame["reset_resumption_evidence"] = None
+    # --- 경로 1: 거래정지 시그니처 (직전 거래일 volume==0) ---
+    if "volume" in frame.columns:
+        series_columns = (
+            ["identifier", "listing_episode"]
+            if "listing_episode" in frame.columns
+            else ["identifier"]
+        )
+        ordered = frame.sort_values(series_columns + ["trade_date"])
+        previous_volume = (
+            ordered.groupby(series_columns, sort=False)["volume"]
+            .shift(1)
+            .reindex(frame.index)
+        )
+        suspension = (
+            frame["asset_type"].eq("stock")
+            & frame["source_adjustment_event"].fillna(False)
+            & previous_volume.eq(0)
+        )
+        frame.loc[suspension, "reset_resumption_confirmed"] = True
+        frame.loc[suspension, "reset_resumption_evidence"] = (
+            "SUSPENSION_SIGNATURE"
+        )
+    # --- 경로 2: 거래정지해제 공시 대사 ---
+    if corporate_actions is None or corporate_actions.empty:
+        return frame
+    required = {
+        "identifier",
+        "announcement_date",
+        "rcept_no",
+        "report_name",
+    }
+    if not required.issubset(corporate_actions.columns):
+        return frame
+    events = corporate_actions.copy()
+    events["identifier"] = events["identifier"].astype(str)
+    events["announcement_date"] = pd.to_datetime(
+        events["announcement_date"],
+        errors="coerce",
+    ).dt.date
+    # "주권매매거래정지해제(...)"와 "매매거래정지및정지해제(...)" 모두 포함한다.
+    events = events[
+        events["announcement_date"].notna()
+        & events["report_name"].astype(str).str.contains("정지해제", na=False)
+    ]
+    if events.empty:
+        return frame
+    by_identifier = {
+        identifier: group.to_dict("records")
+        for identifier, group in events.groupby("identifier", sort=False)
+    }
+    candidates = frame[
+        frame["asset_type"].eq("stock")
+        & frame["source_adjustment_event"].fillna(False)
+    ]
+    for index, row in candidates.iterrows():
+        matches = []
+        for event in by_identifier.get(str(row["identifier"]), []):
+            distance = (row["trade_date"] - event["announcement_date"]).days
+            # 공시일 하루 전부터 재개 후 5거래일 이내의 첫 기준가 리셋만 인정한다.
+            if -1 <= distance <= 5:
+                matches.append((abs(distance), distance, event))
+        if not matches:
+            continue
+        _, distance, event = min(
+            matches,
+            key=lambda item: (item[0], str(item[2].get("rcept_no") or "")),
+        )
+        frame.at[index, "reset_resumption_confirmed"] = True
+        frame.at[index, "reset_resumption_rcept_no"] = event.get("rcept_no")
+        frame.at[index, "reset_resumption_match_days"] = distance
+        if frame.at[index, "reset_resumption_evidence"] is None:
+            frame.at[index, "reset_resumption_evidence"] = "DISCLOSURE"
+    return frame
+
+
 def _dart_actions_without_krx_adjustment(
     frame: pd.DataFrame,
     corporate_actions: pd.DataFrame | None,
@@ -269,6 +375,14 @@ def _dart_actions_without_krx_adjustment(
         # 가장 가까운 한 행만 검사하면 다음 거래일에 실제 반영된 KRX
         # 조정계수를 놓치므로, 허용 창 전체에 조정 행이 하나라도 있는지 본다.
         if in_window["source_adjustment_event"].fillna(False).any():
+            continue
+        # DART 효력일이 실제 KRX 권리락일과 며칠 어긋나면 기준가 리셋이
+        # 좁은 match window 밖에 나타난다. 더 넓은 창에 실제 리셋이 있으면
+        # 그 행사가 반영된 것으로 보고 "조정 누락"으로 판정하지 않는다.
+        wide_window = group.loc[
+            distances.le(ADJUSTMENT_SEARCH_WINDOW_DAYS)
+        ]
+        if wide_window["source_adjustment_event"].fillna(False).any():
             continue
         # 감자·병합 중 장기 거래정지가 있으면 효력일 근처에 거래행이
         # 존재하지 않는다. 효력일 전 마지막 거래와 이후 첫 거래가 같은
@@ -777,7 +891,7 @@ def check_prices(
 
     series_columns = [
         "identifier", "trade_date", "close", "adj_close", "market", "asset_type",
-        "prev_diff", "shares", "market_cap",
+        "prev_diff", "shares", "market_cap", "volume",
     ]
     combined = prices[series_columns].copy()
     if history is not None and not history.empty:
@@ -794,6 +908,8 @@ def check_prices(
             historic["shares"] = np.nan
         if "market_cap" not in historic:
             historic["market_cap"] = np.nan
+        if "volume" not in historic:
+            historic["volume"] = np.nan
         combined = pd.concat([historic[series_columns], combined], ignore_index=True)
     for column in ("close", "adj_close", "prev_diff", "shares", "market_cap"):
         combined[column] = pd.to_numeric(combined[column], errors="coerce")
@@ -852,6 +968,10 @@ def check_prices(
         combined["close"] / adjusted_previous.replace(0, np.nan) - 1
     )
     combined = _attach_special_trading_evidence(
+        combined,
+        corporate_actions,
+    )
+    combined = _attach_resumption_reset_evidence(
         combined,
         corporate_actions,
     )
@@ -1128,16 +1248,50 @@ def check_prices(
     ))
 
     corporate_action = current[current["source_adjustment_event"]]
+    resumption_reset = corporate_action[
+        ~corporate_action["dart_event_confirmed"]
+        & ~krx_structure_confirmed.loc[corporate_action.index]
+        & corporate_action["reset_resumption_confirmed"]
+    ]
+    resumption_evidence_counts = (
+        resumption_reset["reset_resumption_evidence"]
+        .value_counts()
+        .to_dict()
+    )
+    checks.append(CheckResult(
+        rule_code="REFERENCE_RESET_BY_RESUMPTION",
+        dataset="price_daily",
+        severity=Severity.INFO,
+        status=CheckStatus.PASS,
+        expected=(
+            "a trading-halt resumption (prior-session no-trade signature or "
+            "a resumption disclosure) explains the KRX reference-price reset "
+            "without a structured corporate action"
+        ),
+        actual=(
+            f"explained_events={len(resumption_reset)}, "
+            f"by_evidence={resumption_evidence_counts}"
+        ),
+        failed_count=0,
+        samples=(
+            resumption_reset.head(20).astype(object)
+            .where(pd.notna(resumption_reset.head(20)), None)
+            .to_dict("records")
+        ),
+        partition_key=partition_key,
+    ))
     unconfirmed_action = corporate_action[
         ~corporate_action["dart_event_confirmed"]
         & ~krx_structure_confirmed.loc[corporate_action.index]
+        & ~corporate_action["reset_resumption_confirmed"]
     ]
     checks.append(result(
         "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT",
         "price_daily",
         Severity.WARNING,
         unconfirmed_action,
-        "every >0.5% KRX reference-price adjustment has nearby DART evidence",
+        "every >0.5% KRX reference-price adjustment has nearby DART evidence "
+        "or a trading-halt resumption disclosure",
         partition_key=partition_key,
     ))
 

@@ -68,11 +68,12 @@ uv run python -m pipeline.silver_quality.warning_analysis \
 | `CORPORATE_ACTION_INFERRED_FROM_KRX_STRUCTURE` | Info/Pass | KRX 비교기준가 조정계수와 실제 상장주식 수 변화가 2% 이내에서 역수 관계인 구조변경 |
 | `SPECIAL_TRADING_EVENT` | Info/Pass | 최근 120일 내 정리매매·상장폐지·거래재개·재상장·변경상장 DART 공시로 설명되는 실제 30.5% 초과 가격 변화. 보통주 공시는 이름이 유일하게 일치하는 우선주에도 발행회사 근거로 상속하며 가격값은 수정하지 않음 |
 | `PRICE_ADJUSTMENT_FACTOR_CHANGE` | Info/Pass | KRX 기준가 수정계수 0.5% 초과 기업행사 기록 |
-| `PRICE_ADJUSTMENT_WITHOUT_DART_EVENT` | Warning | 0.5% 초과 KRX 조정계수에 인접한 DART 기업행사 근거가 없음 |
+| `REFERENCE_RESET_BY_RESUMPTION` | Info/Pass | 거래재개로 설명되는 KRX 기준가 리셋. 재개일은 계수가 점프를 흡수해 economic_return이 작아 `SPECIAL_TRADING_EVENT`로는 안 잡힌다. 직전 in-series 거래일이 무거래(`volume==0`, marcap이 정지일을 보존)면 공시 없이 거래재개로 결정적 식별(시그니처), 없으면 정지해제 공시 [t-1,t+5] 대사(fallback). 정상거래 중 급락하는 펀드 원금상환·분배는 직전일 `volume>0`이라 제외. 값은 수정하지 않음 |
+| `PRICE_ADJUSTMENT_WITHOUT_DART_EVENT` | Warning | 0.5% 초과 KRX 조정계수에 인접한 DART 기업행사 근거도 거래재개 공시도 없음 |
 | `CORPORATE_ACTION_FACTOR_MISMATCH` | Warning | DART가 실제 가격계수를 제공하는 행사와 KRX 가격계수가 2% 초과 불일치. 감자 전후 주식 수는 비교하지 않음 |
 | `DART_SHARE_COUNT_FACTOR_MISMATCH` | Warning | DART 발행주식 수와 KRX 상장주식 수의 행사 전후 scope가 각각 2% 이내로 일치하는 균등감자에 한해 두 변화율이 2% 초과 불일치 |
 | `DART_SHARE_COUNT_FACTOR_NOT_COMPARABLE` | Explained(Info/Pass) | 특정주주 소각·액면가 감소·동시 증자/주식분할·DART 발행주식과 KRX 상장주식 scope 차이·관측 부재로 직접 비교할 수 없는 행사 |
-| `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` | Warning | 비교 가능한 가격조정형 DART 효력일 근처 또는 장기 거래정지 후 첫 거래일에 KRX 조정계수가 없음 |
+| `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` | Warning | 비교 가능한 가격조정형 DART 효력일 근처 또는 장기 거래정지 후 첫 거래일에 KRX 조정계수가 없음. DART 효력일이 실제 권리락일과 며칠 어긋날 수 있어 ±15일 창에 실제 KRX 리셋이 있으면 반영된 것으로 보고 제외 |
 | `PRICE_COVERAGE_DRIFT` | Warning | 시장별 종목 수가 20일 median 대비 10% 초과 감소 |
 | `PRICE_COVERAGE_GROWTH` | Info/Pass | 시장별 종목 수가 20일 median 대비 10% 초과 증가 |
 | `PRICE_DISTRIBUTION_DRIFT` | Warning | 횡단면 수익률 median의 MAD 이상 |

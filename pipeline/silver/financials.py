@@ -326,8 +326,10 @@ def prepare(
     recs = []
     input_rows = excluded_rows = rejected_rows = 0
     known_duplicate_rows = known_duplicate_groups = 0
+    known_presentation_rows = known_presentation_groups = 0
     unexpected_duplicate_rows = unexpected_duplicate_groups = 0
     known_duplicate_samples: list[dict] = []
+    known_presentation_samples: list[dict] = []
     unexpected_duplicate_samples: list[dict] = []
     selected_files = sorted(
         _iter_files(base, years, files),
@@ -419,11 +421,25 @@ def prepare(
                 separators=(",", ":"),
                 default=str,
             )
+            raw_without_presentation = json.dumps(
+                {
+                    key: value
+                    for key, value in r.items()
+                    if key not in {"ord", "sj_div", "sj_nm"}
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
             file_groups.setdefault(exact_key, []).append({
                 "candidate": candidate,
                 "account_name": str(r.get("account_nm") or "").strip(),
+                "account_id": str(r.get("account_id") or "").strip(),
+                "statement": str(r.get("sj_div") or "").strip(),
                 "ord": str(r.get("ord") or "").strip(),
                 "raw_without_ord": raw_without_ord,
+                "raw_without_presentation": raw_without_presentation,
             })
 
         for exact_key, occurrences in file_groups.items():
@@ -435,6 +451,10 @@ def prepare(
             ords = {item["ord"] for item in occurrences}
             raw_shapes = {
                 item["raw_without_ord"]
+                for item in occurrences
+            }
+            presentation_shapes = {
+                item["raw_without_presentation"]
                 for item in occurrences
             }
             known_net_income_ord_duplicate = (
@@ -459,18 +479,60 @@ def prepare(
                 if len(known_duplicate_samples) < 20:
                     known_duplicate_samples.append({
                         "identifier": ticker,
-                        "period_end": period_end,
-                        "fiscal_period": fp,
+                        "period_end": exact_key[2],
+                        "fiscal_period": exact_key[3],
                         "fs_type": exact_key[4],
-                        "revision_key": revision_key,
-                        "metric": metric,
-                        "value": val,
+                        "revision_key": exact_key[5],
+                        "metric": exact_key[6],
+                        "value": exact_key[7],
                         "source_file": f,
                         "source_ords": sorted(
                             ords,
                             key=_ord_sort_key,
                         ),
                         "selected_ord": selected["ord"],
+                    })
+                continue
+
+            statements = {
+                item["statement"]
+                for item in occurrences
+            }
+            known_full_statement_presentation_duplicate = (
+                supplemental
+                and exact_key[6] == "net_income"
+                and len(occurrences) == 2
+                and statements == {"IS", "CIS"}
+                and len({
+                    item["account_id"]
+                    for item in occurrences
+                }) == 1
+                and len(names) == 1
+                and len(presentation_shapes) == 1
+            )
+            if known_full_statement_presentation_duplicate:
+                selected = next(
+                    item
+                    for item in occurrences
+                    if item["statement"] == "IS"
+                )
+                recs.append(selected["candidate"])
+                duplicate_rows = len(occurrences) - 1
+                known_presentation_rows += duplicate_rows
+                known_presentation_groups += 1
+                excluded_rows += duplicate_rows
+                if len(known_presentation_samples) < 20:
+                    known_presentation_samples.append({
+                        "identifier": ticker,
+                        "period_end": exact_key[2],
+                        "fiscal_period": exact_key[3],
+                        "fs_type": exact_key[4],
+                        "revision_key": exact_key[5],
+                        "metric": exact_key[6],
+                        "value": exact_key[7],
+                        "source_file": f,
+                        "source_statements": sorted(statements),
+                        "selected_statement": "IS",
                     })
                 continue
 
@@ -482,12 +544,12 @@ def prepare(
             if len(unexpected_duplicate_samples) < 20:
                 unexpected_duplicate_samples.append({
                     "identifier": ticker,
-                    "period_end": period_end,
-                    "fiscal_period": fp,
+                    "period_end": exact_key[2],
+                    "fiscal_period": exact_key[3],
                     "fs_type": exact_key[4],
-                    "revision_key": revision_key,
-                    "metric": metric,
-                    "value": val,
+                    "revision_key": exact_key[5],
+                    "metric": exact_key[6],
+                    "value": exact_key[7],
                     "source_file": f,
                     "account_names": sorted(names),
                     "source_ords": sorted(ords, key=_ord_sort_key),
@@ -544,6 +606,11 @@ def prepare(
             "row_count": known_duplicate_rows,
             "group_count": known_duplicate_groups,
             "samples": known_duplicate_samples,
+        },
+        "known_full_statement_presentation_duplicate": {
+            "row_count": known_presentation_rows,
+            "group_count": known_presentation_groups,
+            "samples": known_presentation_samples,
         },
         "unexpected_exact_duplicate": {
             "row_count": unexpected_duplicate_rows,

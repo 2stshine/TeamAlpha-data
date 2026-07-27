@@ -478,3 +478,63 @@ def test_same_bad_values_from_both_dart_apis_are_source_warning(tmp_path):
     assert source_warning.status.value == "FAIL"
     assert source_warning.failed_count == 1
     assert not source_warning.blocks_publish
+
+
+def test_full_statement_is_cis_net_income_duplicate_prefers_is(tmp_path):
+    primary = _write_dart_file(
+        tmp_path,
+        [_dart_row(ord_value="1", account_nm="유동자산")],
+    )
+    supplemental = (
+        tmp_path
+        / "financials"
+        / "dart_full"
+        / "year=2026"
+        / "corp=005930"
+        / "11011-CFS.json"
+    )
+    supplemental.parent.mkdir(parents=True)
+    is_row = _dart_row(ord_value="15", account_nm="당기순이익(손실)")
+    is_row["sj_div"] = "IS"
+    is_row["sj_nm"] = "손익계산서"
+    cis_row = dict(is_row)
+    cis_row["sj_div"] = "CIS"
+    cis_row["sj_nm"] = "포괄손익계산서"
+    cis_row["ord"] = "0"
+    for row in (is_row, cis_row):
+        row.pop("stock_code")
+        row.pop("fs_div")
+    supplemental.write_text(
+        json.dumps([is_row, cis_row], ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    frame, stats = financials.prepare(
+        str(tmp_path),
+        files=[str(primary), str(supplemental)],
+    )
+
+    net_income = frame[frame["metric"].eq("net_income")]
+    assert len(net_income) == 1
+    assert net_income.iloc[0]["value"] == 100
+    known = stats["known_full_statement_presentation_duplicate"]
+    assert known["row_count"] == 1
+    assert known["group_count"] == 1
+    assert known["samples"][0]["selected_statement"] == "IS"
+    assert known["samples"][0]["metric"] == "net_income"
+    assert known["samples"][0]["value"] == 100
+    assert stats["unexpected_exact_duplicate"]["row_count"] == 0
+    assert stats["input_rows"] == (
+        stats["transformed_rows"]
+        + stats["excluded_rows"]
+        + stats["rejected_rows"]
+    )
+
+    reconciliation = check_reconciliation({"fundamental": stats})
+    result = next(
+        item for item in reconciliation
+        if item.rule_code
+        == "DART_FULL_STATEMENT_PRESENTATION_DUPLICATE"
+    )
+    assert result.status.value == "PASS"
+    assert "duplicate_groups=1" in result.actual

@@ -72,6 +72,7 @@ uv run python -m pipeline.silver_quality.s3_domain_audit \
 | `DART_SOURCE_ACCOUNTING_INCONSISTENCY` | Warning | 주요계정과 같은 revision의 전체재무제표 API가 동일한 비대사 값을 반환하면 원천 오류로 분리하고 Silver 값은 수정하지 않음 |
 | `FUNDAMENTAL_MAJOR_METRIC_COVERAGE` | Warning | 공시 revision별 자산·매출·순이익 중 하나 이상 존재 |
 | `DART_NET_INCOME_ORD_DUPLICATE` | Warning/Pass | 원본의 동일 순이익 행이 `ord`만 달리 두 번 온 경우 작은 `ord`를 결정적으로 선택하고 건수·표본 기록 |
+| `DART_FULL_STATEMENT_PRESENTATION_DUPLICATE` | Info/Pass | 전체재무제표의 동일 순이익 fact가 IS·CIS에 각각 표시된 경우 IS를 결정적으로 선택하고 건수·표본 기록 |
 | `DART_UNEXPECTED_EXACT_DUPLICATE` | Error | 위 순이익 `ord` 패턴 이외의 정확 중복은 제거하지 않고 publish 차단 |
 | `RECONCILIATION_ROW_BALANCE` | Error | 원본·변환·제외·실패 행 수 대사 |
 

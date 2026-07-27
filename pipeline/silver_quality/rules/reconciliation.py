@@ -64,6 +64,37 @@ def check_reconciliation(stats: dict, partition_key: str | None = None) -> list[
                 partition_key=partition_key,
             ))
 
+        presentation_duplicate = values.get(
+            "known_full_statement_presentation_duplicate",
+            {"row_count": 0, "group_count": 0, "samples": []},
+        )
+        presentation_rows = int(
+            presentation_duplicate.get("row_count", 0)
+        )
+        presentation_groups = int(
+            presentation_duplicate.get("group_count", 0)
+        )
+        if "known_full_statement_presentation_duplicate" in values:
+            checks.append(CheckResult(
+                rule_code="DART_FULL_STATEMENT_PRESENTATION_DUPLICATE",
+                dataset=dataset,
+                severity=Severity.INFO,
+                status=CheckStatus.PASS,
+                expected=(
+                    "the same full-statement net_income fact appears once "
+                    "in IS and once in CIS; select IS deterministically"
+                ),
+                actual=(
+                    f"deduplicated_rows={presentation_rows}, "
+                    f"duplicate_groups={presentation_groups}"
+                ),
+                failed_count=0,
+                samples=list(
+                    presentation_duplicate.get("samples", [])
+                )[:20],
+                partition_key=partition_key,
+            ))
+
         unexpected_duplicate = values.get(
             "unexpected_exact_duplicate",
             {"row_count": 0, "group_count": 0, "samples": []},

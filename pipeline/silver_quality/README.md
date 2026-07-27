@@ -9,6 +9,25 @@ Silver는 정규화된 데이터가 아니라 이 폴더의 규칙을 통과한 
 검증된 S3 candidate와 이미 적재된 연도를 재사용한다. 일별 적재는 기존 PostgreSQL
 temporary staging과 단일 publish transaction을 유지한다.
 
+운영 S3 전체 감사는 가격·재무 전체 후보를 같은 프로세스에 보유하지 않는다.
+
+```bash
+uv run python -m pipeline.silver_quality.s3_domain_audit --action init
+uv run python -m pipeline.silver_quality.s3_domain_audit \
+  --action domain --domain prices --parent-run-id <run-id>
+uv run python -m pipeline.silver_quality.s3_domain_audit \
+  --action domain --domain fundamentals --parent-run-id <run-id>
+uv run python -m pipeline.silver_quality.s3_domain_audit \
+  --action finalize --parent-run-id <run-id>
+```
+
+- `prices`는 stock/index, asset/identifier, DART 기업행사만 읽는다.
+- `fundamentals`는 stock ticker 유니버스와 DART 재무만 읽는다.
+- 각 도메인은 별도 ECS 프로세스와 자식 `dq_run`으로 실행한다.
+- `finalize`는 같은 cutoff fingerprint와 ruleset의 두 자식이 모두
+  `CERTIFIED`일 때만 결과를 부모 run에 합쳐 최종 `CERTIFIED` 처리한다.
+- 어느 단계도 Silver 테이블을 변경하지 않는다.
+
 | 규칙 | 등급 | 검사 |
 |---|---|---|
 | `COMMON_DUPLICATE_KEY` | Critical | publish 전 business key 중복 |

@@ -100,7 +100,11 @@ def _download_one(s3, bucket: str, root: Path, item: dict) -> int:
     return written
 
 
-def _sync_cutoff(root: Path) -> str:
+def _sync_cutoff(
+    root: Path,
+    *,
+    include_prefixes: tuple[str, ...] | None = None,
+) -> str:
     bucket = _required("S3_BRONZE_BUCKET")
     prefix = _required("BACKFILL_MANIFEST_PREFIX")
     if root.exists() and any(root.iterdir()):
@@ -108,11 +112,24 @@ def _sync_cutoff(root: Path) -> str:
     root.mkdir(parents=True, exist_ok=True)
 
     s3 = boto3.client("s3")
-    objects, fingerprint = _load_manifests(s3, bucket, prefix)
+    all_objects, fingerprint = _load_manifests(s3, bucket, prefix)
+    objects = (
+        [
+            item
+            for item in all_objects
+            if any(
+                item["key"].startswith(allowed)
+                for allowed in include_prefixes
+            )
+        ]
+        if include_prefixes is not None
+        else all_objects
+    )
     total_bytes = 0
     completed = 0
     print(
-        f"[ecs-backfill] syncing manifest objects={len(objects)} "
+        f"[ecs-backfill] syncing manifest objects={len(objects)}/"
+        f"{len(all_objects)} "
         f"fingerprint={fingerprint}",
         flush=True,
     )

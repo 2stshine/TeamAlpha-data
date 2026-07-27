@@ -39,6 +39,7 @@ temporary staging과 단일 publish transaction을 유지한다.
 | `PRICE_ADJUSTMENT_WITHOUT_DART_EVENT` | Warning | 0.5% 초과 KRX 조정계수에 인접한 DART 기업행사 근거가 없음 |
 | `CORPORATE_ACTION_FACTOR_MISMATCH` | Warning | DART가 실제 가격계수를 제공하는 행사와 KRX 가격계수가 2% 초과 불일치. 감자 전후 주식 수는 비교하지 않음 |
 | `DART_SHARE_COUNT_FACTOR_MISMATCH` | Warning | DART 감자 전후 보통주 수 비율과 KRX 실제 상장주식 수 변화가 2% 초과 불일치 |
+| `DART_SHARE_COUNT_FACTOR_NOT_COMPARABLE` | Explained(Info/Pass) | 특정주주 소각·유상/액면감자·동시 주식분할 등 DART 감자비율과 전체 KRX 상장주식 수를 직접 비교할 수 없는 행사 |
 | `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` | Warning | 가격조정형 DART 효력일 근처에 KRX 조정계수가 없음 |
 | `PRICE_COVERAGE_DRIFT` | Warning | 시장별 종목 수가 20일 median 대비 10% 초과 감소 |
 | `PRICE_COVERAGE_GROWTH` | Info/Pass | 시장별 종목 수가 20일 median 대비 10% 초과 증가 |

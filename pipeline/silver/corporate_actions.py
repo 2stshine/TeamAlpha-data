@@ -26,6 +26,7 @@ COLUMNS = [
     "match_window_days",
     "expected_factor",
     "share_count_factor",
+    "share_count_factor_comparable",
     "action_method",
     "confirms_price_adjustment",
     "expects_price_adjustment",
@@ -145,6 +146,34 @@ def _structured_share_count_factor(
     return before / after
 
 
+def _share_count_factor_comparable(event_type: str, row: dict) -> bool:
+    """감자비율을 실제 전체 상장주식 수 변화와 비교할 수 있는지 판정한다.
+
+    전체 보통주를 같은 비율로 병합하는 경우만 비교한다. 특정 주주/주식의
+    소각, 유상감자, 액면가 감소, 동시 주식분할은 DART의 감자 전후 숫자가
+    KRX 일별 LIST_SHRS 변화와 같은 경제적 범위를 나타내지 않는다.
+    """
+    if event_type != "capital_reduction":
+        return False
+    method = _compact(row.get("cr_mth"))
+    if "병합" not in method and "무상감자" not in method:
+        return False
+    non_comparable = (
+        "특정",
+        "대주주",
+        "최대주주",
+        "자기주식",
+        "보유주식",
+        "유상",
+        "액면감소",
+        "액면액감소",
+        "주식분할",
+        "주식수변동없음",
+        "출자전환",
+    )
+    return not any(marker in method for marker in non_comparable)
+
+
 def _structured_row(
     path: str,
     row: dict,
@@ -173,6 +202,10 @@ def _structured_row(
         "match_window_days": 7 if effective_date else 0,
         "expected_factor": _structured_expected_factor(event_type, row),
         "share_count_factor": _structured_share_count_factor(event_type, row),
+        "share_count_factor_comparable": _share_count_factor_comparable(
+            event_type,
+            row,
+        ),
         "action_method": row.get("cr_mth") if event_type == "capital_reduction" else None,
         "confirms_price_adjustment": (
             event_type in PRICE_ADJUSTING_STRUCTURED
@@ -250,6 +283,7 @@ def _disclosure_row(path: str, row: dict) -> dict | None:
         "match_window_days": match_window_days,
         "expected_factor": None,
         "share_count_factor": None,
+        "share_count_factor_comparable": False,
         "action_method": None,
         "confirms_price_adjustment": confirms_adjustment,
         "expects_price_adjustment": expects_adjustment,

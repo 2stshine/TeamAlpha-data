@@ -68,7 +68,27 @@ def test_capital_reduction_share_factor_is_not_a_price_factor(tmp_path):
     assert events.iloc[0]["event_type"] == "capital_reduction"
     assert pd.isna(events.iloc[0]["expected_factor"])
     assert events.iloc[0]["share_count_factor"] == pytest.approx(8.0)
+    assert events.iloc[0]["share_count_factor_comparable"]
     assert events.iloc[0]["action_method"] == "보통주식 8대 1 무상감자"
+
+
+def test_non_uniform_reduction_is_not_share_factor_comparable(tmp_path):
+    structured = (
+        tmp_path
+        / "corporate_actions/dart/structured/event=capital_reduction/year=2026"
+        / "corp=005930/rcept=20260601000005.json"
+    )
+    _write_json(structured, {
+        "rcept_no": "20260601000005",
+        "cr_std": "2026년 07월 08일",
+        "bfcr_tisstk_ostk": "8,000",
+        "atcr_tisstk_ostk": "1,000",
+        "cr_mth": "최대주주 보유주식만 8대 1 병합",
+    })
+
+    events, _ = corporate_actions.prepare(str(tmp_path))
+
+    assert not events.iloc[0]["share_count_factor_comparable"]
 
 
 def test_combined_offering_does_not_infer_factor_from_bonus_leg_only(tmp_path):

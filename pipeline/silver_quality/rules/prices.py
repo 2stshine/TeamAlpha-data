@@ -276,6 +276,134 @@ def _dart_actions_without_krx_adjustment(
     return pd.DataFrame(missing, columns=columns)
 
 
+def _dart_share_count_factor_results(
+    frame: pd.DataFrame,
+    corporate_actions: pd.DataFrame | None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """균등 감자의 DART 비율을 효력일 주변 실제 KRX 주식수 변화와 대사한다."""
+    output_columns = [
+        "identifier",
+        "effective_date",
+        "rcept_no",
+        "action_method",
+        "dart_share_count_factor",
+        "krx_share_count_factor",
+        "share_factor_relative_error",
+        "observed_trade_date",
+        "reason",
+    ]
+    empty = pd.DataFrame(columns=output_columns)
+    if corporate_actions is None or corporate_actions.empty:
+        return empty, empty
+    required = {
+        "identifier",
+        "event_type",
+        "effective_date",
+        "match_window_days",
+        "share_count_factor",
+        "share_count_factor_comparable",
+        "rcept_no",
+    }
+    if not required.issubset(corporate_actions.columns):
+        return empty, empty
+
+    events = corporate_actions.copy()
+    events["identifier"] = events["identifier"].astype(str)
+    events["effective_date"] = pd.to_datetime(
+        events["effective_date"],
+        errors="coerce",
+    ).dt.date
+    events["share_count_factor"] = pd.to_numeric(
+        events["share_count_factor"],
+        errors="coerce",
+    )
+    events = events[
+        events["event_type"].eq("capital_reduction")
+        & events["effective_date"].notna()
+        & events["share_count_factor"].gt(0)
+    ]
+    if "issuer_event_inherited" in events:
+        events = events[~events["issuer_event_inherited"].fillna(False)]
+    # 정정공시는 같은 효력일의 최신 접수번호를 최종 근거로 사용한다.
+    events = (
+        events.sort_values("rcept_no")
+        .drop_duplicates(["identifier", "effective_date"], keep="last")
+    )
+
+    stock = frame[frame["asset_type"].eq("stock")].copy()
+    by_identifier = {
+        identifier: group.sort_values("trade_date")
+        for identifier, group in stock.groupby("identifier", sort=False)
+    }
+    mismatches: list[dict] = []
+    excluded: list[dict] = []
+    for event in events.to_dict("records"):
+        base = {
+            "identifier": event["identifier"],
+            "effective_date": event["effective_date"],
+            "rcept_no": event.get("rcept_no"),
+            "action_method": event.get("action_method"),
+            "dart_share_count_factor": event["share_count_factor"],
+        }
+        if not bool(event.get("share_count_factor_comparable")):
+            excluded.append({
+                **base,
+                "reason": "non-uniform or non-share-count-comparable reduction",
+            })
+            continue
+        group = by_identifier.get(event["identifier"])
+        if group is None or group.empty:
+            continue
+        window = int(event.get("match_window_days") or 0)
+        distances = group["trade_date"].map(
+            lambda value: abs((value - event["effective_date"]).days)
+        )
+        nearby = group.loc[distances.le(window)].copy()
+        nearby = nearby[
+            nearby["previous_shares"].gt(0)
+            & nearby["shares"].gt(0)
+        ]
+        if nearby.empty:
+            excluded.append({
+                **base,
+                "reason": "no comparable KRX listed-share observations in window",
+            })
+            continue
+
+        # 일별 변경과 허용 창 전체의 누적 변경을 모두 후보로 본다.
+        observed: list[tuple[float, object]] = [
+            (
+                float(row.previous_shares) / float(row.shares),
+                row.trade_date,
+            )
+            for row in nearby.itertuples()
+        ]
+        first = nearby.iloc[0]
+        last = nearby.iloc[-1]
+        observed.append((
+            float(first["previous_shares"]) / float(last["shares"]),
+            last["trade_date"],
+        ))
+        expected = float(event["share_count_factor"])
+        actual, observed_date = min(
+            observed,
+            key=lambda item: abs(item[0] - expected) / expected,
+        )
+        relative_error = abs(actual - expected) / expected
+        if relative_error > 0.02:
+            mismatches.append({
+                **base,
+                "krx_share_count_factor": actual,
+                "share_factor_relative_error": relative_error,
+                "observed_trade_date": observed_date,
+                "reason": "DART ratio differs from nearby KRX listed-share change",
+            })
+    return (
+        pd.DataFrame(mismatches, columns=output_columns),
+        pd.DataFrame(excluded, columns=output_columns),
+    )
+
+
 def check_prices(
     prices: pd.DataFrame,
     target_date=None,
@@ -866,34 +994,11 @@ def check_prices(
         partition_key=partition_key,
     ))
 
-    # DART 감자 전/후 발행주식 수는 가격계수가 아니다. 가격계수와의
-    # 비교 대신 실제 KRX 상장주식 수 변화(previous/current)를 검증한다.
-    dart_share_factor = pd.to_numeric(
-        corporate_action["dart_share_count_factor"],
-        errors="coerce",
+    # DART 감자 전/후 발행주식 수는 가격계수가 아니다. 균등병합만 효력일
+    # 주변 전체 KRX 상장주식 수 변화와 비교하고 나머지는 Explained로 남긴다.
+    share_factor_mismatch, non_comparable_reductions = (
+        _dart_share_count_factor_results(combined, corporate_actions)
     )
-    krx_share_factor = (
-        corporate_action["previous_shares"]
-        / corporate_action["shares"].replace(0, np.nan)
-    )
-    share_factor_error = (
-        krx_share_factor - dart_share_factor
-    ).abs() / dart_share_factor.replace(0, np.nan)
-    share_factor_mismatch = corporate_action[
-        corporate_action["dart_event_confirmed"]
-        & ~corporate_action["dart_event_inherited"]
-        & corporate_action["dart_event_type"].eq("capital_reduction")
-        & dart_share_factor.notna()
-        & krx_share_factor.notna()
-        & share_factor_error.gt(0.02)
-    ].copy()
-    if not share_factor_mismatch.empty:
-        share_factor_mismatch["krx_share_count_factor"] = krx_share_factor.loc[
-            share_factor_mismatch.index
-        ]
-        share_factor_mismatch["share_factor_relative_error"] = (
-            share_factor_error.loc[share_factor_mismatch.index]
-        )
     checks.append(result(
         "DART_SHARE_COUNT_FACTOR_MISMATCH",
         "price_daily",
@@ -902,6 +1007,24 @@ def check_prices(
         (
             "DART capital-reduction before/after share ratio agrees with "
             "actual KRX listed-share change within 2%"
+        ),
+        partition_key=partition_key,
+    ))
+    checks.append(CheckResult(
+        rule_code="DART_SHARE_COUNT_FACTOR_NOT_COMPARABLE",
+        dataset="price_daily",
+        severity=Severity.INFO,
+        status=CheckStatus.PASS,
+        expected=(
+            "non-uniform, par-value-only, simultaneous-split, or "
+            "unobservable reductions are excluded from share-factor comparison"
+        ),
+        actual=f"explained_events={len(non_comparable_reductions)}",
+        failed_count=0,
+        samples=(
+            non_comparable_reductions.head(20).astype(object)
+            .where(pd.notna(non_comparable_reductions.head(20)), None)
+            .to_dict("records")
         ),
         partition_key=partition_key,
     ))

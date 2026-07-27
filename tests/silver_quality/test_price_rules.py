@@ -564,6 +564,7 @@ def test_capital_reduction_compares_dart_to_actual_share_change():
             event_type="capital_reduction",
             expected_factor=None,
             share_count_factor=8.0,
+            share_count_factor_comparable=True,
             action_method="보통주식 8대 1 무상감자",
             source="DART_STRUCTURED",
         ),
@@ -602,11 +603,55 @@ def test_capital_reduction_matching_actual_share_change_passes():
             event_type="capital_reduction",
             expected_factor=None,
             share_count_factor=8.0,
+            share_count_factor_comparable=True,
             action_method="보통주식 8대 1 무상감자",
             source="DART_STRUCTURED",
         ),
     )
     assert _failed(results, "DART_SHARE_COUNT_FACTOR_MISMATCH") == 0
+
+
+def test_non_uniform_reduction_is_explained_not_compared():
+    frame = _valid_prices({
+        "open": 1_000.0,
+        "high": 1_050.0,
+        "low": 950.0,
+        "close": 1_000.0,
+        "adj_close": 1_000.0,
+        "shares": 100,
+        "market_cap": 100_000.0,
+        "prev_diff": 800.0,
+        "fluc_rate": 0.0,
+    })
+    history = pd.DataFrame([{
+        "identifier": "005930",
+        "trade_date": date(2026, 7, 7),
+        "close": 100.0,
+        "adj_close": 100.0,
+        "market": "KOSPI",
+        "asset_type": "stock",
+        "shares": 1_000,
+        "market_cap": 100_000.0,
+    }])
+    results = check_prices(
+        frame,
+        target_date=DAY,
+        history=history,
+        corporate_actions=_action(
+            event_type="capital_reduction",
+            expected_factor=None,
+            share_count_factor=8.0,
+            share_count_factor_comparable=False,
+            action_method="최대주주 보유주식만 8대 1 병합",
+            source="DART_STRUCTURED",
+        ),
+    )
+    assert _failed(results, "DART_SHARE_COUNT_FACTOR_MISMATCH") == 0
+    explained = next(
+        r for r in results
+        if r.rule_code == "DART_SHARE_COUNT_FACTOR_NOT_COMPARABLE"
+    )
+    assert "explained_events=1" in explained.actual
 
 
 def test_dart_action_without_krx_adjustment_is_warning():

@@ -49,6 +49,12 @@ _DT_RE = re.compile(r"(\d{4})\.(\d{2})\.(\d{2})")
 COLS = ["asset_id", "source", "period_end", "fiscal_period", "fs_type",
         "filing_id", "filed", "available_date", "metric", "value",
         "currency", "revision_key", "quality_run_id"]
+ACCOUNTING_METRICS = (
+    "total_assets",
+    "total_liabilities",
+    "total_equity",
+)
+ACCOUNTING_TOLERANCE = 0.01
 
 
 def _available_date(period_end: date, fiscal_period: str, filed: date | None) -> date:
@@ -128,6 +134,187 @@ def _ord_sort_key(value) -> tuple[int, int, str]:
         return 0, int(rendered), rendered
     except ValueError:
         return 1, 0, rendered
+
+
+def _accounting_relative_error(rows: pd.DataFrame) -> float | None:
+    """한 filing scope의 자산=부채+자본 상대오차를 계산한다."""
+    selected = rows[rows["metric"].isin(ACCOUNTING_METRICS)]
+    if (
+        len(selected) != len(ACCOUNTING_METRICS)
+        or selected["metric"].nunique() != len(ACCOUNTING_METRICS)
+    ):
+        return None
+    values = selected.set_index("metric")["value"]
+    assets = abs(float(values["total_assets"]))
+    if assets == 0:
+        return None
+    return abs(
+        float(values["total_assets"])
+        - float(values["total_liabilities"])
+        - float(values["total_equity"])
+    ) / assets
+
+
+def _apply_accounting_supplement_replacements(
+    primary: pd.DataFrame,
+    supplemental: pd.DataFrame,
+    scope_key: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, dict, dict]:
+    """검증된 전체재무제표로 불일치한 주요계정 3종만 원자적으로 교체한다.
+
+    같은 공시 revision/기간/CFS·OFS이고 양쪽에 세 계정이 각각 정확히 하나씩
+    있어야 한다. 주요계정은 1%를 초과해 불일치하고 전체재무제표는 1% 이내로
+    일치할 때만 세 행을 함께 교체한다. 값을 역산해 만들어내지는 않는다.
+    """
+    empty_detail = {
+        "row_count": 0,
+        "scope_count": 0,
+        "scope_keys": [],
+        "samples": [],
+    }
+    if primary.empty or supplemental.empty:
+        return primary, supplemental, empty_detail, empty_detail
+
+    primary_groups = {
+        key: group
+        for key, group in primary.groupby(scope_key, dropna=False, sort=False)
+    }
+    supplemental_groups = {
+        key: group
+        for key, group in supplemental.groupby(
+            scope_key,
+            dropna=False,
+            sort=False,
+        )
+    }
+    primary_drop: list[int] = []
+    supplemental_take: list[int] = []
+    replacement_samples: list[dict] = []
+    source_inconsistency_keys: list[tuple] = []
+    source_inconsistency_samples: list[dict] = []
+    for key in sorted(
+        set(primary_groups) & set(supplemental_groups),
+        key=lambda value: tuple(str(part) for part in value),
+    ):
+        primary_rows = primary_groups[key]
+        supplemental_rows = supplemental_groups[key]
+        primary_bs = primary_rows[
+            primary_rows["metric"].isin(ACCOUNTING_METRICS)
+        ]
+        supplemental_bs = supplemental_rows[
+            supplemental_rows["metric"].isin(ACCOUNTING_METRICS)
+        ]
+        primary_error = _accounting_relative_error(primary_bs)
+        supplemental_error = _accounting_relative_error(supplemental_bs)
+        same_currency = (
+            primary_bs["currency"].nunique(dropna=False) == 1
+            and supplemental_bs["currency"].nunique(dropna=False) == 1
+            and primary_bs["currency"].iloc[0]
+            == supplemental_bs["currency"].iloc[0]
+        )
+        if (
+            primary_error is not None
+            and supplemental_error is not None
+            and primary_error > ACCOUNTING_TOLERANCE
+            and supplemental_error > ACCOUNTING_TOLERANCE
+            and same_currency
+        ):
+            primary_values = (
+                primary_bs.set_index("metric")["value"]
+                .reindex(ACCOUNTING_METRICS)
+            )
+            supplemental_values = (
+                supplemental_bs.set_index("metric")["value"]
+                .reindex(ACCOUNTING_METRICS)
+            )
+            if primary_values.equals(supplemental_values):
+                source_inconsistency_keys.append(key)
+                if len(source_inconsistency_samples) < 20:
+                    scope = dict(zip(scope_key, key, strict=True))
+                    source_inconsistency_samples.append({
+                        **scope,
+                        "values": {
+                            metric: primary_values[metric]
+                            for metric in ACCOUNTING_METRICS
+                        },
+                        "major_account_source_files": sorted(
+                            set(primary_bs["source_file"].astype(str))
+                        ),
+                        "full_statement_source_files": sorted(
+                            set(supplemental_bs["source_file"].astype(str))
+                        ),
+                        "relative_error": primary_error,
+                        "reason": (
+                            "DART major-account and full-statement APIs "
+                            "return the same non-balancing values"
+                        ),
+                    })
+        if (
+            primary_error is None
+            or supplemental_error is None
+            or primary_error <= ACCOUNTING_TOLERANCE
+            or supplemental_error > ACCOUNTING_TOLERANCE
+            or not same_currency
+        ):
+            continue
+
+        primary_drop.extend(primary_bs.index.tolist())
+        supplemental_take.extend(supplemental_bs.index.tolist())
+        if len(replacement_samples) < 20:
+            scope = dict(zip(scope_key, key, strict=True))
+            replacement_samples.append({
+                **scope,
+                "original_values": {
+                    row.metric: row.value
+                    for row in primary_bs.itertuples()
+                },
+                "replacement_values": {
+                    row.metric: row.value
+                    for row in supplemental_bs.itertuples()
+                },
+                "original_source_files": sorted(
+                    set(primary_bs["source_file"].astype(str))
+                ),
+                "replacement_source_files": sorted(
+                    set(supplemental_bs["source_file"].astype(str))
+                ),
+                "before_relative_error": primary_error,
+                "after_relative_error": supplemental_error,
+                "reason": (
+                    "same-revision DART full statement balances while "
+                    "major-account payload does not"
+                ),
+            })
+
+    source_inconsistency = {
+        "row_count": len(source_inconsistency_keys) * len(ACCOUNTING_METRICS),
+        "scope_count": len(source_inconsistency_keys),
+        "scope_keys": source_inconsistency_keys,
+        "samples": source_inconsistency_samples,
+    }
+    if not supplemental_take:
+        return primary, supplemental, empty_detail, source_inconsistency
+
+    replacement_rows = supplemental.loc[supplemental_take].copy()
+    retained_primary = primary.drop(index=primary_drop)
+    retained_supplemental = supplemental.drop(index=supplemental_take)
+    combined_primary = pd.concat(
+        [retained_primary, replacement_rows],
+        ignore_index=True,
+    )
+    return (
+        combined_primary,
+        retained_supplemental,
+        {
+            "row_count": len(replacement_rows),
+            "scope_count": (
+                len(replacement_rows) // len(ACCOUNTING_METRICS)
+            ),
+            "scope_keys": [],
+            "samples": replacement_samples,
+        },
+        source_inconsistency,
+    )
 
 
 def prepare(
@@ -319,8 +506,23 @@ def prepare(
         "identifier", "source", "period_end", "fiscal_period",
         "fs_type", "revision_key", "metric",
     ]
+    filing_scope = business_key[:-1]
     primary = df[~df["_supplemental"]].copy()
     supplemental_df = df[df["_supplemental"]].copy()
+    (
+        primary,
+        supplemental_df,
+        accounting_replacement,
+        source_accounting_inconsistency,
+    ) = (
+        _apply_accounting_supplement_replacements(
+            primary,
+            supplemental_df,
+            filing_scope,
+        )
+    )
+    # 교체에 사용한 전체재무제표 행만큼 원래 주요계정 행이 의도적으로 제외된다.
+    excluded_rows += int(accounting_replacement["row_count"])
     if not supplemental_df.empty:
         primary_index = pd.MultiIndex.from_frame(primary[business_key])
         supplemental_index = pd.MultiIndex.from_frame(
@@ -356,6 +558,8 @@ def prepare(
                 for path in selected_files
             ),
         },
+        "accounting_equation_supplement_replacement": accounting_replacement,
+        "source_accounting_inconsistency": source_accounting_inconsistency,
     }
 
 

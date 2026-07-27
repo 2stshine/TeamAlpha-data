@@ -15,6 +15,7 @@ FUNDAMENTAL_KEYS = [
 def check_financials(
     df: pd.DataFrame,
     partition_key: str | None = None,
+    source_inconsistency: dict | None = None,
 ) -> list[CheckResult]:
     checks = [
         null_keys(
@@ -75,7 +76,18 @@ def check_financials(
             - pivot["total_liabilities"]
             - pivot["total_equity"]
         ).abs() / base
-        bad_idx = rel[rel.gt(0.01)].index
+        all_bad_idx = rel[rel.gt(0.01)].index
+        confirmed_keys = set(
+            (source_inconsistency or {}).get("scope_keys", [])
+        )
+        bad_idx = pd.MultiIndex.from_tuples(
+            [
+                key
+                for key in all_bad_idx
+                if tuple(key) not in confirmed_keys
+            ],
+            names=all_bad_idx.names,
+        )
         source_index = pd.MultiIndex.from_frame(df[filing_scope])
         accounting_bad = df[source_index.isin(bad_idx)]
         accounting_scopes = pivot.loc[bad_idx].reset_index()
@@ -104,6 +116,31 @@ def check_financials(
         ),
         failed_count=len(accounting_scopes),
         samples=accounting_samples,
+        partition_key=partition_key,
+    ))
+    confirmed = source_inconsistency or {}
+    confirmed_scopes = int(confirmed.get("scope_count", 0))
+    confirmed_rows = int(confirmed.get("row_count", 0))
+    checks.append(CheckResult(
+        rule_code="DART_SOURCE_ACCOUNTING_INCONSISTENCY",
+        dataset="fundamental",
+        severity=Severity.WARNING,
+        status=(
+            CheckStatus.FAIL
+            if confirmed_scopes
+            else CheckStatus.PASS
+        ),
+        expected=(
+            "DART major-account values satisfy Assets ≈ Liabilities + Equity; "
+            "if not, preserve source values and confirm against the same-revision "
+            "full-statement API without deriving a correction"
+        ),
+        actual=(
+            f"confirmed_source_scopes={confirmed_scopes}, "
+            f"affected_account_rows={confirmed_rows}"
+        ),
+        failed_count=confirmed_scopes,
+        samples=list(confirmed.get("samples", []))[:20],
         partition_key=partition_key,
     ))
 

@@ -137,6 +137,29 @@ def run_registered_rules(
         failed_count=0,
         partition_key=partition_key,
     ))
+    replacement = bundle.stats.get("fundamental", {}).get(
+        "accounting_equation_supplement_replacement",
+        {"row_count": 0, "scope_count": 0, "samples": []},
+    )
+    replacement_rows = int(replacement.get("row_count", 0))
+    replacement_scopes = int(replacement.get("scope_count", 0))
+    results.append(CheckResult(
+        rule_code="DART_ACCOUNTING_EQUATION_SUPPLEMENT_REPLACEMENT",
+        dataset="fundamental",
+        severity=Severity.INFO,
+        status=CheckStatus.PASS,
+        expected=(
+            "replace assets/liabilities/equity atomically only when the "
+            "same-revision DART full statement balances within 1%"
+        ),
+        actual=(
+            f"replaced_scopes={replacement_scopes}, "
+            f"replaced_rows={replacement_rows}"
+        ),
+        failed_count=0,
+        samples=list(replacement.get("samples", []))[:20],
+        partition_key=partition_key,
+    ))
     if not bundle.prices.empty:
         results.extend(check_prices(
             bundle.prices,
@@ -146,6 +169,13 @@ def run_registered_rules(
             partition_key=partition_key,
         ))
     if not bundle.fundamentals.empty:
-        results.extend(check_financials(bundle.fundamentals, partition_key))
+        results.extend(check_financials(
+            bundle.fundamentals,
+            partition_key,
+            source_inconsistency=bundle.stats.get(
+                "fundamental",
+                {},
+            ).get("source_accounting_inconsistency"),
+        ))
     results.extend(check_reconciliation(bundle.stats, partition_key))
     return results

@@ -49,6 +49,8 @@ temporary staging과 단일 publish transaction을 유지한다.
 | `DART_FULL_STATEMENT_SUPPLEMENT` | Info/Pass | DART 주요계정에 없는 business key만 전체 재무제표의 BS·IS/CIS 계정으로 보강한 행·파일 수 기록 |
 | `FUNDAMENTAL_CURRENCY_CONSISTENCY` | Error | filing 내 통화 일관성 |
 | `FUNDAMENTAL_ACCOUNTING_EQUATION` | Warning | 회계식 상대오차 1% |
+| `DART_ACCOUNTING_EQUATION_SUPPLEMENT_REPLACEMENT` | Info | 같은 공시 revision·기간·CFS/OFS의 DART 전체재무제표가 1% 이내로 회계식을 만족할 때만 자산·부채·자본 3개를 원자적으로 교체하고 원값·교체값·출처·전후 오차를 기록 |
+| `DART_SOURCE_ACCOUNTING_INCONSISTENCY` | Warning | 주요계정과 같은 revision의 전체재무제표 API가 동일한 비대사 값을 반환하면 원천 오류로 분리하고 Silver 값은 수정하지 않음 |
 | `FUNDAMENTAL_MAJOR_METRIC_COVERAGE` | Warning | 공시 revision별 자산·매출·순이익 중 하나 이상 존재 |
 | `DART_NET_INCOME_ORD_DUPLICATE` | Warning/Pass | 원본의 동일 순이익 행이 `ord`만 달리 두 번 온 경우 작은 `ord`를 결정적으로 선택하고 건수·표본 기록 |
 | `DART_UNEXPECTED_EXACT_DUPLICATE` | Error | 위 순이익 `ord` 패턴 이외의 정확 중복은 제거하지 않고 publish 차단 |

@@ -276,3 +276,205 @@ def test_full_statement_only_fills_missing_primary_metrics(tmp_path):
         + stats["excluded_rows"]
         + stats["rejected_rows"]
     )
+
+
+def test_balancing_full_statement_atomically_replaces_bad_primary_triple(
+    tmp_path,
+):
+    primary_rows = [
+        _dart_row(ord_value="1", account_nm="자산총계"),
+        _dart_row(ord_value="2", account_nm="부채총계"),
+        _dart_row(ord_value="3", account_nm="자본총계"),
+    ]
+    for row, amount in zip(primary_rows, ("100", "80", "10"), strict=True):
+        row["sj_div"] = "BS"
+        row["thstrm_amount"] = amount
+    primary = _write_dart_file(tmp_path, primary_rows)
+
+    supplemental = (
+        tmp_path
+        / "financials"
+        / "dart_full"
+        / "year=2026"
+        / "corp=005930"
+        / "11011-CFS.json"
+    )
+    supplemental.parent.mkdir(parents=True)
+    supplemental_rows = [
+        _dart_row(ord_value="1", account_nm="자산총계"),
+        _dart_row(ord_value="2", account_nm="부채총계"),
+        _dart_row(ord_value="3", account_nm="자본총계"),
+    ]
+    for row, amount in zip(
+        supplemental_rows,
+        ("100", "60", "40"),
+        strict=True,
+    ):
+        row["sj_div"] = "BS"
+        row["thstrm_amount"] = amount
+        row.pop("stock_code")
+        row.pop("fs_div")
+    supplemental.write_text(
+        json.dumps(supplemental_rows, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    frame, stats = financials.prepare(
+        str(tmp_path),
+        files=[str(primary), str(supplemental)],
+    )
+
+    values = frame.set_index("metric")["value"].to_dict()
+    assert values["total_assets"] == 100
+    assert values["total_liabilities"] == 60
+    assert values["total_equity"] == 40
+    assert set(frame["source_file"]) == {str(supplemental)}
+    detail = stats["accounting_equation_supplement_replacement"]
+    assert detail["scope_count"] == 1
+    assert detail["row_count"] == 3
+    assert detail["samples"][0]["before_relative_error"] == 0.1
+    assert detail["samples"][0]["after_relative_error"] == 0
+    assert stats["input_rows"] == (
+        stats["transformed_rows"]
+        + stats["excluded_rows"]
+        + stats["rejected_rows"]
+    )
+
+    results = run_registered_rules(CandidateBundle(
+        identifiers=pd.DataFrame([{
+            "natural_key": "005930",
+            "source": "KRX",
+            "identifier": "005930",
+        }]),
+        fundamentals=frame,
+        stats={"fundamental": stats},
+    ))
+    replacement = next(
+        item for item in results
+        if item.rule_code
+        == "DART_ACCOUNTING_EQUATION_SUPPLEMENT_REPLACEMENT"
+    )
+    assert replacement.status.value == "PASS"
+    assert "replaced_scopes=1" in replacement.actual
+    accounting = next(
+        item for item in results
+        if item.rule_code == "FUNDAMENTAL_ACCOUNTING_EQUATION"
+    )
+    assert accounting.status.value == "PASS"
+
+
+def test_unbalanced_full_statement_does_not_replace_primary_values(tmp_path):
+    primary_rows = [
+        _dart_row(ord_value="1", account_nm="자산총계"),
+        _dart_row(ord_value="2", account_nm="부채총계"),
+        _dart_row(ord_value="3", account_nm="자본총계"),
+    ]
+    for row, amount in zip(primary_rows, ("100", "80", "10"), strict=True):
+        row["sj_div"] = "BS"
+        row["thstrm_amount"] = amount
+    primary = _write_dart_file(tmp_path, primary_rows)
+    supplemental = (
+        tmp_path
+        / "financials"
+        / "dart_full"
+        / "year=2026"
+        / "corp=005930"
+        / "11011-CFS.json"
+    )
+    supplemental.parent.mkdir(parents=True)
+    supplemental_rows = [
+        _dart_row(ord_value="1", account_nm="자산총계"),
+        _dart_row(ord_value="2", account_nm="부채총계"),
+        _dart_row(ord_value="3", account_nm="자본총계"),
+    ]
+    for row, amount in zip(
+        supplemental_rows,
+        ("100", "70", "10"),
+        strict=True,
+    ):
+        row["sj_div"] = "BS"
+        row["thstrm_amount"] = amount
+        row.pop("stock_code")
+        row.pop("fs_div")
+    supplemental.write_text(
+        json.dumps(supplemental_rows, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    frame, stats = financials.prepare(
+        str(tmp_path),
+        files=[str(primary), str(supplemental)],
+    )
+
+    assert set(frame["source_file"]) == {str(primary)}
+    assert stats["accounting_equation_supplement_replacement"]["row_count"] == 0
+
+
+def test_same_bad_values_from_both_dart_apis_are_source_warning(tmp_path):
+    primary_rows = [
+        _dart_row(ord_value="1", account_nm="자산총계"),
+        _dart_row(ord_value="2", account_nm="부채총계"),
+        _dart_row(ord_value="3", account_nm="자본총계"),
+    ]
+    for row, amount in zip(primary_rows, ("100", "80", "10"), strict=True):
+        row["sj_div"] = "BS"
+        row["thstrm_amount"] = amount
+    primary = _write_dart_file(tmp_path, primary_rows)
+    supplemental = (
+        tmp_path
+        / "financials"
+        / "dart_full"
+        / "year=2026"
+        / "corp=005930"
+        / "11011-CFS.json"
+    )
+    supplemental.parent.mkdir(parents=True)
+    supplemental_rows = [
+        _dart_row(ord_value="1", account_nm="자산총계"),
+        _dart_row(ord_value="2", account_nm="부채총계"),
+        _dart_row(ord_value="3", account_nm="자본총계"),
+    ]
+    for row, amount in zip(
+        supplemental_rows,
+        ("100", "80", "10"),
+        strict=True,
+    ):
+        row["sj_div"] = "BS"
+        row["thstrm_amount"] = amount
+        row.pop("stock_code")
+        row.pop("fs_div")
+    supplemental.write_text(
+        json.dumps(supplemental_rows, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    frame, stats = financials.prepare(
+        str(tmp_path),
+        files=[str(primary), str(supplemental)],
+    )
+    source_issue = stats["source_accounting_inconsistency"]
+    assert source_issue["scope_count"] == 1
+    assert source_issue["row_count"] == 3
+    assert source_issue["samples"][0]["relative_error"] == 0.1
+
+    results = run_registered_rules(CandidateBundle(
+        identifiers=pd.DataFrame([{
+            "natural_key": "005930",
+            "source": "KRX",
+            "identifier": "005930",
+        }]),
+        fundamentals=frame,
+        stats={"fundamental": stats},
+    ))
+    generic = next(
+        item for item in results
+        if item.rule_code == "FUNDAMENTAL_ACCOUNTING_EQUATION"
+    )
+    source_warning = next(
+        item for item in results
+        if item.rule_code == "DART_SOURCE_ACCOUNTING_INCONSISTENCY"
+    )
+    assert generic.status.value == "PASS"
+    assert source_warning.status.value == "FAIL"
+    assert source_warning.failed_count == 1
+    assert not source_warning.blocks_publish

@@ -10,7 +10,6 @@ from pipeline.silver.prices import (
     _verify_adj_close_post_publish,
     _with_adj_close,
 )
-from pipeline.silver_quality.models import CheckStatus
 from pipeline.silver_quality.rules.prices import (
     ADJUSTMENT_SEARCH_WINDOW_DAYS,
     _dart_actions_without_krx_adjustment,
@@ -232,11 +231,8 @@ def test_suspended_stock_shape_is_allowed():
     })
     results = check_prices(frame, target_date=DAY)
     assert _failed(results, "PRICE_OHLC_LOGIC") == 0
-    explained = next(r for r in results if r.rule_code == "SOURCE_INCOMPLETE_OHLC")
-    assert explained.failed_count == 0
-    assert explained.severity.value == "INFO"
-    assert explained.status.value == "PASS"
     no_trade = next(r for r in results if r.rule_code == "SOURCE_NO_TRADE_OHLC")
+    assert no_trade.severity.value == "MODIFIED"
     assert no_trade.status.value == "PASS"
     assert "observed_rows=1" in no_trade.actual
 
@@ -265,7 +261,7 @@ def test_active_close_only_ohlc_is_explained():
     assert _failed(results, "PRICE_OHLC_LOGIC") == 0
     explained = next(r for r in results if r.rule_code == "SOURCE_INCOMPLETE_OHLC")
     assert explained.failed_count == 0
-    assert explained.severity.value == "INFO"
+    assert explained.severity.value == "MODIFIED"
     assert explained.status.value == "PASS"
     assert "explained_rows=1" in explained.actual
 
@@ -360,13 +356,6 @@ def test_corporate_action_is_not_a_return_or_scale_warning():
     assert _failed(results, "PRICE_RETURN_SPIKE") == 0
     assert _failed(results, "PRICE_SCALE_JUMP") == 0
     assert _failed(results, "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT") == 0
-    event = next(
-        r for r in results
-        if r.rule_code == "PRICE_ADJUSTMENT_FACTOR_CHANGE"
-    )
-    assert event.status.value == "PASS"
-    assert "observed_events=1" in event.actual
-    assert "dart_confirmed=1" in event.actual
 
 
 def test_unconfirmed_krx_adjustment_is_warning():
@@ -421,7 +410,8 @@ def _result(results, code):
 
 def test_resumption_reset_is_explained_not_warning():
     # 거래재개 기준가 리셋(factor 3배)은 economic_return이 0에 가까워
-    # SPECIAL_TRADING_EVENT로는 안 잡히지만 정지해제 공시로 설명돼야 한다.
+    # 특별거래(30.5% 초과) 근거로는 안 잡히지만, 정지해제 공시로 설명돼
+    # PRICE_ADJUSTMENT_WITHOUT_DART_EVENT에서 제외돼야 한다.
     frame, history = _resumption_reset_setup()
     resumption = _action(
         event_type="trading_halt",
@@ -437,9 +427,6 @@ def test_resumption_reset_is_explained_not_warning():
         corporate_actions=resumption,
     )
     assert _failed(results, "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT") == 0
-    explained = _result(results, "REFERENCE_RESET_BY_RESUMPTION")
-    assert explained.status == CheckStatus.PASS
-    assert "explained_events=1" in explained.actual
 
 
 def test_resumption_reset_detected_by_suspension_signature():
@@ -457,9 +444,6 @@ def test_resumption_reset_detected_by_suspension_signature():
     }])
     results = check_prices(frame, target_date=DAY, history=history)
     assert _failed(results, "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT") == 0
-    explained = _result(results, "REFERENCE_RESET_BY_RESUMPTION")
-    assert "explained_events=1" in explained.actual
-    assert "SUSPENSION_SIGNATURE" in explained.actual
 
 
 def test_reference_reset_without_resumption_stays_warning():
@@ -467,9 +451,6 @@ def test_reference_reset_without_resumption_stays_warning():
     frame, history = _resumption_reset_setup()
     results = check_prices(frame, target_date=DAY, history=history)
     assert _failed(results, "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT") == 1
-    assert "explained_events=0" in _result(
-        results, "REFERENCE_RESET_BY_RESUMPTION"
-    ).actual
 
 
 def _dart_action_frame(reset_offset_days):
@@ -536,12 +517,6 @@ def test_reciprocal_share_change_explains_scale_jump_as_krx_structure():
     results = check_prices(frame, target_date=DAY, history=history)
 
     assert _failed(results, "PRICE_SCALE_JUMP") == 0
-    inferred = next(
-        r for r in results
-        if r.rule_code == "CORPORATE_ACTION_INFERRED_FROM_KRX_STRUCTURE"
-    )
-    assert inferred.status.value == "PASS"
-    assert "observed_events=1" in inferred.actual
     # KRX 가격·주식수·시총의 독립 구조 근거가 있으므로 DART 미대사
     # 경고를 중복 발생시키지 않는다.
     assert _failed(results, "PRICE_ADJUSTMENT_WITHOUT_DART_EVENT") == 0
@@ -586,11 +561,6 @@ def test_special_trading_event_is_info_not_return_or_scale_warning():
 
     assert _failed(results, "PRICE_SCALE_JUMP") == 0
     assert _failed(results, "PRICE_RETURN_SPIKE") == 0
-    special = next(
-        r for r in results if r.rule_code == "SPECIAL_TRADING_EVENT"
-    )
-    assert special.status.value == "PASS"
-    assert "observed_events=1" in special.actual
 
 
 def test_special_trading_episode_accepts_notice_up_to_120_days_before():
@@ -662,12 +632,6 @@ def test_reviewed_terminal_settlement_spike_is_explained():
 
     assert _failed(results, "PRICE_RETURN_SPIKE") == 0
     assert _failed(results, "PRICE_ROUND_TRIP_SPIKE") == 0
-    explained = next(
-        r for r in results
-        if r.rule_code == "SETTLEMENT_TRADING_PRICE_SPIKE"
-    )
-    assert explained.status.value == "PASS"
-    assert "explained_events=2" in explained.actual
 
 
 def test_unreviewed_terminal_spike_remains_warning():
@@ -704,11 +668,6 @@ def test_unreviewed_terminal_spike_remains_warning():
     results = check_prices(frame)
 
     assert _failed(results, "PRICE_RETURN_SPIKE") == 1
-    explained = next(
-        r for r in results
-        if r.rule_code == "SETTLEMENT_TRADING_PRICE_SPIKE"
-    )
-    assert "explained_events=0" in explained.actual
 
 
 def test_capital_reduction_compares_dart_to_actual_share_change():
@@ -824,11 +783,6 @@ def test_non_uniform_reduction_is_explained_not_compared():
     )
     assert _failed(results, "DART_SHARE_COUNT_FACTOR_MISMATCH") == 0
     assert _failed(results, "DART_ACTION_WITHOUT_KRX_ADJUSTMENT") == 0
-    explained = next(
-        r for r in results
-        if r.rule_code == "DART_SHARE_COUNT_FACTOR_NOT_COMPARABLE"
-    )
-    assert "explained_events=1" in explained.actual
 
 
 def test_dart_issued_share_scope_difference_is_not_factor_mismatch():
@@ -863,11 +817,6 @@ def test_dart_issued_share_scope_difference_is_not_factor_mismatch():
     )
 
     assert _failed(results, "DART_SHARE_COUNT_FACTOR_MISMATCH") == 0
-    explained = next(
-        r for r in results
-        if r.rule_code == "DART_SHARE_COUNT_FACTOR_NOT_COMPARABLE"
-    )
-    assert "explained_events=1" in explained.actual
 
 
 def test_dart_action_without_krx_adjustment_is_warning():
@@ -981,11 +930,6 @@ def test_small_source_adjustment_is_applied_to_daily_continuity():
     }])
     results = check_prices(frame, target_date=DAY, history=history)
     assert _failed(results, "ADJ_CLOSE_RETURN_CONTINUITY") == 0
-    event = next(
-        r for r in results
-        if r.rule_code == "PRICE_ADJUSTMENT_FACTOR_CHANGE"
-    )
-    assert "observed_events=0" in event.actual
 
 
 class _RescaleCursor:

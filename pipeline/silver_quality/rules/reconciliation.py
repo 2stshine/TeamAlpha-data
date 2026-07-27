@@ -45,11 +45,11 @@ def check_reconciliation(stats: dict, partition_key: str | None = None) -> list[
         )
         known_rows = int(known_duplicate.get("row_count", 0))
         known_groups = int(known_duplicate.get("group_count", 0))
-        if "known_net_income_ord_duplicate" in values:
+        if "known_net_income_ord_duplicate" in values and known_rows > 0:
             checks.append(CheckResult(
                 rule_code="DART_NET_INCOME_ORD_DUPLICATE",
                 dataset=dataset,
-                severity=Severity.WARNING,
+                severity=Severity.MODIFIED,
                 status=CheckStatus.PASS,
                 expected=(
                     "DART net_income duplicates are exactly two identical "
@@ -74,11 +74,14 @@ def check_reconciliation(stats: dict, partition_key: str | None = None) -> list[
         presentation_groups = int(
             presentation_duplicate.get("group_count", 0)
         )
-        if "known_full_statement_presentation_duplicate" in values:
+        if (
+            "known_full_statement_presentation_duplicate" in values
+            and presentation_rows > 0
+        ):
             checks.append(CheckResult(
                 rule_code="DART_FULL_STATEMENT_PRESENTATION_DUPLICATE",
                 dataset=dataset,
-                severity=Severity.INFO,
+                severity=Severity.MODIFIED,
                 status=CheckStatus.PASS,
                 expected=(
                     "the same full-statement net_income fact appears once "

@@ -54,21 +54,22 @@ def run_registered_rules(
     )
     unsupported_rows = int(unsupported_market.get("row_count", 0))
     unsupported_tickers = int(unsupported_market.get("ticker_count", 0))
-    results.append(CheckResult(
-        rule_code="UNSUPPORTED_MARKET_EXCLUDED",
-        dataset="price_daily",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected="KONEX rows are explicitly excluded from the Silver universe",
-        actual=(
-            f"excluded_rows={unsupported_rows}, "
-            f"excluded_tickers={unsupported_tickers}, "
-            f"markets={unsupported_market.get('markets', {})}"
-        ),
-        failed_count=0,
-        samples=list(unsupported_market.get("samples", []))[:20],
-        partition_key=partition_key,
-    ))
+    if unsupported_rows > 0:
+        results.append(CheckResult(
+            rule_code="UNSUPPORTED_MARKET_EXCLUDED",
+            dataset="price_daily",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected="KONEX rows are explicitly excluded from the Silver universe",
+            actual=(
+                f"excluded_rows={unsupported_rows}, "
+                f"excluded_tickers={unsupported_tickers}, "
+                f"markets={unsupported_market.get('markets', {})}"
+            ),
+            failed_count=0,
+            samples=list(unsupported_market.get("samples", []))[:20],
+            partition_key=partition_key,
+        ))
     unsupported_asset = bundle.stats.get("fundamental", {}).get(
         "unsupported_market_asset",
         {"row_count": 0, "ticker_count": 0, "samples": []},
@@ -77,89 +78,94 @@ def run_registered_rules(
     unsupported_asset_tickers = int(
         unsupported_asset.get("ticker_count", 0)
     )
-    results.append(CheckResult(
-        rule_code="UNSUPPORTED_MARKET_ASSET_EXCLUDED",
-        dataset="fundamental",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected=(
-            "fundamentals for assets with only KONEX price history "
-            "are explicitly excluded"
-        ),
-        actual=(
-            f"excluded_rows={unsupported_asset_rows}, "
-            f"excluded_tickers={unsupported_asset_tickers}"
-        ),
-        failed_count=0,
-        samples=list(unsupported_asset.get("samples", []))[:20],
-        partition_key=partition_key,
-    ))
+    if unsupported_asset_rows > 0:
+        results.append(CheckResult(
+            rule_code="UNSUPPORTED_MARKET_ASSET_EXCLUDED",
+            dataset="fundamental",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected=(
+                "fundamentals for assets with only KONEX price history "
+                "are explicitly excluded"
+            ),
+            actual=(
+                f"excluded_rows={unsupported_asset_rows}, "
+                f"excluded_tickers={unsupported_asset_tickers}"
+            ),
+            failed_count=0,
+            samples=list(unsupported_asset.get("samples", []))[:20],
+            partition_key=partition_key,
+        ))
     nontradable = bundle.stats.get("fundamental", {}).get(
         "no_tradable_price_asset",
         {"row_count": 0, "ticker_count": 0, "samples": []},
     )
     nontradable_rows = int(nontradable.get("row_count", 0))
     nontradable_tickers = int(nontradable.get("ticker_count", 0))
-    results.append(CheckResult(
-        rule_code="NO_TRADABLE_PRICE_ASSET",
-        dataset="fundamental",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected=(
-            "DART ticker occurs at least once in the complete KRX price universe; "
-            "otherwise exclude explicitly"
-        ),
-        actual=(
-            f"excluded_rows={nontradable_rows}, "
-            f"excluded_tickers={nontradable_tickers}"
-        ),
-        failed_count=0,
-        samples=list(nontradable.get("samples", []))[:20],
-        partition_key=partition_key,
-    ))
+    if nontradable_rows > 0:
+        results.append(CheckResult(
+            rule_code="NO_TRADABLE_PRICE_ASSET",
+            dataset="fundamental",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected=(
+                "DART ticker occurs at least once in the complete KRX price universe; "
+                "otherwise exclude explicitly"
+            ),
+            actual=(
+                f"excluded_rows={nontradable_rows}, "
+                f"excluded_tickers={nontradable_tickers}"
+            ),
+            failed_count=0,
+            samples=list(nontradable.get("samples", []))[:20],
+            partition_key=partition_key,
+        ))
     full_statement = bundle.stats.get("fundamental", {}).get(
         "full_statement_supplement",
         {"row_count": 0, "file_count": 0},
     )
-    results.append(CheckResult(
-        rule_code="DART_FULL_STATEMENT_SUPPLEMENT",
-        dataset="fundamental",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected=(
-            "full-statement source fills only business keys absent from "
-            "the DART major-account source"
-        ),
-        actual=(
-            f"supplemented_rows={int(full_statement.get('row_count', 0))}, "
-            f"source_files={int(full_statement.get('file_count', 0))}"
-        ),
-        failed_count=0,
-        partition_key=partition_key,
-    ))
+    full_statement_rows = int(full_statement.get("row_count", 0))
+    if full_statement_rows > 0:
+        results.append(CheckResult(
+            rule_code="DART_FULL_STATEMENT_SUPPLEMENT",
+            dataset="fundamental",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected=(
+                "full-statement source fills only business keys absent from "
+                "the DART major-account source"
+            ),
+            actual=(
+                f"supplemented_rows={full_statement_rows}, "
+                f"source_files={int(full_statement.get('file_count', 0))}"
+            ),
+            failed_count=0,
+            partition_key=partition_key,
+        ))
     replacement = bundle.stats.get("fundamental", {}).get(
         "accounting_equation_supplement_replacement",
         {"row_count": 0, "scope_count": 0, "samples": []},
     )
     replacement_rows = int(replacement.get("row_count", 0))
     replacement_scopes = int(replacement.get("scope_count", 0))
-    results.append(CheckResult(
-        rule_code="DART_ACCOUNTING_EQUATION_SUPPLEMENT_REPLACEMENT",
-        dataset="fundamental",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected=(
-            "replace assets/liabilities/equity atomically only when the "
-            "same-revision DART full statement balances within 1%"
-        ),
-        actual=(
-            f"replaced_scopes={replacement_scopes}, "
-            f"replaced_rows={replacement_rows}"
-        ),
-        failed_count=0,
-        samples=list(replacement.get("samples", []))[:20],
-        partition_key=partition_key,
-    ))
+    if replacement_rows > 0:
+        results.append(CheckResult(
+            rule_code="DART_ACCOUNTING_EQUATION_SUPPLEMENT_REPLACEMENT",
+            dataset="fundamental",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected=(
+                "replace assets/liabilities/equity atomically only when the "
+                "same-revision DART full statement balances within 1%"
+            ),
+            actual=(
+                f"replaced_scopes={replacement_scopes}, "
+                f"replaced_rows={replacement_rows}"
+            ),
+            failed_count=0,
+            samples=list(replacement.get("samples", []))[:20],
+            partition_key=partition_key,
+        ))
     if not bundle.prices.empty:
         results.extend(check_prices(
             bundle.prices,

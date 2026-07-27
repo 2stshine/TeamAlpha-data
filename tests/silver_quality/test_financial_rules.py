@@ -100,7 +100,7 @@ def test_dart_only_rows_are_explicitly_excluded_and_reported():
     )
     assert exclusion.failed_count == 0
     assert exclusion.status.value == "PASS"
-    assert exclusion.severity.value == "INFO"
+    assert exclusion.severity.value == "MODIFIED"
     assert exclusion.samples[0]["identifier"] == "016830"
     assert "excluded_rows=3" in exclusion.actual
     excluded_market = next(

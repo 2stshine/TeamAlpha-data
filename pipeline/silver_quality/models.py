@@ -11,10 +11,10 @@ import pandas as pd
 
 
 class Severity(StrEnum):
-    CRITICAL = "CRITICAL"
-    ERROR = "ERROR"
-    WARNING = "WARNING"
-    INFO = "INFO"
+    CRITICAL = "CRITICAL"  # publish 차단
+    ERROR = "ERROR"        # publish 차단
+    WARNING = "WARNING"    # 비차단, 사람이 검토
+    MODIFIED = "MODIFIED"  # 비차단, 파이프라인이 값을 변경한 곳 기록
 
 
 class CheckStatus(StrEnum):

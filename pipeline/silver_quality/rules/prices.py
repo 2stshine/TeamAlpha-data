@@ -766,40 +766,43 @@ def check_prices(
         partition_key=partition_key,
     ))
     active_incomplete = prices[active_incomplete_ohlc]
-    checks.append(CheckResult(
-        rule_code="SOURCE_INCOMPLETE_OHLC",
-        dataset="price_daily",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected=(
-            "source 0 sentinel is normalized to NULL for all O/H/L while "
-            "close, volume, trading value, and market cap remain unchanged"
-        ),
-        actual=f"explained_rows={len(active_incomplete)}",
-        failed_count=0,
-        samples=(
-            active_incomplete.head(20).astype(object)
-            .where(pd.notna(active_incomplete.head(20)), None)
+    if len(active_incomplete) > 0:
+        checks.append(CheckResult(
+            rule_code="SOURCE_INCOMPLETE_OHLC",
+            dataset="price_daily",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected=(
+                "source 0 sentinel is normalized to NULL for all O/H/L while "
+                "close, volume, trading value, and market cap remain unchanged"
+            ),
+            actual=f"explained_rows={len(active_incomplete)}",
+            failed_count=0,
+            samples=(
+                active_incomplete.head(20).astype(object)
+                .where(pd.notna(active_incomplete.head(20)), None)
+                .to_dict("records")
+            ),
+            partition_key=partition_key,
+        ))
+    no_trade_count = int(no_trade_ohlc.sum())
+    if no_trade_count > 0:
+        no_trade_samples = (
+            prices[no_trade_ohlc].head(20)
+            .astype(object).where(pd.notna(prices[no_trade_ohlc].head(20)), None)
             .to_dict("records")
-        ),
-        partition_key=partition_key,
-    ))
-    no_trade_samples = (
-        prices[no_trade_ohlc].head(20)
-        .astype(object).where(pd.notna(prices[no_trade_ohlc].head(20)), None)
-        .to_dict("records")
-    )
-    checks.append(CheckResult(
-        rule_code="SOURCE_NO_TRADE_OHLC",
-        dataset="price_daily",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected="no-trade rows may preserve close while O/H/L remain NULL",
-        actual=f"observed_rows={int(no_trade_ohlc.sum())}",
-        failed_count=0,
-        samples=no_trade_samples,
-        partition_key=partition_key,
-    ))
+        )
+        checks.append(CheckResult(
+            rule_code="SOURCE_NO_TRADE_OHLC",
+            dataset="price_daily",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected="no-trade rows may preserve close while O/H/L remain NULL",
+            actual=f"observed_rows={no_trade_count}",
+            failed_count=0,
+            samples=no_trade_samples,
+            partition_key=partition_key,
+        ))
 
     market_bad = prices[
         (stock & ~prices["market"].isin(["KOSPI", "KOSDAQ", "KONEX"]))
@@ -1009,26 +1012,6 @@ def check_prices(
         combined[["identifier", "trade_date"]]
     )
     current = combined[combined_index.isin(current_index)]
-    episode_boundaries = current[current["listing_episode_boundary"]]
-    episode_samples = (
-        episode_boundaries.head(20).astype(object)
-        .where(pd.notna(episode_boundaries.head(20)), None)
-        .to_dict("records")
-    )
-    checks.append(CheckResult(
-        rule_code="LISTING_EPISODE_BOUNDARY",
-        dataset="price_daily",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected=(
-            f"price adjustment and return chains reset after >"
-            f"{LISTING_EPISODE_GAP_DAYS}-day ticker absence"
-        ),
-        actual=f"observed_boundaries={len(episode_boundaries)}",
-        failed_count=0,
-        samples=episode_samples,
-        partition_key=partition_key,
-    ))
 
     # 전체 backfill에서는 변환 코드와 독립적으로 수정계수를 다시 누적해
     # 저장 후보 adj_close를 4자리 정밀도로 대사한다. 연도/일자 파티션은
@@ -1110,9 +1093,6 @@ def check_prices(
     ))
 
     all_spikes = current[current["economic_return"].abs().gt(0.305)]
-    special_spikes = all_spikes[
-        all_spikes["dart_special_event_confirmed"]
-    ]
     # 전수 검토로 정리매매가 확인된 종목만 전체 cutoff보다 먼저 종료된
     # 시계열의 마지막 7거래일에서 Explained로 분류한다. 활성 종목이나
     # 같은 ticker의 과거 일반 급변까지 넓게 예외 처리하지 않는다.
@@ -1134,10 +1114,6 @@ def check_prices(
         & episode_last_date.lt(stock_cutoff)
         & reverse_trade_number.lt(7)
     )
-    settlement_spikes = all_spikes[
-        reviewed_settlement.loc[all_spikes.index]
-        & ~all_spikes["dart_special_event_confirmed"]
-    ]
     spike = all_spikes[
         ~all_spikes["dart_special_event_confirmed"]
         & ~reviewed_settlement.loc[all_spikes.index]
@@ -1176,66 +1152,6 @@ def check_prices(
             current["source_adjustment_factor"] * share_ratios
         ).sub(1).abs().le(0.02)
     )
-    inferred_structure = current[
-        krx_structure_confirmed
-        & ~current["dart_event_confirmed"]
-    ]
-    inferred_samples = (
-        inferred_structure.head(20).astype(object)
-        .where(pd.notna(inferred_structure.head(20)), None)
-        .to_dict("records")
-    )
-    checks.append(CheckResult(
-        rule_code="CORPORATE_ACTION_INFERRED_FROM_KRX_STRUCTURE",
-        dataset="price_daily",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected=(
-            "KRX reference-price factor and listed-share change are "
-            "reciprocal within 2%"
-        ),
-        actual=f"observed_events={len(inferred_structure)}",
-        failed_count=0,
-        samples=inferred_samples,
-        partition_key=partition_key,
-    ))
-    special_samples = (
-        special_spikes.head(20).astype(object)
-        .where(pd.notna(special_spikes.head(20)), None)
-        .to_dict("records")
-    )
-    checks.append(CheckResult(
-        rule_code="SETTLEMENT_TRADING_PRICE_SPIKE",
-        dataset="price_daily",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected=(
-            "reviewed delisting series spike occurs only within its final "
-            "7 unrestricted settlement-trading sessions"
-        ),
-        actual=f"explained_events={len(settlement_spikes)}",
-        failed_count=0,
-        samples=(
-            settlement_spikes.head(20).astype(object)
-            .where(pd.notna(settlement_spikes.head(20)), None)
-            .to_dict("records")
-        ),
-        partition_key=partition_key,
-    ))
-    checks.append(CheckResult(
-        rule_code="SPECIAL_TRADING_EVENT",
-        dataset="price_daily",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected=(
-            "DART delisting/resumption evidence explains an actual "
-            ">30.5% price move"
-        ),
-        actual=f"observed_events={len(special_spikes)}",
-        failed_count=0,
-        samples=special_samples,
-        partition_key=partition_key,
-    ))
     scale = current[
         scale_mask
         & ~current["dart_event_confirmed"]
@@ -1248,38 +1164,6 @@ def check_prices(
     ))
 
     corporate_action = current[current["source_adjustment_event"]]
-    resumption_reset = corporate_action[
-        ~corporate_action["dart_event_confirmed"]
-        & ~krx_structure_confirmed.loc[corporate_action.index]
-        & corporate_action["reset_resumption_confirmed"]
-    ]
-    resumption_evidence_counts = (
-        resumption_reset["reset_resumption_evidence"]
-        .value_counts()
-        .to_dict()
-    )
-    checks.append(CheckResult(
-        rule_code="REFERENCE_RESET_BY_RESUMPTION",
-        dataset="price_daily",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected=(
-            "a trading-halt resumption (prior-session no-trade signature or "
-            "a resumption disclosure) explains the KRX reference-price reset "
-            "without a structured corporate action"
-        ),
-        actual=(
-            f"explained_events={len(resumption_reset)}, "
-            f"by_evidence={resumption_evidence_counts}"
-        ),
-        failed_count=0,
-        samples=(
-            resumption_reset.head(20).astype(object)
-            .where(pd.notna(resumption_reset.head(20)), None)
-            .to_dict("records")
-        ),
-        partition_key=partition_key,
-    ))
     unconfirmed_action = corporate_action[
         ~corporate_action["dart_event_confirmed"]
         & ~krx_structure_confirmed.loc[corporate_action.index]
@@ -1319,7 +1203,7 @@ def check_prices(
 
     # DART 감자 전/후 발행주식 수는 가격계수가 아니다. 균등병합만 효력일
     # 주변 전체 KRX 상장주식 수 변화와 비교하고 나머지는 Explained로 남긴다.
-    share_factor_mismatch, non_comparable_reductions = (
+    share_factor_mismatch, _ = (
         _dart_share_count_factor_results(
             combined,
             scoped_corporate_actions,
@@ -1336,24 +1220,6 @@ def check_prices(
         ),
         partition_key=partition_key,
     ))
-    checks.append(CheckResult(
-        rule_code="DART_SHARE_COUNT_FACTOR_NOT_COMPARABLE",
-        dataset="price_daily",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected=(
-            "non-uniform, par-value-only, simultaneous-split, or "
-            "unobservable reductions are excluded from share-factor comparison"
-        ),
-        actual=f"explained_events={len(non_comparable_reductions)}",
-        failed_count=0,
-        samples=(
-            non_comparable_reductions.head(20).astype(object)
-            .where(pd.notna(non_comparable_reductions.head(20)), None)
-            .to_dict("records")
-        ),
-        partition_key=partition_key,
-    ))
 
     missing_krx_adjustment = _dart_actions_without_krx_adjustment(
         combined,
@@ -1366,27 +1232,6 @@ def check_prices(
         Severity.WARNING,
         missing_krx_adjustment,
         "price-adjusting DART event has a nearby KRX reference-price adjustment",
-        partition_key=partition_key,
-    ))
-
-    corporate_action_samples = (
-        corporate_action.head(20).astype(object)
-        .where(pd.notna(corporate_action.head(20)), None)
-        .to_dict("records")
-    )
-    checks.append(CheckResult(
-        rule_code="PRICE_ADJUSTMENT_FACTOR_CHANGE",
-        dataset="price_daily",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected="KRX reference-price adjustment is reconciled to DART evidence",
-        actual=(
-            f"observed_events={len(corporate_action)}, "
-            f"dart_confirmed={int(corporate_action['dart_event_confirmed'].sum())}, "
-            f"dart_unconfirmed={len(unconfirmed_action)}"
-        ),
-        failed_count=0,
-        samples=corporate_action_samples,
         partition_key=partition_key,
     ))
 
@@ -1415,27 +1260,6 @@ def check_prices(
         "market instrument count does not fall >10% below previous 20-day median",
         partition_key=partition_key,
     ))
-    coverage_growth = coverage[
-        coverage["trade_date"].isin(candidate_dates)
-        & coverage["deviation"].gt(0.10)
-    ]
-    growth_samples = (
-        coverage_growth.head(20).astype(object)
-        .where(pd.notna(coverage_growth.head(20)), None)
-        .to_dict("records")
-    )
-    checks.append(CheckResult(
-        rule_code="PRICE_COVERAGE_GROWTH",
-        dataset="price_daily",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected="coverage increases are recorded separately from data-loss risk",
-        actual=f"observed_dates={len(coverage_growth)}",
-        failed_count=0,
-        samples=growth_samples,
-        partition_key=partition_key,
-    ))
-
     daily_return = (
         combined.groupby("trade_date")["return"].median()
         .rename("median_return")
@@ -1463,7 +1287,7 @@ def check_prices(
         "cross-sectional median return within max(5%, 5×rolling MAD)",
         partition_key=partition_key,
     ))
-    confirmation, inconsistent_drift = _distribution_drift_confirmation(
+    _, inconsistent_drift = _distribution_drift_confirmation(
         combined,
         distribution_bad,
     )
@@ -1475,24 +1299,6 @@ def check_prices(
         (
             "drift dates have both benchmark returns in the same direction "
             "and at least 60% same-direction stock breadth"
-        ),
-        partition_key=partition_key,
-    ))
-    checks.append(CheckResult(
-        rule_code="PRICE_DISTRIBUTION_DRIFT_MARKET_CONFIRMED",
-        dataset="price_daily",
-        severity=Severity.INFO,
-        status=CheckStatus.PASS,
-        expected=(
-            "statistical drift remains a warning while independent market "
-            "breadth and benchmark evidence is recorded"
-        ),
-        actual=f"confirmed_dates={len(confirmation) - len(inconsistent_drift)}",
-        failed_count=0,
-        samples=(
-            confirmation.head(20).astype(object)
-            .where(pd.notna(confirmation.head(20)), None)
-            .to_dict("records")
         ),
         partition_key=partition_key,
     ))

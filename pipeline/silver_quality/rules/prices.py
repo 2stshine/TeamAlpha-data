@@ -6,6 +6,9 @@ import pandas as pd
 
 from pipeline.silver.prices import LISTING_EPISODE_GAP_DAYS
 from pipeline.silver_quality.models import CheckResult, CheckStatus, Severity
+from pipeline.silver_quality.reviewed_exceptions import (
+    REVIEWED_SETTLEMENT_TRADING_IDENTIFIERS,
+)
 from pipeline.silver_quality.rules.common import (
     duplicate_keys,
     finite_numbers,
@@ -31,6 +34,8 @@ def _attach_corporate_action_evidence(
     frame["dart_rcept_no"] = None
     frame["dart_effective_date"] = None
     frame["dart_expected_factor"] = np.nan
+    frame["dart_share_count_factor"] = np.nan
+    frame["dart_action_method"] = None
     frame["dart_match_days"] = np.nan
     frame["dart_event_inherited"] = False
     frame["dart_issuer_parent_identifier"] = None
@@ -99,6 +104,10 @@ def _attach_corporate_action_evidence(
         frame.at[index, "dart_rcept_no"] = event.get("rcept_no")
         frame.at[index, "dart_effective_date"] = event.get("effective_date")
         frame.at[index, "dart_expected_factor"] = event.get("expected_factor")
+        frame.at[index, "dart_share_count_factor"] = event.get(
+            "share_count_factor"
+        )
+        frame.at[index, "dart_action_method"] = event.get("action_method")
         frame.at[index, "dart_match_days"] = distance
         frame.at[index, "dart_event_inherited"] = bool(
             event.get("issuer_event_inherited") or False
@@ -682,8 +691,34 @@ def check_prices(
     special_spikes = all_spikes[
         all_spikes["dart_special_event_confirmed"]
     ]
+    # 전수 검토로 정리매매가 확인된 종목만 전체 cutoff보다 먼저 종료된
+    # 시계열의 마지막 7거래일에서 Explained로 분류한다. 활성 종목이나
+    # 같은 ticker의 과거 일반 급변까지 넓게 예외 처리하지 않는다.
+    stock_cutoff = combined.loc[
+        combined["asset_type"].eq("stock"), "trade_date"
+    ].max()
+    episode_last_date = combined.groupby(series_keys)["trade_date"].transform(
+        "max"
+    )
+    reverse_trade_number = combined.iloc[::-1].groupby(
+        [
+            combined["identifier"].iloc[::-1],
+            combined["listing_episode"].iloc[::-1],
+        ],
+        sort=False,
+    ).cumcount().iloc[::-1]
+    reviewed_settlement = (
+        combined["identifier"].isin(REVIEWED_SETTLEMENT_TRADING_IDENTIFIERS)
+        & episode_last_date.lt(stock_cutoff)
+        & reverse_trade_number.lt(7)
+    )
+    settlement_spikes = all_spikes[
+        reviewed_settlement.loc[all_spikes.index]
+        & ~all_spikes["dart_special_event_confirmed"]
+    ]
     spike = all_spikes[
         ~all_spikes["dart_special_event_confirmed"]
+        & ~reviewed_settlement.loc[all_spikes.index]
     ]
     checks.append(result(
         "PRICE_RETURN_SPIKE", "price_daily", Severity.WARNING, spike,
@@ -696,6 +731,7 @@ def check_prices(
         & ~current["previous_dart_event_confirmed"]
         & ~current["dart_special_event_confirmed"]
         & ~current["previous_dart_special_event_confirmed"]
+        & ~reviewed_settlement.loc[current.index]
         & ((current["close"] / current["lag2_close"] - 1).abs().le(0.05))
     ]
     checks.append(result(
@@ -751,6 +787,24 @@ def check_prices(
         .where(pd.notna(special_spikes.head(20)), None)
         .to_dict("records")
     )
+    checks.append(CheckResult(
+        rule_code="SETTLEMENT_TRADING_PRICE_SPIKE",
+        dataset="price_daily",
+        severity=Severity.INFO,
+        status=CheckStatus.PASS,
+        expected=(
+            "reviewed delisting series spike occurs only within its final "
+            "7 unrestricted settlement-trading sessions"
+        ),
+        actual=f"explained_events={len(settlement_spikes)}",
+        failed_count=0,
+        samples=(
+            settlement_spikes.head(20).astype(object)
+            .where(pd.notna(settlement_spikes.head(20)), None)
+            .to_dict("records")
+        ),
+        partition_key=partition_key,
+    ))
     checks.append(CheckResult(
         rule_code="SPECIAL_TRADING_EVENT",
         dataset="price_daily",
@@ -809,6 +863,46 @@ def check_prices(
         Severity.WARNING,
         factor_mismatch,
         "KRX adjustment factor agrees with calculable DART factor within 2%",
+        partition_key=partition_key,
+    ))
+
+    # DART 감자 전/후 발행주식 수는 가격계수가 아니다. 가격계수와의
+    # 비교 대신 실제 KRX 상장주식 수 변화(previous/current)를 검증한다.
+    dart_share_factor = pd.to_numeric(
+        corporate_action["dart_share_count_factor"],
+        errors="coerce",
+    )
+    krx_share_factor = (
+        corporate_action["previous_shares"]
+        / corporate_action["shares"].replace(0, np.nan)
+    )
+    share_factor_error = (
+        krx_share_factor - dart_share_factor
+    ).abs() / dart_share_factor.replace(0, np.nan)
+    share_factor_mismatch = corporate_action[
+        corporate_action["dart_event_confirmed"]
+        & ~corporate_action["dart_event_inherited"]
+        & corporate_action["dart_event_type"].eq("capital_reduction")
+        & dart_share_factor.notna()
+        & krx_share_factor.notna()
+        & share_factor_error.gt(0.02)
+    ].copy()
+    if not share_factor_mismatch.empty:
+        share_factor_mismatch["krx_share_count_factor"] = krx_share_factor.loc[
+            share_factor_mismatch.index
+        ]
+        share_factor_mismatch["share_factor_relative_error"] = (
+            share_factor_error.loc[share_factor_mismatch.index]
+        )
+    checks.append(result(
+        "DART_SHARE_COUNT_FACTOR_MISMATCH",
+        "price_daily",
+        Severity.WARNING,
+        share_factor_mismatch,
+        (
+            "DART capital-reduction before/after share ratio agrees with "
+            "actual KRX listed-share change within 2%"
+        ),
         partition_key=partition_key,
     ))
 

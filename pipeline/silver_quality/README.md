@@ -31,12 +31,14 @@ temporary staging과 단일 publish transaction을 유지한다.
 | `LISTING_EPISODE_BOUNDARY` | Info/Pass | 동일 ticker가 365일 초과 사라졌다 재등장하면 과거 발행회사와 수정주가·수익률 사슬 분리 |
 | `PRICE_RETURN_SPIKE` | Warning | KRX 기준가 조정 후 일간 절대수익률 30.5% 초과이며 DART 특별거래 공시로 설명되지 않음 |
 | `PRICE_ROUND_TRIP_SPIKE` | Warning | 급등락 후 3일 내 원래 가격 복귀 |
+| `SETTLEMENT_TRADING_PRICE_SPIKE` | Explained(Info/Pass) | 전수 검토된 상장폐지 종목의 종료된 시계열 마지막 7거래일 급변을 가격제한폭 없는 정리매매로 설명 |
 | `PRICE_SCALE_JUMP` | Warning | DART·KRX 주식수/시총·특별거래로 설명되지 않는 10배·100배 단위 변화 |
 | `CORPORATE_ACTION_INFERRED_FROM_KRX_STRUCTURE` | Info/Pass | 가격과 주식수가 반대로 10배·100배 변하고 시가총액이 유지된 구조변경 |
 | `SPECIAL_TRADING_EVENT` | Info/Pass | 최근 120일 내 정리매매·상장폐지·거래재개·재상장·변경상장 DART 공시로 설명되는 실제 30.5% 초과 가격 변화. 보통주 공시는 이름이 유일하게 일치하는 우선주에도 발행회사 근거로 상속하며 가격값은 수정하지 않음 |
 | `PRICE_ADJUSTMENT_FACTOR_CHANGE` | Info/Pass | KRX 기준가 수정계수 0.5% 초과 기업행사 기록 |
 | `PRICE_ADJUSTMENT_WITHOUT_DART_EVENT` | Warning | 0.5% 초과 KRX 조정계수에 인접한 DART 기업행사 근거가 없음 |
-| `CORPORATE_ACTION_FACTOR_MISMATCH` | Warning | 계산 가능한 DART 주식수 조정계수와 KRX 계수가 2% 초과 불일치 |
+| `CORPORATE_ACTION_FACTOR_MISMATCH` | Warning | DART가 실제 가격계수를 제공하는 행사와 KRX 가격계수가 2% 초과 불일치. 감자 전후 주식 수는 비교하지 않음 |
+| `DART_SHARE_COUNT_FACTOR_MISMATCH` | Warning | DART 감자 전후 보통주 수 비율과 KRX 실제 상장주식 수 변화가 2% 초과 불일치 |
 | `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` | Warning | 가격조정형 DART 효력일 근처에 KRX 조정계수가 없음 |
 | `PRICE_COVERAGE_DRIFT` | Warning | 시장별 종목 수가 20일 median 대비 10% 초과 감소 |
 | `PRICE_COVERAGE_GROWTH` | Info/Pass | 시장별 종목 수가 20일 median 대비 10% 초과 증가 |
@@ -55,6 +57,10 @@ temporary staging과 단일 publish transaction을 유지한다.
 관계없이 적용한다. `PRICE_ADJUSTMENT_FACTOR_CHANGE`의 0.5% 임계치는
 검토할 기업행사를 요약하는 기준이며, 계산에서 작은 계수를 버리는
 허용오차가 아니다.
+
+DART 감자 전후 발행주식 수는 가격 조정계수로 해석하지 않는다. 해당 비율은
+감자 방법과 함께 기업행사 메타데이터로 보존하고 KRX의 실제 상장주식 수 변화와
+대사한다. 수정종가에는 계속 KRX 비교기준가 계수만 사용한다.
 
 `당기순이익`과 `당기순이익(손실)`은 별도 지표가 아니라 부호가 있는 동일
 `net_income` 지표로 정규화한다. 연결(`CFS`)과 별도(`OFS`) 재무제표는 기존 키로

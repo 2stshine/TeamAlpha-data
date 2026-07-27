@@ -454,7 +454,88 @@ def test_special_trading_episode_accepts_notice_up_to_120_days_before():
     assert _failed(results, "PRICE_RETURN_SPIKE") == 0
 
 
-def test_dart_factor_mismatch_is_warning():
+def test_reviewed_terminal_settlement_spike_is_explained():
+    rows = []
+    closes = [100.0, 100.0, 100.0, 100.0, 100.0, 200.0, 100.0]
+    for offset, close in enumerate(closes):
+        previous = closes[offset - 1] if offset else close
+        rows.append(_row(
+            "000800",
+            "stock",
+            trade_date=date(2015, 4, 1 + offset),
+            open=close,
+            high=close,
+            low=close,
+            close=close,
+            adj_close=close,
+            prev_diff=close - previous,
+            fluc_rate=(close / previous - 1) * 100,
+            shares=1_000,
+            market_cap=close * 1_000,
+        ))
+    # 전체 cutoff 이후에도 존재하는 활성 종목이 있어야 000800 시계열이
+    # 종료된 과거 episode임을 확정할 수 있다.
+    rows.extend([
+        _row("005930", "stock", trade_date=DAY),
+        _row("035720", "stock", market="KOSDAQ", trade_date=DAY),
+        _row("1028", "index", shares=None, market=None, trade_date=DAY),
+        _row("2203", "index", shares=None, market=None, trade_date=DAY),
+    ])
+
+    results = check_prices(pd.DataFrame(rows))
+
+    assert _failed(results, "PRICE_RETURN_SPIKE") == 0
+    assert _failed(results, "PRICE_ROUND_TRIP_SPIKE") == 0
+    explained = next(
+        r for r in results
+        if r.rule_code == "SETTLEMENT_TRADING_PRICE_SPIKE"
+    )
+    assert explained.status.value == "PASS"
+    assert "explained_events=2" in explained.actual
+
+
+def test_unreviewed_terminal_spike_remains_warning():
+    frame = pd.DataFrame([
+        _row(
+            "123456",
+            "stock",
+            trade_date=date(2020, 1, 2),
+            close=100.0,
+            adj_close=100.0,
+            prev_diff=0.0,
+            shares=1_000,
+            market_cap=100_000.0,
+        ),
+        _row(
+            "123456",
+            "stock",
+            trade_date=date(2020, 1, 3),
+            open=200.0,
+            high=200.0,
+            low=200.0,
+            close=200.0,
+            adj_close=200.0,
+            prev_diff=100.0,
+            shares=1_000,
+            market_cap=200_000.0,
+        ),
+        _row("005930", "stock", trade_date=DAY),
+        _row("035720", "stock", market="KOSDAQ", trade_date=DAY),
+        _row("1028", "index", shares=None, market=None, trade_date=DAY),
+        _row("2203", "index", shares=None, market=None, trade_date=DAY),
+    ])
+
+    results = check_prices(frame)
+
+    assert _failed(results, "PRICE_RETURN_SPIKE") == 1
+    explained = next(
+        r for r in results
+        if r.rule_code == "SETTLEMENT_TRADING_PRICE_SPIKE"
+    )
+    assert "explained_events=0" in explained.actual
+
+
+def test_capital_reduction_compares_dart_to_actual_share_change():
     frame = _valid_prices({
         "open": 1_000.0,
         "high": 1_050.0,
@@ -462,7 +543,8 @@ def test_dart_factor_mismatch_is_warning():
         "close": 1_000.0,
         "adj_close": 1_000.0,
         "market_cap": 100_000.0,
-        "prev_diff": 0.0,
+        "shares": 100,
+        "prev_diff": 800.0,
         "fluc_rate": 0.0,
     })
     history = pd.DataFrame([{
@@ -472,6 +554,7 @@ def test_dart_factor_mismatch_is_warning():
         "adj_close": 100.0,
         "market": "KOSPI",
         "asset_type": "stock",
+        "shares": 1_000,
     }])
     results = check_prices(
         frame,
@@ -479,11 +562,51 @@ def test_dart_factor_mismatch_is_warning():
         history=history,
         corporate_actions=_action(
             event_type="capital_reduction",
-            expected_factor=8.0,
+            expected_factor=None,
+            share_count_factor=8.0,
+            action_method="보통주식 8대 1 무상감자",
             source="DART_STRUCTURED",
         ),
     )
-    assert _failed(results, "CORPORATE_ACTION_FACTOR_MISMATCH") == 1
+    assert _failed(results, "CORPORATE_ACTION_FACTOR_MISMATCH") == 0
+    assert _failed(results, "DART_SHARE_COUNT_FACTOR_MISMATCH") == 1
+
+
+def test_capital_reduction_matching_actual_share_change_passes():
+    frame = _valid_prices({
+        "open": 1_000.0,
+        "high": 1_050.0,
+        "low": 950.0,
+        "close": 1_000.0,
+        "adj_close": 1_000.0,
+        "shares": 100,
+        "market_cap": 100_000.0,
+        "prev_diff": 800.0,
+        "fluc_rate": 0.0,
+    })
+    history = pd.DataFrame([{
+        "identifier": "005930",
+        "trade_date": date(2026, 7, 7),
+        "close": 100.0,
+        "adj_close": 100.0,
+        "market": "KOSPI",
+        "asset_type": "stock",
+        "shares": 800,
+        "market_cap": 80_000.0,
+    }])
+    results = check_prices(
+        frame,
+        target_date=DAY,
+        history=history,
+        corporate_actions=_action(
+            event_type="capital_reduction",
+            expected_factor=None,
+            share_count_factor=8.0,
+            action_method="보통주식 8대 1 무상감자",
+            source="DART_STRUCTURED",
+        ),
+    )
+    assert _failed(results, "DART_SHARE_COUNT_FACTOR_MISMATCH") == 0
 
 
 def test_dart_action_without_krx_adjustment_is_warning():

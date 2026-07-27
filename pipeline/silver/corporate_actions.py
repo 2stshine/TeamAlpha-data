@@ -25,6 +25,8 @@ COLUMNS = [
     "effective_date",
     "match_window_days",
     "expected_factor",
+    "share_count_factor",
+    "action_method",
     "confirms_price_adjustment",
     "expects_price_adjustment",
     "confidence",
@@ -122,12 +124,25 @@ def _structured_expected_factor(event_type: str, row: dict) -> float | None:
     # 유무상증자는 유상 신주 비율·발행가와 무상 신주 비율이 함께
     # 이론권리락 가격을 결정한다. 이전 종가까지 필요한 값을 DART
     # 무상분만으로 계산하면 거짓 불일치가 되므로 단독 계수를 만들지 않는다.
-    if event_type == "capital_reduction":
-        before = _number(row.get("bfcr_tisstk_ostk"))
-        after = _number(row.get("atcr_tisstk_ostk"))
-        if before is not None and after is not None and before > 0 and after > 0:
-            return before / after
     return None
+
+
+def _structured_share_count_factor(
+    event_type: str,
+    row: dict,
+) -> float | None:
+    """DART 감자 전·후 보통주 수 비율.
+
+    이것은 가격 조정계수가 아니다. KRX의 실제 상장주식 수 변화와만
+    비교하기 위해 별도 필드로 보존한다.
+    """
+    if event_type != "capital_reduction":
+        return None
+    before = _number(row.get("bfcr_tisstk_ostk"))
+    after = _number(row.get("atcr_tisstk_ostk"))
+    if before is None or after is None or before <= 0 or after <= 0:
+        return None
+    return before / after
 
 
 def _structured_row(
@@ -157,6 +172,8 @@ def _structured_row(
         "effective_date": effective_date,
         "match_window_days": 7 if effective_date else 0,
         "expected_factor": _structured_expected_factor(event_type, row),
+        "share_count_factor": _structured_share_count_factor(event_type, row),
+        "action_method": row.get("cr_mth") if event_type == "capital_reduction" else None,
         "confirms_price_adjustment": (
             event_type in PRICE_ADJUSTING_STRUCTURED
             and effective_date is not None
@@ -232,6 +249,8 @@ def _disclosure_row(path: str, row: dict) -> dict | None:
         "effective_date": effective_date,
         "match_window_days": match_window_days,
         "expected_factor": None,
+        "share_count_factor": None,
+        "action_method": None,
         "confirms_price_adjustment": confirms_adjustment,
         "expects_price_adjustment": expects_adjustment,
         "confidence": (
@@ -340,6 +359,9 @@ def prepare(
         "disclosure_event_count": disclosure_count,
         "effective_date_count": int(events["effective_date"].notna().sum()),
         "expected_factor_count": int(events["expected_factor"].notna().sum()),
+        "share_count_factor_count": int(
+            events["share_count_factor"].notna().sum()
+        ),
     }
 
 

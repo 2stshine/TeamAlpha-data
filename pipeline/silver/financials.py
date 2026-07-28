@@ -594,8 +594,10 @@ def prepare(
         excluded_rows += int(already_present.sum())
         supplemental_df = supplemental_df[~already_present]
     supplemented_rows = len(supplemental_df)
+    # 변경 재무가 없는 날은 primary·supplemental_df 가 모두 비어 concat 결과에서
+    # _supplemental 컬럼이 사라질 수 있다. 임시 마커라 없으면 그대로 둔다.
     df = pd.concat([primary, supplemental_df], ignore_index=True).drop(
-        columns="_supplemental",
+        columns="_supplemental", errors="ignore",
     )
     return df, {
         "input_rows": input_rows,

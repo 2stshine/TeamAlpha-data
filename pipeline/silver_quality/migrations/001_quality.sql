@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS dq_result (
     partition_key  TEXT,
     dataset_name   TEXT NOT NULL,
     rule_code      TEXT NOT NULL,
-    severity       TEXT NOT NULL CHECK (severity IN ('CRITICAL', 'ERROR', 'WARNING', 'INFO')),
+    severity       TEXT NOT NULL CHECK (severity IN ('CRITICAL', 'ERROR', 'WARNING', 'MODIFIED', 'INFO')),
     status         TEXT NOT NULL CHECK (status IN ('PASS', 'FAIL')),
     expected_value TEXT,
     actual_value   TEXT,
@@ -35,6 +35,13 @@ CREATE TABLE IF NOT EXISTS dq_result (
     checked_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ix_dq_result_run ON dq_result(run_id, severity, status);
+
+-- 기존 DB의 severity CHECK 제약을 MODIFIED 등급까지 허용하도록 갱신한다.
+-- (과거 INFO 행 검증을 위해 INFO도 유지한다. DROP IF EXISTS로 재실행 안전.)
+ALTER TABLE dq_result DROP CONSTRAINT IF EXISTS dq_result_severity_check;
+ALTER TABLE dq_result
+    ADD CONSTRAINT dq_result_severity_check
+    CHECK (severity IN ('CRITICAL', 'ERROR', 'WARNING', 'MODIFIED', 'INFO'));
 
 CREATE TABLE IF NOT EXISTS dq_metric (
     metric_id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

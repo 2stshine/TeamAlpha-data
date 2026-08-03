@@ -86,11 +86,11 @@ def _candidate_bundle(base: str) -> CandidateBundle:
         identifiers=identifier_df,
         prices=price_df,
         fundamentals=fundamental_df,
+        actions=action_df,
         stats={
             "price_daily": price_stats,
             "fundamental": fundamental_stats,
             "corporate_action": action_stats,
-            "_corporate_actions": action_df,
         },
     )
 
@@ -118,29 +118,57 @@ def _required_backfill_results(bundle: CandidateBundle) -> list[CheckResult]:
 def _asset_stage_frames(bundle: CandidateBundle) -> tuple[pd.DataFrame, pd.DataFrame]:
     return (
         bundle.assets[[
-            "natural_key", "name", "asset_type", "exchange",
-            "currency", "source_file",
+            "natural_key", "name", "asset_type", "instrument_type", "exchange",
+            "currency", "country_code", "base_currency", "listed_from",
+            "listed_to", "source_file",
         ]],
         bundle.identifiers[[
-            "natural_key", "source", "identifier", "source_file",
+            "natural_key", "source", "identifier", "identifier_type",
+            "valid_from", "valid_to", "source_file",
         ]],
     )
 
 
 def _price_stage_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    return frame[[
+    staged = frame.copy()
+    if "total_return_close" not in staged:
+        staged["total_return_close"] = staged["adj_close"]
+    if "currency" not in staged:
+        staged["currency"] = "KRW"
+    if "vwap" not in staged:
+        staged["vwap"] = None
+    if "available_at" not in staged:
+        staged["available_at"] = (
+            pd.to_datetime(staged["trade_date"])
+            .dt.tz_localize("Asia/Seoul")
+            + pd.Timedelta(days=1, hours=8, minutes=30)
+        )
+    return staged[[
         "identifier", "source", "trade_date", "open", "high", "low", "close",
-        "adj_close", "volume", "trading_value", "shares", "market_cap", "market",
+        "adj_close", "total_return_close", "currency", "vwap", "available_at",
+        "volume", "trading_value", "shares", "market_cap", "market",
         "asset_type", "prev_diff", "fluc_rate", "source_file",
     ]]
 
 
 def _fundamental_stage_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return frame[[
-        "identifier", "source", "period_end", "fiscal_period", "fs_type",
-        "filing_id", "filed", "available_date", "metric", "value", "currency",
-        "revision_key", "source_file",
+        "identifier", "source", "statement_type", "data_basis", "period_end",
+        "fiscal_period", "fs_type", "filing_id", "filed", "accepted_at",
+        "available_date", "available_at", "metric", "value", "currency",
+        "unit_type", "revision_key", "source_file",
     ]]
+
+
+def _action_stage_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    normalized = corporate_actions.normalize_for_publish(frame)
+    if normalized.empty:
+        return normalized
+    normalized["source_file"] = (
+        frame["source_file"].reset_index(drop=True)
+        if "source_file" in frame else None
+    )
+    return normalized
 
 
 def _stage_partition(
@@ -188,7 +216,9 @@ def _stage_partition(
 def _assert_final_empty(conn) -> None:
     with conn.cursor() as cur:
         counts = {}
-        for table in ("asset_identifier", "price_daily", "fundamental", "asset"):
+        for table in (
+            "corporate_action", "asset_identifier", "price_daily", "fundamental", "asset",
+        ):
             cur.execute(f"SELECT count(*) FROM {table}")
             counts[table] = cur.fetchone()[0]
     if any(counts.values()):
@@ -208,6 +238,7 @@ def _publish(conn, context, bundle: CandidateBundle, results) -> None:
         )
         prices.publish(conn, bundle.prices, krx_map, context.run_id)
         financials.publish(conn, bundle.fundamentals, krx_map, context.run_id)
+        corporate_actions.publish(conn, bundle.actions, krx_map, context.run_id)
         expected = {
             "price_daily": len(bundle.prices),
             "fundamental": len(bundle.fundamentals),
@@ -350,6 +381,25 @@ def run(src: str = "local", resume: str | None = None) -> None:
                     frame=_fundamental_stage_frame(frame),
                     bundle=fundamental_bundle,
                 )
+
+        done_actions = staging.staged_partitions(
+            conn, context.run_id, "corporate_action",
+        )
+        if not bundle.actions.empty and "corporate_action:all" not in done_actions:
+            action_bundle = CandidateBundle(
+                assets=bundle.assets,
+                identifiers=bundle.identifiers,
+                actions=bundle.actions,
+                stats={"corporate_action": bundle.stats.get("corporate_action", {})},
+            )
+            _stage_partition(
+                conn,
+                context,
+                table="corporate_action",
+                partition_key="corporate_action:all",
+                frame=_action_stage_frame(bundle.actions),
+                bundle=action_bundle,
+            )
 
         repository.update_status(conn, context.run_id, "VALIDATING")
         global_results = evaluate(bundle) + _required_backfill_results(bundle)

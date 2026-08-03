@@ -7,6 +7,7 @@ import pytest
 from pipeline.silver_quality import repository
 from pipeline.silver_quality.models import CheckResult, CheckStatus, Severity
 from pipeline.silver import load
+from pipeline.silver_quality import migrate
 
 
 pytestmark = pytest.mark.postgres
@@ -19,15 +20,14 @@ def conn():
         pytest.skip("TEST_DATABASE_URL is not set")
     connection = psycopg.connect(url)
     schema = Path(__file__).parents[2] / "sql" / "schema.sql"
-    migration = (
-        Path(__file__).parents[2]
-        / "pipeline" / "silver_quality" / "migrations" / "001_quality.sql"
-    )
     with connection.cursor() as cur:
         cur.execute(schema.read_text(encoding="utf-8"))
-        cur.execute(migration.read_text(encoding="utf-8"))
+    connection.commit()
+    migrate.run(connection)
+    with connection.cursor() as cur:
         cur.execute(
-            "TRUNCATE fundamental, price_daily, asset_identifier, asset, "
+            "TRUNCATE corporate_action, fundamental, price_daily, "
+            "asset_identifier, asset, "
             "dq_metric, dq_result, dq_run CASCADE"
         )
     connection.commit()

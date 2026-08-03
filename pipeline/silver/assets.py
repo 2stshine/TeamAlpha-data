@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import glob
 import re
+from datetime import date
 
 import pandas as pd
 from uuid import UUID
@@ -46,8 +47,15 @@ def prepare(base: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             "natural_key": ticker,
             "name": name,
             "asset_type": "stock",
+            "instrument_type": (
+                "preferred_stock" if _PREFERRED_SUFFIX.search(name) else "common_stock"
+            ),
             "exchange": "KRX",
             "currency": "KRW",
+            "country_code": "KR",
+            "base_currency": "KRW",
+            "listed_from": None,
+            "listed_to": None,
             "source_file": None,
         }
         for ticker, name in names.items()
@@ -57,6 +65,9 @@ def prepare(base: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             "natural_key": ticker,
             "source": "KRX",
             "identifier": ticker,
+            "identifier_type": "ticker",
+            "valid_from": date.min,
+            "valid_to": None,
             "source_file": None,
         }
         for ticker in names
@@ -66,6 +77,9 @@ def prepare(base: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             "natural_key": ticker,
             "source": "DART",
             "identifier": corp_code,
+            "identifier_type": "corp_code",
+            "valid_from": date.min,
+            "valid_to": None,
             "source_file": "financials/dart/corpCode.xml",
         }
         for ticker, corp_code in corp.items()
@@ -76,14 +90,22 @@ def prepare(base: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             "natural_key": code,
             "name": name,
             "asset_type": "index",
+            "instrument_type": "index",
             "exchange": "KRX",
             "currency": "KRW",
+            "country_code": "KR",
+            "base_currency": "KRW",
+            "listed_from": None,
+            "listed_to": None,
             "source_file": None,
         })
         identifier_rows.append({
             "natural_key": code,
             "source": "KRX",
             "identifier": code,
+            "identifier_type": "ticker",
+            "valid_from": date.min,
+            "valid_to": None,
             "source_file": None,
         })
     return pd.DataFrame(asset_rows), pd.DataFrame(identifier_rows)
@@ -147,8 +169,35 @@ def publish(
     quality_run_id: UUID,
 ) -> dict[str, int]:
     """후보를 현재 transaction에 반영하고 KRX identifier→asset_id를 반환한다."""
+    asset_defaults = {
+        "instrument_type": "unknown",
+        "country_code": None,
+        "base_currency": None,
+        "listed_from": None,
+        "listed_to": None,
+    }
+    identifier_defaults = {
+        "identifier_type": "ticker",
+        "valid_from": date.min,
+        "valid_to": None,
+    }
+    asset_candidates = asset_candidates.copy()
+    identifier_candidates = identifier_candidates.copy()
+    for column, default in asset_defaults.items():
+        if column not in asset_candidates:
+            asset_candidates[column] = default
+    asset_candidates["base_currency"] = asset_candidates[
+        "base_currency"
+    ].fillna(asset_candidates["currency"])
+    for column, default in identifier_defaults.items():
+        if column not in identifier_candidates:
+            identifier_candidates[column] = default
+
     with conn.cursor() as cur:
-        cur.execute("SELECT identifier, asset_id FROM asset_identifier WHERE source='KRX'")
+        cur.execute(
+            "SELECT identifier, asset_id FROM asset_identifier "
+            "WHERE source='KRX' AND valid_to IS NULL"
+        )
         krx_map = dict(cur.fetchall())
         natural_to_id: dict[str, int] = {}
         for row in asset_candidates.itertuples(index=False):
@@ -158,12 +207,17 @@ def publish(
                 cur.execute(
                     """
                     UPDATE asset
-                    SET name=%s, asset_type=%s, exchange=%s, currency=%s,
+                    SET name=%s, asset_type=%s, instrument_type=%s,
+                        exchange=%s, currency=%s, country_code=%s,
+                        base_currency=%s, listed_from=COALESCE(%s, listed_from),
+                        listed_to=%s,
                         quality_run_id=%s, loaded_at=now()
                     WHERE asset_id=%s
                     """,
                     (
-                        row.name, row.asset_type, row.exchange, row.currency,
+                        row.name, row.asset_type, row.instrument_type,
+                        row.exchange, row.currency, row.country_code,
+                        row.base_currency, row.listed_from, row.listed_to,
                         quality_run_id, krx_map[natural_key],
                     ),
                 )
@@ -171,10 +225,17 @@ def publish(
             cur.execute(
                 """
                 INSERT INTO asset (
-                    name, asset_type, exchange, currency, quality_run_id, loaded_at
-                ) VALUES (%s,%s,%s,%s,%s,now()) RETURNING asset_id
+                    name, asset_type, instrument_type, exchange, currency,
+                    country_code, base_currency, listed_from, listed_to,
+                    quality_run_id, loaded_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+                RETURNING asset_id
                 """,
-                (row.name, row.asset_type, row.exchange, row.currency, quality_run_id),
+                (
+                    row.name, row.asset_type, row.instrument_type, row.exchange,
+                    row.currency, row.country_code, row.base_currency,
+                    row.listed_from, row.listed_to, quality_run_id,
+                ),
             )
             aid = cur.fetchone()[0]
             natural_to_id[natural_key] = aid
@@ -184,8 +245,10 @@ def publish(
             if aid is None:
                 continue
             cur.execute(
-                "SELECT asset_id FROM asset_identifier WHERE source=%s AND identifier=%s",
-                (row.source, str(row.identifier)),
+                "SELECT asset_id FROM asset_identifier "
+                "WHERE source=%s AND identifier_type=%s AND identifier=%s "
+                "AND valid_to IS NULL",
+                (row.source, row.identifier_type, str(row.identifier)),
             )
             existing = cur.fetchone()
             if existing and existing[0] != aid:
@@ -197,15 +260,26 @@ def publish(
             cur.execute(
                 """
                 INSERT INTO asset_identifier (
-                    asset_id, source, identifier, quality_run_id, loaded_at
-                ) VALUES (%s,%s,%s,%s,now())
-                ON CONFLICT (source, identifier) DO UPDATE
-                SET quality_run_id=EXCLUDED.quality_run_id, loaded_at=now()
+                    asset_id, source, identifier, identifier_type,
+                    valid_from, valid_to, quality_run_id, loaded_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,now())
+                ON CONFLICT (
+                    asset_id, source, identifier_type, identifier, valid_from
+                ) DO UPDATE SET
+                    valid_to=EXCLUDED.valid_to,
+                    quality_run_id=EXCLUDED.quality_run_id,
+                    loaded_at=now()
                 """,
-                (aid, row.source, str(row.identifier), quality_run_id),
+                (
+                    aid, row.source, str(row.identifier), row.identifier_type,
+                    row.valid_from, row.valid_to, quality_run_id,
+                ),
             )
 
-        cur.execute("SELECT identifier, asset_id FROM asset_identifier WHERE source='KRX'")
+        cur.execute(
+            "SELECT identifier, asset_id FROM asset_identifier "
+            "WHERE source='KRX' AND valid_to IS NULL"
+        )
         krx_map = dict(cur.fetchall())
     print(f"[assets] asset candidates={len(asset_candidates)}, KRX identifiers={len(krx_map)}")
     return krx_map

@@ -10,14 +10,18 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import html
 import json
 import re
 import zipfile
 from datetime import date, datetime
 from pathlib import Path
+from uuid import UUID
 
 import pandas as pd
+
+from pipeline.common import db
 
 
 COLUMNS = [
@@ -603,3 +607,99 @@ def inherit_issuer_events(
         "preferred_ticker_count": len(inherited),
         "inherited_event_count": len(expanded) - len(original),
     }
+
+
+PUBLISH_COLUMNS = [
+    "asset_id", "source", "action_key", "action_type", "announcement_date",
+    "ex_date", "record_date", "payment_date", "cash_amount", "currency",
+    "ratio_numerator", "ratio_denominator", "expected_price_factor",
+    "share_count_factor", "status", "confidence", "filing_id",
+    "quality_run_id",
+]
+
+
+def _action_key(row) -> str:
+    receipt = str(getattr(row, "rcept_no", "") or "").strip()
+    if receipt:
+        return receipt
+    material = "|".join(
+        str(value or "")
+        for value in (
+            getattr(row, "identifier", None),
+            getattr(row, "event_type", None),
+            getattr(row, "announcement_date", None),
+            getattr(row, "effective_date", None),
+            getattr(row, "source_file", None),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def normalize_for_publish(candidates: pd.DataFrame) -> pd.DataFrame:
+    """Convert DART evidence rows to the persistent corporate-action shape."""
+    if candidates.empty:
+        return pd.DataFrame(columns=["identifier", *PUBLISH_COLUMNS[1:-1]])
+    records = []
+    for row in candidates.itertuples(index=False):
+        records.append({
+            "identifier": str(row.identifier),
+            "source": str(row.source),
+            "action_key": _action_key(row),
+            "action_type": str(row.event_type),
+            "announcement_date": row.announcement_date,
+            "ex_date": row.effective_date,
+            "record_date": None,
+            "payment_date": None,
+            "cash_amount": None,
+            "currency": "KRW",
+            "ratio_numerator": None,
+            "ratio_denominator": None,
+            "expected_price_factor": row.expected_factor,
+            "share_count_factor": row.share_count_factor,
+            "status": (
+                "confirmed" if row.effective_date is not None else "announced"
+            ),
+            "confidence": row.confidence,
+            "filing_id": str(row.rcept_no or "") or None,
+        })
+    return pd.DataFrame(records)
+
+
+def publish(
+    conn,
+    candidates: pd.DataFrame,
+    identifier_map: dict[str, int],
+    quality_run_id: UUID,
+) -> int:
+    """DQ에만 쓰던 DART 기업행사를 Silver 테이블에도 영속화한다."""
+    frame = normalize_for_publish(candidates)
+    if frame.empty:
+        return 0
+    frame["asset_id"] = frame["identifier"].map(identifier_map)
+    frame = frame[frame["asset_id"].notna()].copy()
+    frame["asset_id"] = frame["asset_id"].astype("int64")
+    frame["quality_run_id"] = quality_run_id
+    records = frame.to_dict("records")
+    if not records:
+        return 0
+    rows = list(
+        frame[PUBLISH_COLUMNS].astype(object).where(
+            pd.notna(frame[PUBLISH_COLUMNS]), None,
+        ).itertuples(index=False, name=None)
+    )
+    count = db.upsert(
+        conn,
+        "corporate_action",
+        PUBLISH_COLUMNS,
+        rows,
+        conflict=["asset_id", "source", "action_key"],
+        update=[
+            "action_type", "announcement_date", "ex_date", "record_date",
+            "payment_date", "cash_amount", "currency", "ratio_numerator",
+            "ratio_denominator", "expected_price_factor", "share_count_factor",
+            "status", "confidence", "filing_id", "quality_run_id", "loaded_at",
+        ],
+        temp_name="_stg_corporate_action_publish",
+    )
+    print(f"[corporate-actions] corporate_action upsert {count}행")
+    return count

@@ -46,9 +46,12 @@ SUPPLEMENT_STATEMENT_BY_METRIC = {
 # reprt_code → (fiscal_period, 12월 결산 기준 종료 월, 일). thstrm_dt 를 못 읽을 때만 쓰는 fallback.
 REPRT = {"11011": ("FY", 12, 31), "11013": ("Q1", 3, 31), "11012": ("Q2", 6, 30), "11014": ("Q3", 9, 30)}
 _DT_RE = re.compile(r"(\d{4})\.(\d{2})\.(\d{2})")
-COLS = ["asset_id", "source", "period_end", "fiscal_period", "fs_type",
-        "filing_id", "filed", "available_date", "metric", "value",
-        "currency", "revision_key", "quality_run_id"]
+COLS = [
+    "asset_id", "source", "statement_type", "data_basis", "period_end",
+    "fiscal_period", "fs_type", "filing_id", "filed", "accepted_at",
+    "available_date", "available_at", "metric", "value", "currency",
+    "unit_type", "revision_key", "quality_run_id",
+]
 ACCOUNTING_METRICS = (
     "total_assets",
     "total_liabilities",
@@ -599,6 +602,18 @@ def prepare(
     df = pd.concat([primary, supplemental_df], ignore_index=True).drop(
         columns="_supplemental", errors="ignore",
     )
+    balance_metrics = {
+        metric
+        for metric, statements in SUPPLEMENT_STATEMENT_BY_METRIC.items()
+        if statements == {"BS"}
+    }
+    df["statement_type"] = df["metric"].map(
+        lambda metric: "BS" if metric in balance_metrics else "IS"
+    )
+    df["data_basis"] = "STANDARDIZED"
+    df["accepted_at"] = pd.NaT
+    df["available_at"] = pd.to_datetime(df["available_date"], utc=True)
+    df["unit_type"] = "currency"
     return df, {
         "input_rows": input_rows,
         "transformed_rows": len(df),
@@ -735,16 +750,17 @@ def publish(
     df["quality_run_id"] = quality_run_id
     if replace_scopes:
         scopes = df[[
-            "asset_id", "source", "period_end", "fiscal_period",
-            "fs_type", "revision_key",
+            "asset_id", "source", "statement_type", "data_basis",
+            "period_end", "fiscal_period", "fs_type", "revision_key",
         ]].drop_duplicates()
         with conn.cursor() as cur:
             for scope in scopes.itertuples(index=False, name=None):
                 cur.execute(
                     """
                     DELETE FROM fundamental
-                    WHERE asset_id=%s AND source=%s AND period_end=%s
-                      AND fiscal_period=%s AND fs_type=%s AND revision_key=%s
+                    WHERE asset_id=%s AND source=%s AND statement_type=%s
+                      AND data_basis=%s AND period_end=%s AND fiscal_period=%s
+                      AND fs_type=%s AND revision_key=%s
                     """,
                     scope,
                 )
@@ -753,10 +769,12 @@ def publish(
         .itertuples(index=False, name=None)
     )
     n = db.upsert(conn, "fundamental", COLS, rows,
-                  conflict=["asset_id", "source", "period_end", "fiscal_period",
-                            "fs_type", "revision_key", "metric"],
-                  update=["filing_id", "filed", "available_date", "value",
-                          "currency", "quality_run_id", "loaded_at"],
+                  conflict=["asset_id", "source", "statement_type", "data_basis",
+                            "period_end", "fiscal_period", "fs_type",
+                            "revision_key", "metric"],
+                  update=["filing_id", "filed", "accepted_at", "available_date",
+                          "available_at", "value", "currency", "unit_type",
+                          "quality_run_id", "loaded_at"],
                   temp_name="_stg_fundamental_publish")
     print(f"[financials] fundamental upsert {n}행")
     return n

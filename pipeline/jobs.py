@@ -20,11 +20,13 @@ from datetime import date, datetime, timedelta
 from pipeline.bronze import (
     corporate_actions,
     financials,
+    fmp as fmp_bronze,
     index,
     stock_krxapi,
     stock_marcap,
 )
 from pipeline.silver import load
+from pipeline.silver import fmp_load
 
 # silver 는 현재 로컬 bronze(./data)를 읽는다 → dest='local' 일 때 end-to-end.
 # dest='s3' 는 bronze 만 S3 적재(silver S3 직접읽기는 후속).
@@ -40,8 +42,12 @@ def run_backfill(fromyear: int, toyear: int, dest: str) -> None:
         f"{toyear}1231",
         dest,
     )
+    fmp_bronze.run_backfill(fromyear, toyear, dest)
     if dest == "local":
         load.backfill()                                       # silver 전체 (bronze→RDS)
+        fmp_load.run(
+            src="local", fromyear=fromyear, toyear=toyear,
+        )                                                     # FMP source-scoped upsert
 
 
 def run_daily(day: str, dest: str) -> None:
@@ -53,8 +59,10 @@ def run_daily(day: str, dest: str) -> None:
         datetime.strptime(day, "%Y%m%d").date() - timedelta(days=14)
     ).strftime("%Y%m%d")
     corporate_actions.run(action_from, day, dest)
+    fmp_bronze.run_daily(day, dest)
     if dest == "local":
         load.incremental(day)                                 # silver 증분 (bronze→RDS)
+        fmp_load.run(src="local", day=day)
 
 
 def parse_args() -> argparse.Namespace:

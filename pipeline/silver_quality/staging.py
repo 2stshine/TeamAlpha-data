@@ -22,7 +22,10 @@ def replace_backfill_partition(
     partition_key: str,
     frame: pd.DataFrame,
 ) -> None:
-    allowed = {"asset", "asset_identifier", "price_daily", "fundamental"}
+    allowed = {
+        "asset", "asset_identifier", "price_daily", "fundamental",
+        "corporate_action",
+    }
     if table not in allowed:
         raise ValueError(f"unsupported stage table: {table}")
     target = f"quality_stage.{table}"
@@ -41,7 +44,10 @@ def replace_backfill_partition(
 
 
 def staged_partitions(conn, run_id: UUID, table: str) -> set[str]:
-    if table not in {"asset", "asset_identifier", "price_daily", "fundamental"}:
+    if table not in {
+        "asset", "asset_identifier", "price_daily", "fundamental",
+        "corporate_action",
+    }:
         raise ValueError(table)
     with conn.cursor() as cur:
         cur.execute(
@@ -54,7 +60,9 @@ def staged_partitions(conn, run_id: UUID, table: str) -> set[str]:
 
 def cleanup_backfill(conn, run_id: UUID) -> None:
     with conn.cursor() as cur:
-        for table in ("fundamental", "price_daily", "asset_identifier", "asset"):
+        for table in (
+            "corporate_action", "fundamental", "price_daily", "asset_identifier", "asset",
+        ):
             cur.execute(
                 f"DELETE FROM quality_stage.{table} WHERE backfill_run_id=%s",
                 (run_id,),

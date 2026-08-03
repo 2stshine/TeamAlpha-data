@@ -19,7 +19,7 @@ import boto3
 
 from pipeline.common import db
 from pipeline.silver_quality import audit, backfill, s3_backfill
-from pipeline.silver_quality.migrate import MIGRATION
+from pipeline.silver_quality.migrate import MIGRATIONS_DIR
 
 
 MANIFEST_NAMES = ("stock", "index", "financials", "corporate_actions")
@@ -193,7 +193,10 @@ def _prepare_rds(*, s3_candidate_mode: bool, resume: bool) -> None:
                     cur.execute(f"SELECT count(*) FROM {table}")
                     counts[table] = cur.fetchone()[0]
                 print(f"[ecs-backfill] legacy Silver counts={counts}", flush=True)
-                cur.execute(MIGRATION.read_text(encoding="utf-8"))
+                for migration in sorted(
+                    MIGRATIONS_DIR.glob("[0-9][0-9][0-9]_*.sql")
+                ):
+                    cur.execute(migration.read_text(encoding="utf-8"))
                 if not resume:
                     cur.execute(
                         "TRUNCATE fundamental, price_daily, "

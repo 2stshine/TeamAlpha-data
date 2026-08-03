@@ -13,7 +13,7 @@ from uuid import UUID
 import pandas as pd
 
 from pipeline.common import db
-from pipeline.silver import assets, financials, prices
+from pipeline.silver import assets, corporate_actions, financials, prices
 from pipeline.silver_quality import repository
 from pipeline.silver_quality.backfill import (
     PUBLISH_LOCK_ID,
@@ -124,6 +124,7 @@ def _candidate_parts(
             assets=bundle.assets,
             identifiers=bundle.identifiers,
             prices=frame,
+            actions=bundle.actions,
             stats={
                 "price_daily": {
                     "input_rows": len(frame),
@@ -133,9 +134,6 @@ def _candidate_parts(
                 },
                 "corporate_action": bundle.stats.get(
                     "corporate_action", {}
-                ),
-                "_corporate_actions": bundle.stats.get(
-                    "_corporate_actions", pd.DataFrame()
                 ),
             },
         )
@@ -166,6 +164,22 @@ def _candidate_parts(
             frame=_fundamental_stage_frame(frame),
             bundle=fundamental_bundle, fingerprint=fingerprint,
         ))
+    if not bundle.actions.empty:
+        parts.append(_record_candidate(
+            conn,
+            context,
+            store,
+            dataset="corporate_action",
+            partition_key="corporate_action:all",
+            frame=bundle.actions,
+            bundle=CandidateBundle(
+                assets=bundle.assets,
+                identifiers=bundle.identifiers,
+                actions=bundle.actions,
+                stats={"corporate_action": bundle.stats.get("corporate_action", {})},
+            ),
+            fingerprint=fingerprint,
+        ))
     return parts
 
 
@@ -187,13 +201,17 @@ def _reload_bundle(
         identifiers=combined("asset_identifier"),
         prices=combined("price_daily"),
         fundamentals=combined("fundamental"),
+        actions=combined("corporate_action"),
         stats=stats,
     )
 
 
 def _only_current_run_or_empty(conn, run_id: UUID) -> None:
     with conn.cursor() as cur:
-        for table in ("asset", "asset_identifier", "price_daily", "fundamental"):
+        for table in (
+            "asset", "asset_identifier", "price_daily", "fundamental",
+            "corporate_action",
+        ):
             cur.execute(
                 f"SELECT count(*), count(*) FILTER "
                 f"(WHERE quality_run_id=%s) FROM {table}",
@@ -210,7 +228,10 @@ def _only_current_run_or_empty(conn, run_id: UUID) -> None:
 def _set_autovacuum(conn, enabled: bool) -> None:
     value = "true" if enabled else "false"
     with conn.cursor() as cur:
-        for table in ("asset", "asset_identifier", "price_daily", "fundamental"):
+        for table in (
+            "asset", "asset_identifier", "price_daily", "fundamental",
+            "corporate_action",
+        ):
             cur.execute(
                 f"ALTER TABLE {table} SET "
                 f"(autovacuum_enabled={value}, toast.autovacuum_enabled={value})"
@@ -311,11 +332,17 @@ def _publish(
             conn.close()
             conn = db.connect()
 
+        with conn.transaction():
+            corporate_actions.publish(
+                conn, bundle.actions, krx_map, context.run_id,
+            )
+
         expected = {
             "asset": len(bundle.assets),
             "asset_identifier": len(bundle.identifiers),
             "price_daily": len(bundle.prices),
             "fundamental": len(bundle.fundamentals),
+            "corporate_action": len(bundle.actions),
         }
         with conn.transaction():
             with conn.cursor() as cur:

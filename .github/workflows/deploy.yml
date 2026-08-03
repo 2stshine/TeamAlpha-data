@@ -30,6 +30,7 @@ env:
   SCHEDULE_NAME: ${{ vars.SCHEDULE_NAME }}
   SCHEDULE_EXPRESSION: "cron(30 8 ? * TUE-SAT *)"
   SCHEDULE_TIMEZONE: Asia/Seoul
+  FMP_API_SECRET_ARN: ${{ vars.FMP_API_SECRET_ARN }}
 
 jobs:
   test:
@@ -127,6 +128,7 @@ jobs:
         id: task
         env:
           IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+          FMP_API_SECRET_ARN: ${{ env.FMP_API_SECRET_ARN }}
         run: |
           set -euo pipefail
 
@@ -138,6 +140,7 @@ jobs:
           jq \
             --arg image "${IMAGE_URI}" \
             --arg container "${CONTAINER_NAME}" \
+            --arg fmp_secret "${FMP_API_SECRET_ARN}" \
             '
             {
               family,
@@ -163,11 +166,29 @@ jobs:
                   .image = $image
                   | .entryPoint = ["uv", "run", "python", "-m", "pipeline.daily_full"]
                   | del(.command)
+                  | if ($fmp_secret | length) > 0 then
+                      .secrets = (
+                        ((.secrets // []) | map(select(.name != "FMP_API_KEY")))
+                        + [{"name":"FMP_API_KEY","valueFrom":$fmp_secret}]
+                      )
+                    else . end
                 else
                   .
                 end
               )
             ' current-task-definition.json > new-task-definition.json
+
+          jq -e \
+            --arg container "${CONTAINER_NAME}" \
+            '
+            .containerDefinitions[]
+            | select(.name == $container)
+            | (.secrets // [])
+            | any(.name == "FMP_API_KEY" and (.valueFrom | length) > 0)
+            ' new-task-definition.json > /dev/null || {
+              echo "FMP_API_KEY secret is missing. Set FMP_API_SECRET_ARN or update the ECS task definition." >&2
+              exit 1
+            }
 
           TASK_DEFINITION_ARN="$(
             aws ecs register-task-definition \

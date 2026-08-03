@@ -2,7 +2,19 @@
 
 Silver는 이 폴더의 규칙을 통과한 데이터만 담는다. 모든 적재는 규칙 실행을 거치며
 결과는 `dq_run`·`dq_result`에 기록된다. **규칙은 Silver 값을 고치지 않는다** — 원천
-(KRX·DART) 오류는 그대로 보존하고 플래그만 남긴다.
+(KRX·DART) 오류는 그대로 보존하고 플래그만 남긴다. FMP는 별도의
+source-aware gate를 거치며 ETF/fund·비주식 상품 제외를 `MODIFIED` 결과와
+건수로 기록한다. 제외된 원문 행은 Bronze에서 삭제하지 않는다.
+
+FMP 전용 핵심 규칙은 다음과 같다.
+
+| 규칙 | 등급 | 의미 |
+|---|---|---|
+| `FMP_REQUIRED_UNIVERSE` | Critical | 편입 가능한 미국 주식 유니버스가 비어 있지 않음 |
+| `FMP_SILVER_UNIVERSE` | Critical | NASDAQ·NYSE·AMEX의 비 ETF/fund 주식성 자산만 편입 |
+| `FMP_PRICE_OHLC` | Error | 복원 OHLC 범위와 양수 조건 |
+| `FMP_*_IDENTIFIER_MAPPING` | Critical | 가격·재무·기업행사가 편입 자산에 매핑됨 |
+| `FMP_SILVER_UNIVERSE_EXCLUDED` | Modified | Bronze에 보존된 제외 행의 사유·건수 |
 
 **등급**
 

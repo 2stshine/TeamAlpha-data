@@ -1,11 +1,11 @@
 # TeamAlpha Data Pipeline
 
-KRX와 DART 데이터를 수집해 원천 데이터는 **S3 bronze**에 저장하고, 분석/조회용 데이터는 **RDS PostgreSQL silver**에 정규화해 적재하는 배치 파이프라인입니다.
+KRX·DART·FMP 데이터를 수집해 원천 데이터는 **S3 bronze**에 저장하고, 분석/조회용 데이터는 **RDS PostgreSQL silver**에 정규화해 적재하는 배치 파이프라인입니다.
 
 ## 프로젝트 개요
 
 ```text
-KRX OpenAPI / OpenDART / marcap
+KRX OpenAPI / OpenDART / marcap / FMP stable API
   -> bronze 수집기
   -> S3 bronze 저장소
   -> ECS daily task
@@ -13,7 +13,7 @@ KRX OpenAPI / OpenDART / marcap
   -> RDS PostgreSQL
 ```
 
-- **bronze**: API/데이터셋 응답을 최대한 그대로 저장합니다. 필터링, 리네임, 타입 변환은 silver에서 처리합니다.
+- **bronze**: API 응답 본문을 byte-for-byte 저장합니다. ETF·펀드가 응답에 섞여 있어도 삭제하지 않으며 필터링, 리네임, 타입 변환은 silver에서만 처리합니다.
 - **silver**: 팀원이 SQL로 조회하기 좋도록 `asset` 중심으로 정규화합니다.
 - **운영 스케줄**: 화~토 오전 08:30 KST에 실행해 전날 KRX 데이터를 적재합니다.
 - **자동 배포**: `main` 브랜치에 push하면 GitHub Actions가 ECR/ECS/Scheduler를 갱신합니다.
@@ -104,9 +104,14 @@ EventBridge Scheduler
 ```text
 KRX_API_KEY
 DART_API_KEY
+FMP_API_KEY
 S3_BRONZE_BUCKET
 SILVER_DB_URL
 ```
+
+FMP key는 GitHub Actions repository variable `FMP_API_SECRET_ARN`이 가리키는
+AWS Secrets Manager 값으로 ECS의 `FMP_API_KEY`에 주입합니다. 새 task definition에
+이 secret이 없으면 배포 workflow가 중단됩니다.
 
 `.env`, API key, DB 비밀번호, 로컬 `data/`는 커밋하면 안 됩니다.
 
@@ -167,12 +172,24 @@ corporate_actions/
         disclosures.json
         structured_complete.json
         documents_complete.json
+
+stock/fmp/
+  universe/                         # stock-list, screener, profile bulk 원문
+  eod-bulk/date=YYYY-MM-DD/         # 글로벌 CSV 응답 전체
+financials/fmp/                     # 글로벌 bulk + 변경 종목별 JSON 원문
+corporate_actions/fmp/              # 배당·분할 calendar 전체 응답
+fx/fmp/pair=USDKRW/                 # USD/KRW 원문
+market/fmp/                         # 미국 거래소 시간·휴일 원문
 ```
 
 bronze 원칙:
 
 - 가능한 한 원천 응답 단위에 맞춰 파티션을 나눕니다.
 - 값은 원천 응답 그대로 저장합니다.
+- FMP 글로벌/broad 응답을 미국 주식만 골라 다시 쓰지 않습니다. `response.*`와
+  SHA-256·요청정보만 담은 별도 `manifest.json`을 저장하며 API key는 기록하지 않습니다.
+- Bronze에서는 `isEtf`·`isFund` 조건으로 행을 제거하지 않습니다. ETF/fund 및
+  비주식 상품 제외는 Silver 후보 생성과 DQ에서만 수행합니다.
 - `stock/marcap`은 과거 주식 가격 백필에 사용합니다.
 - `stock/krxapi`, `index/krxapi`는 daily 증분 적재에 사용합니다.
 - `financials/dart/corpCode.xml`은 bronze에 저장하고 silver에서 재사용합니다.
@@ -188,13 +205,14 @@ bronze 원칙:
 
 ## RDS Silver 구조
 
-silver는 PostgreSQL 테이블 4개로 구성됩니다.
+핵심 silver는 PostgreSQL 테이블 5개로 구성됩니다.
 
 ```text
 asset
 asset_identifier
 price_daily
 fundamental
+corporate_action
 ```
 
 관계:
@@ -204,6 +222,7 @@ asset
   -> asset_identifier  # KRX ticker, DART corp_code 등 외부 식별자
   -> price_daily       # 주식/지수 일봉, 수정종가, 거래량, 시가총액
   -> fundamental       # DART 재무 지표 long format
+  -> corporate_action  # DART/FMP 배당·분할·자본변동
 ```
 
 | 테이블 | 역할 | 주요 키 |
@@ -211,7 +230,15 @@ asset
 | `asset` | 종목/지수 마스터 | `asset_id` |
 | `asset_identifier` | KRX/DART 식별자 매핑 | `(asset_id, source, identifier)` |
 | `price_daily` | 주식/벤치마크 지수 일봉 | `(asset_id, source, trade_date)` |
-| `fundamental` | DART 주요 재무계정 long format | `(asset_id, source, period_end, fiscal_period, fs_type, metric)` |
+| `fundamental` | DART/FMP 재무계정 long format | `(asset_id, source, statement_type, data_basis, period_end, fiscal_period, fs_type, revision_key, metric)` |
+| `corporate_action` | 배당·분할·증자·감자 등 기업행사 | `(asset_id, source, action_key)` |
+
+FMP Silver 편입 대상은 NASDAQ·NYSE·AMEX에서 거래되는 common stock,
+preferred stock, ADR, REIT입니다. ETF, fund, ETN, warrant, unit, listed note는
+Silver에서 제외하고 제외 건수·사유를 `dq_result`/`dq_metric`에 남깁니다.
+FMP `close`는 `adj_close`(분할조정), `adjClose`는 `total_return_close`(배당조정)로
+보존하고, 원 OHLC는 수집한 split ratio로 복원합니다. USD 가격·보고통화는 각
+행의 `currency`에 기록하며 `USDKRW`도 FX asset의 `price_daily`로 적재합니다.
 
 컬럼별 상세 설계는 [schema_tables.md](schema_tables.md)와 [sql/schema.sql](sql/schema.sql)를 참고합니다.
 
@@ -283,8 +310,10 @@ Silver quality DB migration:
 uv run python -m pipeline.silver_quality.migrate
 ```
 
-운영 배포에서는 새 daily task를 실행하기 전에 이 migration을 one-off ECS task로 먼저
-적용해야 합니다. migration이 없으면 daily task는 Silver를 변경하지 않고 즉시 실패합니다.
+`pipeline.daily_full`은 수집 전에 migration checksum을 읽기 전용으로 확인하며
+미적용 DDL을 자동 실행하지 않습니다. 최초 v2 전환은 대형 `price_daily`·
+`fundamental`의 타입/PK 변경을 포함하므로 스케줄을 중지하고 RDS snapshot을 만든
+maintenance window에서 위 명령을 one-off로 먼저 실행해야 합니다.
 
 최초 Silver backfill:
 
@@ -324,6 +353,8 @@ uv run python -m pipeline.bronze.financials --from 2026 --to 2026 --dest s3
 uv run python -m pipeline.bronze.financials_full \
   --scope 004990:2015:11011:CFS --dest s3
 uv run python -m pipeline.bronze.corporate_actions --from 20150101 --to 20260713 --dest s3
+uv run python -m pipeline.bronze.fmp --mode backfill --from 2015 --to 2026 --dest s3
+uv run python -m pipeline.bronze.fmp --mode daily --date 20260713 --dest s3
 ```
 
 로컬 `./data`에서 silver 적재:
@@ -331,6 +362,9 @@ uv run python -m pipeline.bronze.corporate_actions --from 20150101 --to 20260713
 ```bash
 uv run python -m pipeline.silver.load --mode backfill
 uv run python -m pipeline.silver.load --mode incremental --date 20260713
+uv run python -m pipeline.silver.fmp_load --mode backfill --from 2015 --to 2026
+uv run python -m pipeline.silver.fmp_load --mode backfill --resume <dq-run-uuid>
+uv run python -m pipeline.silver.fmp_load --mode daily --date 20260713
 ```
 
 GitHub Actions를 쓰지 못할 때 수동 이미지 배포:
@@ -378,6 +412,7 @@ ECR_REPOSITORY=<ecr-repository>
 ECS_TASK_FAMILY=<ecs-task-definition-family>
 CONTAINER_NAME=<ecs-container-name>
 SCHEDULE_NAME=<eventbridge-scheduler-name>
+FMP_API_SECRET_ARN=<fmp-api-key-secret-arn>
 ```
 
 ## 알림

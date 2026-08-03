@@ -171,7 +171,7 @@ def run_registered_rules(
             bundle.prices,
             target_date=target_date,
             history=history,
-            corporate_actions=bundle.stats.get("_corporate_actions"),
+            corporate_actions=bundle.actions,
             partition_key=partition_key,
         ))
     if not bundle.fundamentals.empty:

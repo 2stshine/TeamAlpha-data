@@ -17,9 +17,12 @@ import pandas as pd
 from pipeline.common import db
 from pipeline.silver.assets import BENCHMARKS
 
-COLS = ["asset_id", "source", "trade_date", "open", "high", "low", "close",
-        "adj_close", "volume", "trading_value", "shares", "market_cap", "market",
-        "quality_run_id"]
+COLS = [
+    "asset_id", "source", "trade_date", "open", "high", "low", "close",
+    "adj_close", "total_return_close", "currency", "vwap", "available_at",
+    "volume", "trading_value", "shares", "market_cap", "market",
+    "quality_run_id",
+]
 
 # marcap 은 코스닥 글로벌 세그먼트를 따로 표기하지만 krxapi 는 KOSDAQ 으로 합쳐 준다(1771+50=1821 일치).
 # 두 소스를 같은 값으로 맞춘다.
@@ -549,6 +552,18 @@ def publish(
         missing = sorted(both.loc[both["asset_id"].isna(), "identifier"].astype(str).unique())
         raise RuntimeError(f"quality gate missed unmapped price identifiers: {missing[:20]}")
     both["asset_id"] = both["asset_id"].astype("int64")
+    if "total_return_close" not in both:
+        both["total_return_close"] = both["adj_close"]
+    if "currency" not in both:
+        both["currency"] = "KRW"
+    if "vwap" not in both:
+        both["vwap"] = None
+    if "available_at" not in both:
+        both["available_at"] = (
+            pd.to_datetime(both["trade_date"])
+            .dt.tz_localize("Asia/Seoul")
+            + pd.Timedelta(days=1, hours=8, minutes=30)
+        )
     both["quality_run_id"] = quality_run_id
     rows = list(
         both[COLS].astype(object).where(pd.notna(both[COLS]), None)
@@ -557,6 +572,7 @@ def publish(
     n = db.upsert(conn, "price_daily", COLS, rows,
                   conflict=["asset_id", "source", "trade_date"],
                   update=["open", "high", "low", "close", "adj_close",
+                          "total_return_close", "currency", "vwap", "available_at",
                           "volume", "trading_value", "shares", "market_cap", "market",
                           "quality_run_id", "loaded_at"],
                   temp_name="_stg_price_publish")

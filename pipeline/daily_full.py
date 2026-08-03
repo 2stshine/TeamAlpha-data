@@ -10,9 +10,17 @@ from zoneinfo import ZoneInfo
 
 import boto3
 
-from pipeline.bronze import corporate_actions, financials, index, stock_krxapi
+from pipeline.bronze import (
+    corporate_actions,
+    financials,
+    fmp as fmp_bronze,
+    index,
+    stock_krxapi,
+)
 from pipeline.common.paths import base_uri, ymd_to_dash
 from pipeline.silver import load
+from pipeline.silver import fmp_load
+from pipeline.silver_quality import migrate
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -28,6 +36,18 @@ def _target_day() -> str:
     if override:
         return override
     return (datetime.now(KST).date() - timedelta(days=1)).strftime("%Y%m%d")
+
+
+def _fmp_target_day(krx_day: str) -> str:
+    """Use a completed US session at the existing 08:30 KST schedule.
+
+    FMP documents bulk refreshes as taking several hours.  At 08:30 KST the
+    same-calendar US session has only just closed, so use the prior weekday.
+    """
+    candidate = datetime.strptime(krx_day, "%Y%m%d").date() - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate.strftime("%Y%m%d")
 
 
 def _key_from_s3_uri(uri: str) -> str:
@@ -95,6 +115,7 @@ def main() -> None:
     root = Path("/app/data")
 
     print(f"[daily] start day={day}", flush=True)
+    migrate.assert_current()
     stock_krxapi.run(day, day, "s3")
     index.run(day, day, "s3")
     changed_financial_uris = financials.run(int(day[:4]), int(day[:4]), "s3", refresh_existing=True)
@@ -157,6 +178,16 @@ def main() -> None:
         market_closed=market_closed,
     )
     print(f"[silver] incremental complete day={day}", flush=True)
+
+    # FMP is a separate source transaction. KRX/DART remains committed if FMP
+    # later fails, and a task retry safely reuses the immutable raw objects.
+    fmp_day = _fmp_target_day(day)
+    print(f"[fmp] daily start day={fmp_day}", flush=True)
+    fmp_uris = fmp_bronze.run_daily(fmp_day, "s3")
+    fmp_keys = [_key_from_s3_uri(uri) for uri in fmp_uris]
+    _download_keys(bucket, fmp_keys, root)
+    fmp_load.run(src="local", day=fmp_day)
+    print(f"[fmp] daily complete day={fmp_day}", flush=True)
 
 
 if __name__ == "__main__":

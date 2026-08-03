@@ -38,6 +38,7 @@ class CandidateBundle:
     identifiers: pd.DataFrame = field(default_factory=pd.DataFrame)
     prices: pd.DataFrame = field(default_factory=pd.DataFrame)
     fundamentals: pd.DataFrame = field(default_factory=pd.DataFrame)
+    actions: pd.DataFrame = field(default_factory=pd.DataFrame)
     stats: dict[str, Any] = field(default_factory=dict)
 
 

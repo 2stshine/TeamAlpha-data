@@ -74,11 +74,11 @@ def _build_candidates(
         identifiers=identifier_df,
         prices=price_df,
         fundamentals=fundamental_df,
+        actions=action_df,
         stats={
             "price_daily": price_stats,
             "fundamental": fundamental_stats,
             "corporate_action": action_stats,
-            "_corporate_actions": action_df,
             "_unsupported_market_identifiers": (
                 all_price_identifiers - supported_price_identifiers
             ),
@@ -190,6 +190,9 @@ def incremental(
                     )
                 financials.publish(
                     conn, bundle.fundamentals, krx_map, context.run_id,
+                )
+                corporate_actions.publish(
+                    conn, bundle.actions, krx_map, context.run_id,
                 )
                 repository.save_metrics(conn, context.run_id, bundle)
                 repository.finish_run(

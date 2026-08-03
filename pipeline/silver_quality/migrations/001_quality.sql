@@ -112,7 +112,8 @@ END $$;
 CREATE INDEX IF NOT EXISTS ix_fundamental_pit_revision
     ON fundamental(asset_id, metric, available_date, revision_key);
 
-CREATE OR REPLACE VIEW fundamental_current AS
+DROP VIEW IF EXISTS fundamental_current;
+CREATE VIEW fundamental_current AS
 SELECT asset_id, source, period_end, fiscal_period, fs_type, filing_id, filed,
        available_date, metric, value, currency, revision_key, quality_run_id, loaded_at
 FROM (

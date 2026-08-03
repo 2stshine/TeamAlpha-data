@@ -150,10 +150,10 @@ def _price_bundle(base: str) -> CandidateBundle:
         assets=asset_df,
         identifiers=identifier_df,
         prices=price_df,
+        actions=action_df,
         stats={
             "price_daily": price_stats,
             "corporate_action": action_stats,
-            "_corporate_actions": action_df,
         },
     )
 
@@ -176,9 +176,9 @@ def _price_static_bundle(base: str) -> CandidateBundle:
     return CandidateBundle(
         assets=asset_df,
         identifiers=identifier_df,
+        actions=action_df,
         stats={
             "corporate_action": action_stats,
-            "_corporate_actions": action_df,
         },
     )
 
@@ -296,10 +296,10 @@ def _run_price_partitions(
             assets=static.assets,
             identifiers=static.identifiers,
             prices=frame,
+            actions=static.actions,
             stats={
                 "price_daily": stats,
                 "corporate_action": static.stats["corporate_action"],
-                "_corporate_actions": static.stats["_corporate_actions"],
             },
         )
         partition_key = f"year:{year}"

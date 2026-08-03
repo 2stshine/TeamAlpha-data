@@ -98,6 +98,7 @@ def save_metrics(conn, run_id: UUID, bundle) -> None:
         "asset_identifier": bundle.identifiers,
         "price_daily": bundle.prices,
         "fundamental": bundle.fundamentals,
+        "corporate_action": bundle.actions,
     }
     with conn.cursor() as cur:
         def insert_metric(dataset: str, name: str, value, dimension=None):
@@ -160,11 +161,21 @@ def save_metrics(conn, run_id: UUID, bundle) -> None:
                 "fundamental", "null_value_ratio",
                 f["value"].isna().mean(),
             )
-        corporate_actions = bundle.stats.get("_corporate_actions")
+        corporate_actions = bundle.actions
         if (
             isinstance(corporate_actions, pd.DataFrame)
             and not corporate_actions.empty
         ):
+            effective_column = (
+                "effective_date"
+                if "effective_date" in corporate_actions
+                else "ex_date"
+            )
+            factor_column = (
+                "expected_factor"
+                if "expected_factor" in corporate_actions
+                else "expected_price_factor"
+            )
             insert_metric(
                 "corporate_action",
                 "row_count",
@@ -173,17 +184,21 @@ def save_metrics(conn, run_id: UUID, bundle) -> None:
             insert_metric(
                 "corporate_action",
                 "effective_date_count",
-                corporate_actions["effective_date"].notna().sum(),
+                corporate_actions[effective_column].notna().sum(),
             )
             insert_metric(
                 "corporate_action",
                 "expected_factor_count",
-                corporate_actions["expected_factor"].notna().sum(),
+                corporate_actions[factor_column].notna().sum(),
             )
+            if "expects_price_adjustment" in corporate_actions:
+                price_adjusting = corporate_actions[
+                    "expects_price_adjustment"
+                ].fillna(False).sum()
+            else:
+                price_adjusting = corporate_actions[factor_column].notna().sum()
             insert_metric(
-                "corporate_action",
-                "price_adjusting_event_count",
-                corporate_actions["expects_price_adjustment"].fillna(False).sum(),
+                "corporate_action", "price_adjusting_event_count", price_adjusting,
             )
 
 

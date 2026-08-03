@@ -95,6 +95,12 @@ def test_silver_filters_instruments_but_keeps_bronze_and_maps_price_semantics(tm
             {"symbol": "AAPL", "date": "2020-08-31", "numerator": 4, "denominator": 1}
         ]).encode(),
     )
+    _write(
+        tmp_path / "corporate_actions/fmp/splits/snapshot_date=2020-08-28/response.json",
+        json.dumps([
+            {"symbol": "AAPL", "date": "2020-08-31", "numerator": 4, "denominator": 1}
+        ]).encode(),
+    )
 
     bundle = fmp.build_candidates(str(tmp_path), date(2020, 8, 28))
 
@@ -271,12 +277,22 @@ def test_usdkrw_is_an_fx_price_asset(tmp_path):
         "vwap": 1386.3, "volume": 0,
     }]).encode())
     _manifest(path)
+    duplicate_path = (
+        tmp_path / "fx/fmp/pair=USDKRW/from=2015/to=2026/response.json"
+    )
+    _write(duplicate_path, json.dumps([{
+        "symbol": "USDKRW", "date": "2026-08-03", "open": 1380.1,
+        "high": 1390.2, "low": 1378.5, "close": 1388.4,
+        "vwap": 1386.3, "volume": 0,
+    }]).encode())
+    _manifest(duplicate_path)
 
     assets, identifiers, prices, _ = fmp.prepare_fx(
         str(tmp_path), target_date=date(2026, 8, 3),
     )
 
     assert assets.iloc[0]["asset_type"] == "fx"
+    assert len(prices) == 1
     assert identifiers.iloc[0]["identifier_type"] == "fx_pair"
     assert prices.iloc[0]["close"] == pytest.approx(1388.4)
     assert prices.iloc[0]["currency"] == "KRW"

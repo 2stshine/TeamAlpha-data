@@ -334,11 +334,21 @@ def run_backfill(fromyear: int, toyear: int, dest: str = "s3") -> list[str]:
     root = base_uri(dest)
     client = FMPClient()
     snapshot = date.today().isoformat()
+    print(
+        f"[fmp-bronze] backfill start years={fromyear}-{toyear} dest={dest}",
+        flush=True,
+    )
     paths = _collect_universe(
         client, root, snapshot, all_delisted_pages=True,
     )
     current = date(fromyear, 1, 1)
     end = date(toyear, 12, 31)
+    business_days = sum(
+        1
+        for offset in range((end - current).days + 1)
+        if (current + timedelta(days=offset)).weekday() < 5
+    )
+    processed_days = 0
     while current <= end:
         if current.weekday() < 5:
             ds = current.isoformat()
@@ -346,8 +356,15 @@ def run_backfill(fromyear: int, toyear: int, dest: str = "s3") -> list[str]:
                 client, root=root, endpoint="eod-bulk", params={"date": ds},
                 prefix=f"stock/fmp/eod-bulk/date={ds}", extension="csv",
             )
+            processed_days += 1
+            if processed_days % 25 == 0 or processed_days == business_days:
+                print(
+                    f"[fmp-bronze] eod {processed_days}/{business_days} date={ds}",
+                    flush=True,
+                )
         current += timedelta(days=1)
     for year in range(fromyear, toyear + 1):
+        print(f"[fmp-bronze] statements/actions year={year}", flush=True)
         for period in _periods():
             for endpoint, statement in (
                 ("income-statement-bulk", "income"),
@@ -388,6 +405,10 @@ def run_backfill(fromyear: int, toyear: int, dest: str = "s3") -> list[str]:
         extension="json",
     )
     paths += _collect_market_metadata(client, root, snapshot)
+    print(
+        f"[fmp-bronze] backfill complete objects={len(paths)}",
+        flush=True,
+    )
     return paths
 
 

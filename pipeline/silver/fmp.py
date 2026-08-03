@@ -422,7 +422,7 @@ def _manifest_received_at(path: str) -> datetime | None:
 
 
 def _split_events(base: str) -> dict[str, list[tuple[date, float]]]:
-    result: dict[str, list[tuple[date, float]]] = defaultdict(list)
+    unique: dict[str, set[tuple[date, float]]] = defaultdict(set)
     for path in glob.glob(f"{base}/corporate_actions/fmp/splits/**/response.*", recursive=True):
         for row in _raw_frame(path).to_dict("records"):
             symbol = _text(row.get("symbol"))
@@ -430,8 +430,11 @@ def _split_events(base: str) -> dict[str, list[tuple[date, float]]]:
             numerator = _number(row.get("numerator"))
             denominator = _number(row.get("denominator"))
             if symbol and event_date and numerator and denominator and denominator != 0:
-                result[symbol].append((event_date, numerator / denominator))
-    return result
+                unique[symbol].add((event_date, numerator / denominator))
+    return {
+        symbol: sorted(events)
+        for symbol, events in unique.items()
+    }
 
 
 def _ticker_metadata(assets: pd.DataFrame, identifiers: pd.DataFrame) -> dict[str, dict]:
@@ -595,6 +598,13 @@ def prepare_fx(
                 "asset_type": "fx",
                 "source_file": path,
             })
+    if rows:
+        rows = (
+            pd.DataFrame(rows)
+            .sort_values("source_file")
+            .drop_duplicates(["identifier", "source", "trade_date"], keep="last")
+            .to_dict("records")
+        )
     if not rows:
         asset_rows = []
         identifier_rows = []

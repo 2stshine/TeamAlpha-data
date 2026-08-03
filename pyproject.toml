@@ -10,6 +10,7 @@ dependencies = [
     "python-dotenv",
     "requests",
     "psycopg[binary]",
+    "exchange-calendars>=4.11,<5",
 ]
 
 [tool.uv]

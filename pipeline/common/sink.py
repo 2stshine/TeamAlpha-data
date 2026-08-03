@@ -52,6 +52,28 @@ def exists(dest: str) -> bool:
     return Path(dest).exists()
 
 
+def object_size(dest: str) -> int | None:
+    """Return an object's byte size without downloading its contents."""
+    if dest.startswith("s3://"):
+        import boto3
+        from botocore.exceptions import ClientError
+
+        bucket, key = _split_s3(dest)
+        try:
+            response = boto3.client("s3").head_object(Bucket=bucket, Key=key)
+            return int(response["ContentLength"])
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in {
+                "NoSuchKey", "404", "NotFound",
+            }:
+                return None
+            raise
+    path = Path(dest)
+    if not path.exists():
+        return None
+    return path.stat().st_size
+
+
 def write_text(text: str, dest: str) -> str:
     """리터럴 텍스트(예: DART raw JSON 응답)를 그대로 저장 — 로컬 또는 S3."""
     if dest.startswith("s3://"):

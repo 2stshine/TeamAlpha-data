@@ -17,10 +17,11 @@ from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Callable
 
+import exchange_calendars as xcals
 import requests
 
 from pipeline.common.paths import base_uri
-from pipeline.common.sink import exists, read_bytes, write_bytes
+from pipeline.common.sink import object_size, read_bytes, write_bytes
 
 BASE_URL = "https://financialmodelingprep.com/stable"
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
@@ -77,17 +78,23 @@ class FMPClient:
         self.min_interval = max(0.0, min_interval)
         self.sleeper = sleeper
         self._last_request_started = 0.0
+        self.logical_request_count = 0
+        self.request_count = 0
+        self.retry_count = 0
+        self.rate_limit_count = 0
 
     def get(self, endpoint: str, params: dict[str, object] | None = None) -> RawResponse:
         endpoint = endpoint.strip("/")
         safe_params = dict(params or {})
         url = f"{BASE_URL}/{endpoint}"
         last_error: Exception | None = None
+        self.logical_request_count += 1
         for attempt in range(1, self.max_attempts + 1):
             elapsed = time.monotonic() - self._last_request_started
             if self._last_request_started and elapsed < self.min_interval:
                 self.sleeper(self.min_interval - elapsed)
             self._last_request_started = time.monotonic()
+            self.request_count += 1
             try:
                 # Header auth keeps the credential out of URLs, logs and manifests.
                 response = self.session.get(
@@ -103,9 +110,17 @@ class FMPClient:
                 self.sleeper(min(30.0, 2 ** (attempt - 1) + random.random()))
                 continue
             if response.status_code in RETRYABLE_STATUS and attempt < self.max_attempts:
+                self.retry_count += 1
                 delay = _retry_after(response.headers.get("Retry-After"))
                 if delay is None:
                     delay = min(30.0, 2 ** (attempt - 1) + random.random())
+                if response.status_code == 429:
+                    self.rate_limit_count += 1
+                    print(
+                        f"[fmp-client] rate limited attempt={attempt} "
+                        f"retry_after={delay:.2f}s",
+                        flush=True,
+                    )
                 self.sleeper(min(60.0, delay))
                 continue
             if response.status_code < 200 or response.status_code >= 300:
@@ -162,6 +177,36 @@ def verify_raw_object(object_uri: str, manifest_uri: str) -> bool:
     )
 
 
+def verify_raw_object_for_resume(object_uri: str, manifest_uri: str) -> bool:
+    """Cheaply certify a completed partition before resuming.
+
+    Bronze writes the payload first and its checksum manifest last.  Therefore a
+    complete manifest plus the matching object byte length is a safe completion
+    marker.  This avoids downloading every multi-megabyte payload on each retry;
+    ``verify_raw_object`` remains available for full checksum audits.
+    """
+    if not object_uri.startswith("s3://"):
+        return verify_raw_object(object_uri, manifest_uri)
+    raw_manifest = read_bytes(manifest_uri)
+    if raw_manifest is None:
+        return False
+    try:
+        metadata = json.loads(raw_manifest)
+    except (TypeError, ValueError):
+        return False
+    content_length = metadata.get("content_length")
+    checksum = metadata.get("sha256")
+    return (
+        metadata.get("complete") is True
+        and metadata.get("object_uri") == object_uri
+        and isinstance(content_length, int)
+        and content_length >= 0
+        and object_size(object_uri) == content_length
+        and isinstance(checksum, str)
+        and re.fullmatch(r"[0-9a-f]{64}", checksum) is not None
+    )
+
+
 def collect_raw(
     client: FMPClient,
     *,
@@ -174,12 +219,16 @@ def collect_raw(
     """Store one logical response without parsing or filtering it."""
     object_uri = f"{root.rstrip('/')}/{prefix.strip('/')}/response.{extension}"
     manifest_uri = f"{root.rstrip('/')}/{prefix.strip('/')}/manifest.json"
-    if exists(object_uri) and verify_raw_object(object_uri, manifest_uri):
+    if verify_raw_object_for_resume(object_uri, manifest_uri):
         return [object_uri, manifest_uri]
     response = client.get(endpoint, params)
     write_bytes(response.body, object_uri)
     write_bytes(_manifest(response, object_uri), manifest_uri)
-    if not verify_raw_object(object_uri, manifest_uri):
+    # Successful S3 PUTs plus the manifest-last protocol form the completion
+    # marker. Local writes retain immediate byte-for-byte verification.
+    if not object_uri.startswith("s3://") and not verify_raw_object(
+        object_uri, manifest_uri,
+    ):
         raise FMPError(f"Bronze checksum verification failed: {object_uri}")
     return [object_uri, manifest_uri]
 
@@ -268,7 +317,7 @@ def run_daily(day: str, dest: str = "s3") -> list[str]:
     client = FMPClient(
         max_attempts=20,
         min_interval=float(
-            os.environ.get("FMP_BACKFILL_MIN_INTERVAL_SECONDS", "12.5")
+            os.environ.get("FMP_DAILY_MIN_INTERVAL_SECONDS", "0.5")
         ),
     )
     paths = _collect_universe(client, root, snapshot)
@@ -340,11 +389,27 @@ def _periods() -> tuple[str, ...]:
     return "Q1", "Q2", "Q3", "Q4", "FY"
 
 
+def _xnys_sessions(start: date, end: date) -> list[date]:
+    """Return actual completed US equity sessions for the requested range."""
+    if start > end:
+        return []
+    calendar = xcals.get_calendar("XNYS")
+    return [
+        timestamp.date()
+        for timestamp in calendar.sessions_in_range(start.isoformat(), end.isoformat())
+    ]
+
+
 def run_backfill(fromyear: int, toyear: int, dest: str = "s3") -> list[str]:
     if fromyear > toyear:
         raise ValueError("fromyear must be <= toyear")
     root = base_uri(dest)
-    client = FMPClient()
+    client = FMPClient(
+        max_attempts=20,
+        min_interval=float(
+            os.environ.get("FMP_BACKFILL_MIN_INTERVAL_SECONDS", "0.5")
+        ),
+    )
     snapshot = date.today().isoformat()
     print(
         f"[fmp-bronze] backfill start years={fromyear}-{toyear} dest={dest}",
@@ -353,28 +418,32 @@ def run_backfill(fromyear: int, toyear: int, dest: str = "s3") -> list[str]:
     paths = _collect_universe(
         client, root, snapshot, all_delisted_pages=True,
     )
-    current = date(fromyear, 1, 1)
-    end = date(toyear, 12, 31)
-    business_days = sum(
-        1
-        for offset in range((end - current).days + 1)
-        if (current + timedelta(days=offset)).weekday() < 5
-    )
+    start = date(fromyear, 1, 1)
+    # A KST/UTC batch can run before the current US session has closed.  Never
+    # certify a future/incomplete date as an immutable empty Bronze partition.
+    end = min(date(toyear, 12, 31), date.today() - timedelta(days=1))
+    sessions = _xnys_sessions(start, end)
+    business_days = len(sessions)
     processed_days = 0
-    while current <= end:
-        if current.weekday() < 5:
-            ds = current.isoformat()
-            paths += collect_raw(
-                client, root=root, endpoint="eod-bulk", params={"date": ds},
-                prefix=f"stock/fmp/eod-bulk/date={ds}", extension="csv",
+    eod_request_start = client.logical_request_count
+    eod_started_at = time.monotonic()
+    for session_date in sessions:
+        ds = session_date.isoformat()
+        paths += collect_raw(
+            client, root=root, endpoint="eod-bulk", params={"date": ds},
+            prefix=f"stock/fmp/eod-bulk/date={ds}", extension="csv",
+        )
+        processed_days += 1
+        if processed_days % 25 == 0 or processed_days == business_days:
+            elapsed = max(time.monotonic() - eod_started_at, 0.001)
+            eod_api_calls = client.logical_request_count - eod_request_start
+            print(
+                f"[fmp-bronze] eod {processed_days}/{business_days} date={ds} "
+                f"api_calls={eod_api_calls} reused={processed_days - eod_api_calls} "
+                f"rate={processed_days / elapsed:.2f}/s "
+                f"rate_limits={client.rate_limit_count}",
+                flush=True,
             )
-            processed_days += 1
-            if processed_days % 25 == 0 or processed_days == business_days:
-                print(
-                    f"[fmp-bronze] eod {processed_days}/{business_days} date={ds}",
-                    flush=True,
-                )
-        current += timedelta(days=1)
     for year in range(fromyear, toyear + 1):
         print(f"[fmp-bronze] statements/actions year={year}", flush=True)
         for period in _periods():

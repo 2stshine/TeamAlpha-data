@@ -1,5 +1,6 @@
 import hashlib
 import json
+from datetime import date
 
 from pipeline.bronze import fmp
 
@@ -72,3 +73,36 @@ def test_client_retries_429_without_exposing_secret():
     assert response.body == b"[]"
     assert waits == [0.0]
     assert len(session.calls) == 2
+    assert client.logical_request_count == 1
+    assert client.request_count == 2
+    assert client.rate_limit_count == 1
+
+
+def test_s3_resume_uses_manifest_and_head_without_downloading_payload(monkeypatch):
+    object_uri = "s3://bronze/stock/fmp/eod-bulk/date=2026-07-31/response.csv"
+    manifest_uri = "s3://bronze/stock/fmp/eod-bulk/date=2026-07-31/manifest.json"
+    manifest = json.dumps({
+        "complete": True,
+        "object_uri": object_uri,
+        "content_length": 123,
+        "sha256": "a" * 64,
+    }).encode()
+    reads = []
+
+    def fake_read(uri):
+        reads.append(uri)
+        return manifest if uri == manifest_uri else None
+
+    monkeypatch.setattr(fmp, "read_bytes", fake_read)
+    monkeypatch.setattr(fmp, "object_size", lambda uri: 123)
+
+    assert fmp.verify_raw_object_for_resume(object_uri, manifest_uri)
+    assert reads == [manifest_uri]
+
+
+def test_xnys_sessions_exclude_weekdays_when_market_is_closed():
+    sessions = fmp._xnys_sessions(date(2025, 1, 1), date(2025, 1, 10))
+
+    assert date(2025, 1, 1) not in sessions
+    assert date(2025, 1, 9) not in sessions  # Carter national day of mourning
+    assert date(2025, 1, 2) in sessions

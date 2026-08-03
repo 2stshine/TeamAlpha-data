@@ -1,10 +1,15 @@
 # Silver quality gate
 
 Silver는 이 폴더의 규칙을 통과한 데이터만 담는다. 모든 적재는 규칙 실행을 거치며
-결과는 `dq_run`·`dq_result`에 기록된다. **규칙은 Silver 값을 고치지 않는다** — 원천
-(KRX·DART) 오류는 그대로 보존하고 플래그만 남긴다. FMP는 별도의
-source-aware gate를 거치며 ETF/fund·비주식 상품 제외를 `MODIFIED` 결과와
-건수로 기록한다. 제외된 원문 행은 Bronze에서 삭제하지 않는다.
+결과는 `dq_run`·`dq_result`에 기록된다. 원천(KRX·DART) 오류는 임의로 고치지 않고
+보존·플래그하며, `0 → NULL` 정규화나 명시적 제외처럼 결정적인 변환은
+`MODIFIED`로 기록한다. FMP는 별도의 source-aware gate를 거치며 ETF/fund·비주식
+상품 제외 건수도 `MODIFIED`에 남긴다. 제외된 원문 행은 Bronze에서 삭제하지 않는다.
+
+FMP 편입 범위는 NASDAQ·NYSE·AMEX의 common stock, preferred stock, ADR,
+REIT이다. ETF, fund, ETN, warrant, unit, listed note, 분류가 모호한 행은 제외하고
+사유별 건수와 표본을 DQ 결과에 남긴다. USD 가격·재무와 `USDKRW` FX도 동일한
+source-aware 검사를 거친다.
 
 FMP 전용 핵심 규칙은 다음과 같다.
 

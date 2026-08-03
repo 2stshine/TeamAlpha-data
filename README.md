@@ -1,20 +1,31 @@
 # TeamAlpha Data Pipeline
 
-KRX·DART·FMP 데이터를 수집해 원천 데이터는 **S3 bronze**에 저장하고, 분석/조회용 데이터는 **RDS PostgreSQL silver**에 정규화해 적재하는 배치 파이프라인입니다.
+KRX·DART·FMP 데이터를 수집해 원천 데이터는 **S3 Bronze**에 보존하고,
+분석 가능한 데이터는 **RDS PostgreSQL Silver**, 검증된 팩터 산출물은 같은
+database의 **`gold` schema**에 저장하는 배치 파이프라인입니다.
 
 ## 프로젝트 개요
 
 ```text
 KRX OpenAPI / OpenDART / marcap / FMP stable API
-  -> bronze 수집기
-  -> S3 bronze 저장소
-  -> ECS daily task
-  -> silver 적재 로직
-  -> RDS PostgreSQL
+                    │
+                    ▼
+        bronze 수집기 -> S3 bronze
+                    │
+                    ▼
+       ECS daily/backfill -> RDS public silver
+                                      │
+                                      ▼
+                 research/manual -> RDS gold schema
 ```
 
-- **bronze**: API 응답 본문을 byte-for-byte 저장합니다. ETF·펀드가 응답에 섞여 있어도 삭제하지 않으며 필터링, 리네임, 타입 변환은 silver에서만 처리합니다.
-- **silver**: 팀원이 SQL로 조회하기 좋도록 `asset` 중심으로 정규화합니다.
+- **bronze**: 소스의 원천 단위와 값을 S3에 보존합니다. FMP 응답은 byte-for-byte로
+  저장합니다. ETF·펀드가 섞여 있어도 삭제하지 않으며 편입 필터와 타입 변환은
+  Silver에서 수행합니다.
+- **silver**: `asset` 중심으로 가격·재무·기업행사를 정규화하고, point-in-time 및
+  source-aware 품질 게이트를 통과한 데이터만 publish합니다.
+- **gold**: 팩터 정의·버전·평가와 종목별 값·순위, 팩터 간 상관관계를 저장합니다.
+  현재 12-1 모멘텀 계산 SQL이 구현되어 있으며 평가 기준은 아직 확정 전입니다.
 - **운영 스케줄**: 화~토 오전 08:30 KST에 실행해 전날 KRX 데이터를 적재합니다.
 - **자동 배포**: `main` 브랜치에 push하면 GitHub Actions가 ECR/ECS/Scheduler를 갱신합니다.
 - **결과 알림**: daily ECS task가 종료되면 SNS 이메일로 성공/실패 결과를 받습니다.
@@ -25,13 +36,16 @@ KRX OpenAPI / OpenDART / marcap / FMP stable API
 .
 ├── .github/workflows/deploy.yml  # GitHub Actions 자동 배포
 ├── deploy/Dockerfile             # ECS/Fargate 실행 이미지
-├── pipeline/                     # 수집, 동기화, silver 적재 코드
+├── pipeline/                     # Bronze 수집, Silver 적재, Gold 계산 코드
 │   ├── bronze/                   # S3 bronze 원천 데이터 수집기
 │   ├── common/                   # 경로, 저장, DB 공통 유틸
+│   ├── gold/                     # 팩터 계산 구현
 │   ├── silver/                   # RDS silver 후보 생성/적재
 │   └── silver_quality/           # 품질 규칙, DQ 이력, staging/backfill
 ├── sql/schema.sql                # RDS silver schema
+├── sql/gold_schema.sql           # 같은 RDS의 gold schema
 ├── schema_tables.md              # silver 테이블 설계 상세 문서
+├── gold_schema.md                # gold 3테이블 설계 상세 문서
 ├── pyproject.toml                # Python 프로젝트/의존성 설정
 └── uv.lock                       # 의존성 lock 파일
 ```
@@ -44,8 +58,12 @@ KRX OpenAPI / OpenDART / marcap / FMP stable API
 EventBridge Scheduler
   -> ECS Fargate task
   -> S3 bronze 저장
-  -> RDS silver 적재
+  -> RDS public silver 적재
   -> SNS 이메일 알림
+
+Research/manual factor job
+  -> RDS public silver 조회
+  -> RDS gold 적재
 ```
 
 ### 배포 흐름
@@ -76,7 +94,7 @@ EventBridge Scheduler
   -> ECS Fargate task 실행
   -> ECS가 ECR에서 Docker 이미지 pull
   -> 컨테이너에서 python -m pipeline.daily_full 실행
-  -> KRX/DART API 호출
+  -> KRX/DART/FMP API 호출
   -> S3 bronze 저장
   -> 필요한 S3 객체를 /app/data로 다운로드
   -> RDS silver 적재
@@ -96,7 +114,7 @@ EventBridge Scheduler
 | ECS task definition | 파이프라인 컨테이너, role, secret 주입 설정 |
 | Scheduler | daily ECS task를 시작하는 EventBridge Scheduler |
 | Scheduler 시간 | `cron(30 8 ? * TUE-SAT *)`, `Asia/Seoul` |
-| RDS PostgreSQL | silver 테이블을 저장하는 private database |
+| RDS PostgreSQL | `public` Silver와 `gold` 팩터 테이블을 함께 저장하는 private database |
 | SNS topic | daily task 결과 이메일 알림 |
 
 운영 task에는 AWS Secrets Manager 값이 환경변수로 주입됩니다.
@@ -188,6 +206,12 @@ bronze 원칙:
 - 값은 원천 응답 그대로 저장합니다.
 - FMP 글로벌/broad 응답을 미국 주식만 골라 다시 쓰지 않습니다. `response.*`와
   SHA-256·요청정보만 담은 별도 `manifest.json`을 저장하며 API key는 기록하지 않습니다.
+- FMP 과거 가격은 XNYS의 실제 완료 거래일만 대상으로 `eod-bulk`를 날짜당 한 번
+  호출합니다. 현재 미국 세션과 미래 날짜를 빈 immutable 파티션으로 확정하지 않습니다.
+- 재개 시 S3 payload 전체를 다시 내려받지 않고 완료 manifest와 객체 크기로 빠르게
+  판정합니다. 전체 SHA-256 재검증 함수는 별도 품질 감사에 사용할 수 있습니다.
+- EOD Bulk가 `429`를 반환하면 엔드포인트별 실질 호출 간격을 학습하며, 재무·유니버스
+  등 작은 endpoint의 속도는 별도로 유지합니다.
 - Bronze에서는 `isEtf`·`isFund` 조건으로 행을 제거하지 않습니다. ETF/fund 및
   비주식 상품 제외는 Silver 후보 생성과 DQ에서만 수행합니다.
 - `stock/marcap`은 과거 주식 가격 백필에 사용합니다.
@@ -219,7 +243,7 @@ corporate_action
 
 ```text
 asset
-  -> asset_identifier  # KRX ticker, DART corp_code 등 외부 식별자
+  -> asset_identifier  # KRX/DART/FMP ticker·corp_code·CIK·CUSIP·ISIN
   -> price_daily       # 주식/지수 일봉, 수정종가, 거래량, 시가총액
   -> fundamental       # DART 재무 지표 long format
   -> corporate_action  # DART/FMP 배당·분할·자본변동
@@ -228,7 +252,7 @@ asset
 | 테이블 | 역할 | 주요 키 |
 |---|---|---|
 | `asset` | 종목/지수 마스터 | `asset_id` |
-| `asset_identifier` | KRX/DART 식별자 매핑 | `(asset_id, source, identifier)` |
+| `asset_identifier` | KRX/DART/FMP 식별자 매핑과 유효기간 | `(asset_id, source, identifier_type, identifier, valid_from)` |
 | `price_daily` | 주식/벤치마크 지수 일봉 | `(asset_id, source, trade_date)` |
 | `fundamental` | DART/FMP 재무계정 long format | `(asset_id, source, statement_type, data_basis, period_end, fiscal_period, fs_type, revision_key, metric)` |
 | `corporate_action` | 배당·분할·증자·감자 등 기업행사 | `(asset_id, source, action_key)` |
@@ -241,6 +265,43 @@ FMP `close`는 `adj_close`(분할조정), `adjClose`는 `total_return_close`(배
 행의 `currency`에 기록하며 `USDKRW`도 FX asset의 `price_daily`로 적재합니다.
 
 컬럼별 상세 설계는 [schema_tables.md](schema_tables.md)와 [sql/schema.sql](sql/schema.sql)를 참고합니다.
+
+## RDS Gold 구조
+
+Gold는 별도 인스턴스를 만들지 않고 Silver와 같은 PostgreSQL database의 `gold`
+schema에 둡니다. Silver의 `public.asset`을 FK로 직접 참조하므로 별도 종목 마스터
+복제나 동기화가 필요 없습니다.
+
+```text
+gold.factor
+  -> gold.factor_value
+  -> gold.factor_correlation
+```
+
+| 테이블 | 역할 | 주요 키 |
+|---|---|---|
+| `gold.factor` | 팩터 정의, 구현 버전, 설정, 최신 평가와 상태 | `(factor_key, version)` |
+| `gold.factor_value` | 승인 팩터의 종목×PIT 날짜별 원값과 순위 | `(factor_id, asset_id, as_of_date)` |
+| `gold.factor_correlation` | 두 승인 팩터의 기간별 rank Spearman 상관 | `(left_factor_id, right_factor_id, period_start, period_end)` |
+
+상태는 `CANDIDATE`, `APPROVED`, `REJECTED`, `RETIRED`이며, 값과 상관관계는
+승인된 팩터만 적재할 수 있도록 DB trigger가 강제합니다. 동일한 `factor_key`에서
+`APPROVED` 버전은 하나만 허용합니다.
+
+현재 첫 구현은 **12-1 모멘텀**입니다.
+
+```text
+value = adj_close[t-21 거래일] / adj_close[t-252 거래일] - 1
+rank  = 같은 as_of_date KOSPI·KOSDAQ 유니버스 내 내림차순 순위
+```
+
+구현은 [`pipeline/gold/factors/momentum_12_1.sql`](pipeline/gold/factors/momentum_12_1.sql)에
+있습니다. 현재 테스트 스냅샷 적재까지 완료했으며 기준 IC·평가 구간·통과 임계값과
+자동 갱신 주기는 아직 확정하지 않았습니다. 따라서 Gold는 현재 daily task에 자동으로
+연결하지 않고 연구/평가 단계에서 명시적으로 실행합니다.
+
+상세 설계와 DDL은 [gold_schema.md](gold_schema.md),
+[sql/gold_schema.sql](sql/gold_schema.sql)을 참고합니다.
 
 ## Daily 실행 흐름
 
@@ -257,12 +318,15 @@ python -m pipeline.daily_full
 
 실행 순서:
 
-1. 대상 날짜의 주식/지수 bronze 데이터를 S3에 저장합니다.
-2. 당해 연도 DART 데이터를 확인하고, 변경된 JSON만 S3에 다시 저장합니다.
+1. 대상 날짜의 KRX 주식/지수 Bronze를 S3에 저장합니다.
+2. 당해 연도 DART 재무와 기업행사를 확인하고 변경 원문만 저장합니다.
 3. 필요한 S3 객체만 ECS 컨테이너의 `/app/data`로 다운로드합니다.
-4. Silver 후보 데이터를 생성하고 자동 품질 검사를 수행합니다.
+4. KRX/DART Silver 후보를 생성하고 자동 품질 검사를 수행합니다.
 5. Critical/Error가 없을 때만 대상 날짜 교체와 upsert를 하나의 transaction으로 반영합니다.
-6. 실패하면 기존 Silver를 유지하고 `dq_run`·`dq_result`에 원인을 기록합니다.
+6. 완료된 직전 미국 세션의 FMP Bronze와 Silver를 별도 transaction으로 처리합니다.
+7. 실패하면 이미 인증된 Silver는 유지하고 `dq_run`·`dq_result`에 원인을 기록합니다.
+
+Gold 팩터는 평가 정책과 갱신 주기가 확정되기 전까지 daily 흐름에 포함하지 않습니다.
 
 KRX OpenAPI는 당일 데이터를 안정적으로 제공하지 않기 때문에 다음날 오전에 전날 데이터를 가져옵니다.
 
@@ -285,6 +349,7 @@ cp .env.example .env
 ```text
 KRX_API_KEY=...
 DART_API_KEY=...
+FMP_API_KEY=...
 AWS_PROFILE=<aws-profile>
 S3_BRONZE_BUCKET=<bronze-bucket>
 SILVER_DB_URL=postgresql://<user>:<password>@<rds-endpoint>:5432/<database>
@@ -357,6 +422,16 @@ uv run python -m pipeline.bronze.fmp --mode backfill --from 2015 --to 2026 --des
 uv run python -m pipeline.bronze.fmp --mode daily --date 20260713 --dest s3
 ```
 
+FMP 전체 Bronze 이후 Silver를 연도별로 이어서 실행하는 ECS용 진입점:
+
+```bash
+uv run python -m pipeline.fmp_backfill_ecs --phase full --from 2015 --to 2026
+```
+
+완료된 `response.*`/`manifest.json` 파티션은 재호출하지 않으므로 같은 범위로
+재실행해도 이어서 진행합니다. 운영에서는 daily task와 겹치지 않도록 Scheduler를
+중지한 maintenance window에서 one-off ECS task로 실행합니다.
+
 로컬 `./data`에서 silver 적재:
 
 ```bash
@@ -366,6 +441,15 @@ uv run python -m pipeline.silver.fmp_load --mode backfill --from 2015 --to 2026
 uv run python -m pipeline.silver.fmp_load --mode backfill --resume <dq-run-uuid>
 uv run python -m pipeline.silver.fmp_load --mode daily --date 20260713
 ```
+
+Gold schema 생성:
+
+```bash
+psql "$SILVER_DB_URL" -v ON_ERROR_STOP=1 -f sql/gold_schema.sql
+```
+
+12-1 모멘텀 SQL은 호출자가 승인된 `factor_id`를 전달하고 transaction을 소유하는
+형태입니다. 평가 기준이 확정되기 전에는 자동 배치에 연결하지 않습니다.
 
 GitHub Actions를 쓰지 못할 때 수동 이미지 배포:
 

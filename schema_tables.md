@@ -115,3 +115,19 @@ DART 구조화 공시와 공시 원문 증거뿐 아니라 FMP split/dividend ca
 | 국내 기업행사 | `corporate_actions/dart` |
 | 미국 기업행사 | `corporate_actions/fmp` |
 | USD/KRW | `fx/fmp/pair=USDKRW` |
+
+## Gold와의 경계
+
+Silver는 원천을 분석 가능한 PIT 데이터로 정규화하는 계층이며 팩터 값은 저장하지
+않는다. Gold는 같은 PostgreSQL database의 별도 `gold` schema에서
+`public.asset`과 Silver 데이터를 참조한다.
+
+```text
+public.asset / public.price_daily / public.fundamental
+                         │
+                         ▼
+ gold.factor -> gold.factor_value -> gold.factor_correlation
+```
+
+Gold 3테이블과 12-1 모멘텀 구현은 [gold_schema.md](gold_schema.md) 및
+[sql/gold_schema.sql](sql/gold_schema.sql)을 기준으로 한다.

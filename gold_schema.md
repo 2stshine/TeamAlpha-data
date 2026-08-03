@@ -56,7 +56,8 @@ APPROVED일 때만 적재한다.
 │   ├── asset
 │   ├── asset_identifier
 │   ├── price_daily
-│   └── fundamental
+│   ├── fundamental
+│   └── corporate_action
 └── gold
     ├── factor
     ├── factor_value
@@ -72,3 +73,34 @@ APPROVED일 때만 적재한다.
 Gold 계산이 Silver 운영을 방해할 정도로 커질 때만 별도 RDS 또는 read replica를
 검토한다. 물리적으로 분리하면 PostgreSQL FK를 사용할 수 없어 `asset` dimension
 복제와 별도 정합성 검사가 필요하다.
+
+## 첫 팩터: 12-1 모멘텀
+
+현재 구현된 첫 Gold 팩터는 최신 KRX 거래일 기준 12-1 모멘텀이다.
+
+```text
+signal_end   = as_of_date에서 21 거래일 전
+signal_start = as_of_date에서 252 거래일 전
+value        = adj_close[signal_end] / adj_close[signal_start] - 1
+rank         = 같은 날짜 KOSPI·KOSDAQ 유니버스 내 value 내림차순 순위
+```
+
+- 구현: [`pipeline/gold/factors/momentum_12_1.sql`](pipeline/gold/factors/momentum_12_1.sql)
+- 입력: `public.price_daily`의 KRX `adj_close`
+- 유니버스: 최신 `as_of_date`에 KOSPI 또는 KOSDAQ인 `stock`
+- 현재 단계: 계산 SQL과 테스트 스냅샷 적재 완료
+- 미확정: IC 계산 방식, 평가 기간, 최소 관측치, 승인 임계값, 자동 갱신 주기
+
+기준 평가가 아직 없으므로 테스트 적재 결과를 운영 승인된 투자 신호로 해석하지
+않는다. 평가가 확정되면 `factor.evaluation`에 근거와 `passed`를 기록하고 상태 전이를
+통해 승인 여부를 명시한다.
+
+## 적용과 검증
+
+```bash
+psql "$SILVER_DB_URL" -v ON_ERROR_STOP=1 -f sql/gold_schema.sql
+uv run pytest -q tests/gold/test_gold_schema.py
+```
+
+DDL은 idempotent하며 `gold.active_factor_catalog` view는 현재 `APPROVED`인 버전만
+노출한다. 팩터 값 계산 SQL은 호출자가 `factor_id`와 transaction을 관리한다.

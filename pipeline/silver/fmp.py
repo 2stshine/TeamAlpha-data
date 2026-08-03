@@ -251,6 +251,7 @@ def prepare_universe(
         exchange = _exchange(row)
         is_etf = _as_bool(row.get("isEtf"))
         is_fund = _as_bool(row.get("isFund"))
+        is_active = _as_bool(row.get("isActivelyTrading"))
         name = _text(row.get("companyName") or row.get("name")) or symbol
         reason = None
         if exchange not in SUPPORTED_EXCHANGES:
@@ -261,6 +262,11 @@ def prepare_universe(
             reason = "FUND"
         elif NON_EQUITY_NAME.search(name):
             reason = "NON_EQUITY_NAME"
+        elif is_active is False and symbol not in delisted_by_symbol:
+            # profile-bulk retains stale, renamed tickers without a delisting
+            # date. Only the dedicated delisted endpoint is accepted as
+            # evidence that an inactive symbol belongs in the history.
+            reason = "INACTIVE_UNDATED"
         elif (is_etf is None or is_fund is None) and symbol not in delisted_by_symbol:
             reason = "AMBIGUOUS_CLASSIFICATION"
         if reason:
@@ -369,17 +375,37 @@ def prepare_universe(
 
     assets = pd.DataFrame(asset_rows)
     identifiers = pd.DataFrame(identifier_rows)
+    ambiguous_identifier_samples: list[dict] = []
+    ambiguous_identifier_rows_removed = 0
     if not identifiers.empty:
         identifiers = identifiers.drop_duplicates(
             ["natural_key", "source", "identifier_type", "identifier", "valid_from"],
             keep="last",
         ).reset_index(drop=True)
+        # FMP occasionally assigns the same current CUSIP/ISIN to multiple
+        # active symbols. Keep the raw values in Bronze, but omit every
+        # ambiguous mapping from Silver so point-in-time joins stay safe.
+        current_security_id = (
+            identifiers["valid_to"].isna()
+            & identifiers["identifier_type"].isin(["cusip", "isin"])
+        )
+        ambiguous = current_security_id & identifiers.duplicated(
+            ["source", "identifier_type", "identifier"], keep=False,
+        )
+        ambiguous_identifier_rows_removed = int(ambiguous.sum())
+        ambiguous_identifier_samples = identifiers.loc[
+            ambiguous,
+            ["natural_key", "identifier_type", "identifier"],
+        ].head(30).to_dict("records")
+        identifiers = identifiers.loc[~ambiguous].reset_index(drop=True)
     return assets, identifiers, {
         "raw_symbol_count": len(merged),
         "admitted_symbol_count": len(admitted),
         "excluded_symbol_count": sum(exclusions.values()),
         "excluded_by_reason": dict(exclusions),
         "excluded_samples": samples,
+        "ambiguous_identifier_rows_removed": ambiguous_identifier_rows_removed,
+        "ambiguous_identifier_samples": ambiguous_identifier_samples,
         "source_file_count": len(source_files) + len(delisted_files) + len(change_files),
     }
 

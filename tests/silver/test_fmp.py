@@ -158,6 +158,60 @@ def test_financials_and_actions_are_long_pit_candidates(tmp_path):
     assert dividend["currency"] == "USD"
 
 
+def test_universe_excludes_stale_profiles_and_ambiguous_security_ids(tmp_path):
+    rows = [
+        {
+            "symbol": "NEW", "companyName": "New Corp", "exchange": "NASDAQ",
+            "currency": "USD", "country": "US", "isEtf": False,
+            "isFund": False, "isAdr": False, "isActivelyTrading": True,
+            "industry": "Software", "ipoDate": "2020-01-01",
+            "cik": "1", "cusip": "111111111", "isin": "US1111111111",
+        },
+        {
+            "symbol": "OLD", "companyName": "Old Corp", "exchange": "NASDAQ",
+            "currency": "USD", "country": "US", "isEtf": False,
+            "isFund": False, "isAdr": False, "isActivelyTrading": False,
+            "industry": "Software", "ipoDate": "2010-01-01",
+            "cik": "1", "cusip": "111111111", "isin": "US1111111111",
+        },
+        {
+            "symbol": "DUPEA", "companyName": "Dupe A", "exchange": "NYSE",
+            "currency": "USD", "country": "US", "isEtf": False,
+            "isFund": False, "isAdr": False, "isActivelyTrading": True,
+            "industry": "Industrials", "ipoDate": "2021-01-01",
+            "cik": "2", "cusip": "222222222", "isin": "US2222222222",
+        },
+        {
+            "symbol": "DUPEB", "companyName": "Dupe B", "exchange": "NYSE",
+            "currency": "USD", "country": "US", "isEtf": False,
+            "isFund": False, "isAdr": False, "isActivelyTrading": True,
+            "industry": "Industrials", "ipoDate": "2022-01-01",
+            "cik": "3", "cusip": "222222222", "isin": "US2222222222",
+        },
+    ]
+    _write(
+        tmp_path
+        / "stock/fmp/universe/profile-bulk/snapshot_date=2026-07-31/part=0/response.csv",
+        _csv(rows),
+    )
+
+    assets, identifiers, stats = fmp.prepare_universe(
+        str(tmp_path), date(2026, 7, 31),
+    )
+
+    assert set(assets["natural_key"]) == {"FMP:NEW", "FMP:DUPEA", "FMP:DUPEB"}
+    assert stats["excluded_by_reason"]["INACTIVE_UNDATED"] == 1
+    assert stats["ambiguous_identifier_rows_removed"] == 4
+    assert set(
+        identifiers.loc[
+            identifiers["identifier_type"].eq("ticker"), "identifier"
+        ]
+    ) == {"NEW", "DUPEA", "DUPEB"}
+    assert not identifiers.duplicated(
+        ["source", "identifier_type", "identifier"], keep=False,
+    ).any()
+
+
 def test_usdkrw_is_an_fx_price_asset(tmp_path):
     path = tmp_path / "fx/fmp/pair=USDKRW/date=2026-08-03/response.json"
     _write(path, json.dumps([{

@@ -167,4 +167,22 @@ def check_fmp(bundle: CandidateBundle) -> list[CheckResult]:
         failed_count=0,
         samples=list(universe.get("excluded_samples", []))[:20],
     ))
+    ambiguous_identifiers = int(
+        universe.get("ambiguous_identifier_rows_removed", 0)
+    )
+    checks.append(CheckResult(
+        rule_code="FMP_AMBIGUOUS_IDENTIFIER_EXCLUDED",
+        dataset="asset_identifier",
+        severity=Severity.MODIFIED,
+        status=CheckStatus.PASS,
+        expected=(
+            "ambiguous current CUSIP/ISIN remain in Bronze and are omitted "
+            "from Silver"
+        ),
+        actual=f"excluded_identifier_rows={ambiguous_identifiers}",
+        failed_count=0,
+        samples=list(
+            universe.get("ambiguous_identifier_samples", [])
+        )[:20],
+    ))
     return checks

@@ -212,6 +212,57 @@ def test_universe_excludes_stale_profiles_and_ambiguous_security_ids(tmp_path):
     ).any()
 
 
+def test_prices_respect_ticker_validity_after_symbol_change(tmp_path):
+    rows = [
+        {
+            "symbol": "NEW", "companyName": "Renamed Corp", "exchange": "NASDAQ",
+            "currency": "USD", "country": "US", "isEtf": False,
+            "isFund": False, "isAdr": False, "isActivelyTrading": True,
+            "industry": "Software", "ipoDate": "2020-01-01",
+            "cik": "1", "cusip": "111111111", "isin": "US1111111111",
+        },
+        {
+            "symbol": "OLD", "companyName": "Renamed Corp", "exchange": "NASDAQ",
+            "currency": "USD", "country": "US", "isEtf": False,
+            "isFund": False, "isAdr": False, "isActivelyTrading": True,
+            "industry": "Software", "ipoDate": "2020-01-01",
+            "cik": "1", "cusip": "111111111", "isin": "US1111111111",
+        },
+    ]
+    _write(
+        tmp_path
+        / "stock/fmp/universe/profile-bulk/snapshot_date=2026-07-31/part=0/response.csv",
+        _csv(rows),
+    )
+    _write(
+        tmp_path
+        / "stock/fmp/universe/symbol-change/snapshot_date=2026-07-31/response.json",
+        json.dumps([{
+            "oldSymbol": "OLD", "newSymbol": "NEW", "date": "2026-06-01",
+        }]).encode(),
+    )
+    price_path = tmp_path / "stock/fmp/eod-bulk/date=2026-07-31/response.csv"
+    _write(price_path, _csv([
+        {
+            "symbol": "OLD", "date": "2026-07-31", "open": 10,
+            "high": 11, "low": 9, "close": 10, "adjClose": 10,
+            "volume": 100,
+        },
+        {
+            "symbol": "NEW", "date": "2026-07-31", "open": 20,
+            "high": 21, "low": 19, "close": 20, "adjClose": 20,
+            "volume": 200,
+        },
+    ]))
+    _manifest(price_path)
+
+    bundle = fmp.build_candidates(str(tmp_path), date(2026, 7, 31))
+
+    assert list(bundle.prices["identifier"]) == ["NEW"]
+    assert list(bundle.prices["natural_key"]) == ["FMP:NEW"]
+    assert not any(result.status == CheckStatus.FAIL for result in check_fmp(bundle))
+
+
 def test_usdkrw_is_an_fx_price_asset(tmp_path):
     path = tmp_path / "fx/fmp/pair=USDKRW/date=2026-08-03/response.json"
     _write(path, json.dumps([{

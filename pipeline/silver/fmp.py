@@ -439,7 +439,12 @@ def _ticker_metadata(assets: pd.DataFrame, identifiers: pd.DataFrame) -> dict[st
         return {}
     by_key = assets.set_index("natural_key").to_dict("index")
     return {
-        str(row.identifier): by_key[str(row.natural_key)]
+        str(row.identifier): {
+            **by_key[str(row.natural_key)],
+            "natural_key": str(row.natural_key),
+            "valid_from": row.valid_from,
+            "valid_to": row.valid_to,
+        }
         for row in identifiers.itertuples(index=False)
         if row.identifier_type == "ticker" and str(row.natural_key) in by_key
     }
@@ -473,7 +478,14 @@ def prepare_prices(
             symbol = _text(raw.get("symbol"))
             meta = ticker_meta.get(symbol or "")
             trade_date = _parse_date(raw.get("date")) or partition_date
-            if meta is None:
+            if (
+                meta is None
+                or trade_date < meta["valid_from"]
+                or (
+                    meta["valid_to"] is not None
+                    and trade_date > meta["valid_to"]
+                )
+            ):
                 continue
             factor = 1.0
             for split_date, split_ratio in splits.get(symbol, []):
@@ -482,6 +494,7 @@ def prepare_prices(
             adjusted_close = _number(raw.get("close"))
             total_return = _number(raw.get("adjClose"))
             rows.append({
+                "natural_key": meta["natural_key"],
                 "identifier": symbol,
                 "source": "FMP",
                 "trade_date": trade_date,
@@ -954,6 +967,14 @@ def _publish_frame(
         raise RuntimeError(f"unmapped FMP identifiers: {missing[:20]}")
     frame["asset_id"] = frame["asset_id"].astype("int64")
     frame["quality_run_id"] = quality_run_id
+    duplicate_publish_key = frame.duplicated(conflict, keep=False)
+    if duplicate_publish_key.any():
+        samples = frame.loc[
+            duplicate_publish_key, conflict + ["identifier"]
+        ].head(20).to_dict("records")
+        raise RuntimeError(
+            f"duplicate FMP publish key table={table} samples={samples}"
+        )
     rows = list(
         frame[columns].astype(object).where(pd.notna(frame[columns]), None)
         .itertuples(index=False, name=None)

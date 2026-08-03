@@ -95,6 +95,11 @@ def check_fmp(bundle: CandidateBundle) -> list[CheckResult]:
                 ["open", "high", "low", "close", "adj_close", "total_return_close", "volume", "vwap"],
             ),
         ])
+        if "natural_key" in prices:
+            checks.append(duplicate_keys(
+                prices, "price_daily",
+                ["natural_key", "source", "trade_date"],
+            ))
         unmapped = prices[~prices["identifier"].astype(str).isin(symbols)]
         checks.append(result(
             "FMP_PRICE_IDENTIFIER_MAPPING", "price_daily", Severity.CRITICAL,

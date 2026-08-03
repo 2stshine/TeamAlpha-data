@@ -41,6 +41,26 @@ def test_month_windows_cover_requested_range():
     ]
 
 
+def test_dependency_paths_selects_structured_and_documents_in_window():
+    writer = object.__new__(corporate_actions._BronzeWriter)
+    writer._executor = object()
+    writer._existing = {
+        "s3://bucket/corporate_actions/dart/structured/event=bonus_issue/"
+        "year=2026/corp=002070/rcept=20260715000358.json",
+        "s3://bucket/corporate_actions/dart/documents/year=2026/"
+        "corp=008830/rcept=20260731901116.zip",
+        "s3://bucket/corporate_actions/dart/structured/event=bonus_issue/"
+        "year=2025/corp=000001/rcept=20250101000001.json",
+        "s3://bucket/corporate_actions/dart/disclosures/year=2026/"
+        "date=2026-07-31/corp=008830/rcept=20260731901116.json",
+    }
+
+    selected = writer.dependency_paths("20260202", "20260731")
+
+    assert len(selected) == 2
+    assert all("2026" in path for path in selected)
+
+
 def test_run_saves_json_rows_and_binary_document(tmp_path, monkeypatch):
     monkeypatch.setenv("DART_API_KEY", "test-key")
     monkeypatch.setattr(
@@ -132,3 +152,12 @@ def test_run_saves_json_rows_and_binary_document(tmp_path, monkeypatch):
         "local",
     )
     assert second_changed == []
+
+    dependencies = corporate_actions.run(
+        "20260101",
+        "20260131",
+        "local",
+        include_dependencies=True,
+    )
+    assert str(structured_path) in dependencies
+    assert str(document_path) in dependencies

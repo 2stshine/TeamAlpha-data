@@ -176,6 +176,26 @@ class _BronzeWriter:
             )
         return [by_receipt[key] for key in sorted(by_receipt)]
 
+    def dependency_paths(
+        self,
+        fromdate: str,
+        todate: str,
+    ) -> list[str]:
+        """S3에 이미 있는 구조화 공시·원문 중 증거 기간을 반환한다."""
+        if self._executor is None:
+            return []
+        selected = []
+        for path in self._existing:
+            if not (
+                "/corporate_actions/dart/structured/" in path
+                or "/corporate_actions/dart/documents/" in path
+            ):
+                continue
+            match = re.search(r"/rcept=(\d{8})\d{6}\.(?:json|zip)$", path)
+            if match and fromdate <= match.group(1) <= todate:
+                selected.append(path)
+        return sorted(selected)
+
     def _submit(self, path: str, data: bytes) -> bool:
         if path in self._existing:
             return False
@@ -498,8 +518,15 @@ def run(
     dest: str,
     *,
     download_documents: bool = True,
+    include_dependencies: bool = False,
+    dependency_fromdate: str | None = None,
 ) -> list[str]:
-    """기간 내 기업행사 원본을 수집하고 변경된 Bronze URI를 반환한다."""
+    """기간 내 기업행사 원본을 수집하고 Silver 입력 URI를 반환한다.
+
+    기본값은 새로 쓰인 Bronze URI만 반환한다. 일일 ECS처럼 빈 로컬
+    디스크에서 시작하는 호출자는 ``include_dependencies=True``로 이미 S3에
+    존재하는 구조화 공시와 원문 ZIP도 함께 받아야 한다.
+    """
     api_key = os.environ.get("DART_API_KEY")
     if not api_key:
         raise SystemExit("DART_API_KEY 환경변수가 없습니다 (.env 확인)")
@@ -509,6 +536,7 @@ def run(
     writer = _BronzeWriter(base)
 
     changed_paths: list[str] = []
+    dependency_paths: set[str] = set()
     candidates: dict[str, dict] = {}
     list_calls = structured_calls = document_calls = unavailable_documents = 0
     print(
@@ -517,6 +545,11 @@ def run(
     )
 
     try:
+        if include_dependencies:
+            dependency_paths.update(writer.dependency_paths(
+                dependency_fromdate or fromdate,
+                todate,
+            ))
         structured_marker = _manifest_path(
             base,
             fromdate,
@@ -602,6 +635,19 @@ def run(
                 "event_api": event_api,
                 "needs_document": needs_document,
             }
+            if include_dependencies and event_api is not None:
+                structured_path = _structured_path(
+                    base,
+                    event_api,
+                    row,
+                    ticker,
+                )
+                if writer.exists(structured_path):
+                    dependency_paths.add(structured_path)
+            if include_dependencies and needs_document:
+                document_path = _document_path(base, row, ticker)
+                if writer.exists(document_path):
+                    dependency_paths.add(document_path)
         print(
             f"[corporate-actions] candidates prepared={len(candidates)}",
             flush=True,
@@ -659,6 +705,10 @@ def run(
                         )
                         if writer.save_json(row, path):
                             changed_paths.append(path)
+                        if include_dependencies:
+                            announced = str(row.get("rcept_no") or "")[:8]
+                            if fromdate <= announced <= todate:
+                                dependency_paths.add(path)
                     if query_no % 100 == 0:
                         print(
                             "[corporate-actions] structured "
@@ -704,6 +754,8 @@ def run(
                         candidate["row"],
                         candidate["ticker"],
                     )
+                    if include_dependencies and writer.exists(path):
+                        dependency_paths.add(path)
                     if not writer.exists(path) and not writer.exists(
                         unavailable_path
                     ):
@@ -761,7 +813,7 @@ def run(
         f"changed={len(changed_paths)}",
         flush=True,
     )
-    return changed_paths
+    return sorted(set(changed_paths) | dependency_paths)
 
 
 def parse_args() -> argparse.Namespace:

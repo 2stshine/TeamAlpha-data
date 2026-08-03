@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import glob
+import html
 import json
 import re
+import zipfile
 from datetime import date, datetime
 from pathlib import Path
 
@@ -365,7 +367,57 @@ def _disclosure_type(report_name: object) -> tuple[str, bool, int] | None:
     return None
 
 
-def _disclosure_row(path: str, row: dict) -> dict | None:
+def _document_effective_date(
+    base: str,
+    *,
+    ticker: str,
+    rcept_no: str,
+    event_type: str,
+) -> date | None:
+    """원문 ZIP에서 거래소 공시의 실제 실시일을 읽는다."""
+    labels = {
+        "rights_detachment": ("권리락 실시일",),
+        "ex_dividend": ("배당락 실시일",),
+    }.get(event_type, ())
+    if not labels:
+        return None
+    paths = glob.glob(
+        f"{base}/corporate_actions/dart/documents/year=*/"
+        f"corp={ticker}/rcept={rcept_no}.zip"
+    )
+    for path in sorted(paths):
+        try:
+            with zipfile.ZipFile(path) as archive:
+                payloads = [archive.read(name) for name in archive.namelist()]
+        except (OSError, zipfile.BadZipFile):
+            continue
+        for payload in payloads:
+            text = None
+            for encoding in ("utf-8", "euc-kr", "cp949"):
+                try:
+                    text = payload.decode(encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if text is None:
+                text = payload.decode("utf-8", errors="replace")
+            visible = html.unescape(re.sub(r"<[^>]+>", " ", text))
+            visible = re.sub(r"\s+", " ", visible)
+            for label in labels:
+                match = re.search(
+                    re.escape(label)
+                    + r".{0,600}?((?:19|20)\d{2}\s*[년./-]\s*"
+                    r"\d{1,2}\s*[월./-]\s*\d{1,2}\s*일?)",
+                    visible,
+                )
+                if match:
+                    parsed = _parse_date(match.group(1))
+                    if parsed is not None:
+                        return parsed
+    return None
+
+
+def _disclosure_row(base: str, path: str, row: dict) -> dict | None:
     event = _disclosure_type(row.get("report_nm"))
     if event is None:
         return None
@@ -374,9 +426,23 @@ def _disclosure_row(path: str, row: dict) -> dict | None:
     announced = _parse_date(row.get("rcept_dt")) or _announcement_date(row)
     if not ticker or announced is None:
         return None
+    document_date = _document_effective_date(
+        base,
+        ticker=ticker,
+        rcept_no=str(row.get("rcept_no") or ""),
+        event_type=event_type,
+    )
     confirms_adjustment = expects_adjustment or event_type == "ex_dividend"
-    effective_date = announced if confirms_adjustment else None
-    match_window_days = 3 if event_type == "ex_dividend" else window
+    effective_date = (
+        document_date or announced
+        if confirms_adjustment
+        else None
+    )
+    match_window_days = (
+        0
+        if document_date is not None
+        else (3 if event_type == "ex_dividend" else window)
+    )
     return {
         "identifier": ticker,
         "event_type": event_type,
@@ -468,7 +534,7 @@ def prepare(
 
     disclosure_count = 0
     for path, row in disclosure_rows:
-        parsed = _disclosure_row(path, row)
+        parsed = _disclosure_row(base, path, row)
         if parsed is not None:
             records.append(parsed)
             disclosure_count += 1

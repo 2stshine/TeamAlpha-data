@@ -1,5 +1,7 @@
 import json
+import zipfile
 from datetime import date
+from io import BytesIO
 
 import pandas as pd
 import pytest
@@ -10,6 +12,14 @@ from pipeline.silver import corporate_actions
 def _write_json(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _write_document(path, xml):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("document.xml", xml)
+    path.write_bytes(output.getvalue())
 
 
 def test_prepare_normalizes_structured_factor_and_exchange_notice(tmp_path):
@@ -47,6 +57,36 @@ def test_prepare_normalizes_structured_factor_and_exchange_notice(tmp_path):
     assert notice["effective_date"] == date(2026, 7, 7)
     assert stats["effective_date_count"] == 2
     assert stats["expected_factor_count"] == 1
+
+
+def test_rights_notice_uses_document_execution_date(tmp_path):
+    manifest = (
+        tmp_path
+        / "corporate_actions/dart/manifests"
+        / "from=20260202/to=20260731/disclosures.json"
+    )
+    _write_json(manifest, [{
+        "stock_code": "008830",
+        "rcept_no": "20260731901116",
+        "rcept_dt": "20260731",
+        "report_nm": "권리락 (무상증자)",
+    }])
+    document = (
+        tmp_path
+        / "corporate_actions/dart/documents/year=2026/corp=008830"
+        / "rcept=20260731901116.zip"
+    )
+    _write_document(
+        document,
+        "<document><label>권리락 실시일</label>"
+        "<value>2026-08-03</value></document>",
+    )
+
+    events, _ = corporate_actions.prepare(str(tmp_path))
+
+    event = events.iloc[0]
+    assert event["effective_date"] == date(2026, 8, 3)
+    assert event["match_window_days"] == 0
 
 
 def test_capital_reduction_share_factor_is_not_a_price_factor(tmp_path):

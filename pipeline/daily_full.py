@@ -18,6 +18,8 @@ from pipeline.silver import load
 KST = ZoneInfo("Asia/Seoul")
 EXPECTED_STOCK_FILES = {"kospi.parquet", "kosdaq.parquet"}
 EXPECTED_INDEX_FILES = {"krx.parquet", "kospi.parquet", "kosdaq.parquet"}
+CORPORATE_ACTION_DISCOVERY_LOOKBACK_DAYS = 14
+CORPORATE_ACTION_EVIDENCE_LOOKBACK_DAYS = 180
 
 
 def _target_day() -> str:
@@ -99,9 +101,20 @@ def main() -> None:
     changed_financial_keys = [_key_from_s3_uri(uri) for uri in changed_financial_uris]
     print(f"[daily] changed financial files={len(changed_financial_keys)}", flush=True)
     action_from = (
-        datetime.strptime(day, "%Y%m%d").date() - timedelta(days=14)
+        datetime.strptime(day, "%Y%m%d").date()
+        - timedelta(days=CORPORATE_ACTION_DISCOVERY_LOOKBACK_DAYS)
     ).strftime("%Y%m%d")
-    changed_action_uris = corporate_actions.run(action_from, day, "s3")
+    action_evidence_from = (
+        datetime.strptime(day, "%Y%m%d").date()
+        - timedelta(days=CORPORATE_ACTION_EVIDENCE_LOOKBACK_DAYS)
+    ).strftime("%Y%m%d")
+    changed_action_uris = corporate_actions.run(
+        action_from,
+        day,
+        "s3",
+        include_dependencies=True,
+        dependency_fromdate=action_evidence_from,
+    )
     changed_action_keys = [
         _key_from_s3_uri(uri) for uri in changed_action_uris
     ]

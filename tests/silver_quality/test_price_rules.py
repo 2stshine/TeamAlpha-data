@@ -492,6 +492,33 @@ def test_dart_action_with_no_nearby_reset_is_flagged():
     assert missing.iloc[0]["identifier"] == "005930"
 
 
+def test_future_dart_action_is_not_flagged_before_effective_date():
+    effective = date(2026, 8, 4)
+    frame = pd.DataFrame([{
+        "identifier": "005930",
+        "asset_type": "stock",
+        "trade_date": date(2026, 7, 31),
+        "source_adjustment_event": False,
+        "source_adjustment_factor": 1.0,
+    }])
+    actions = pd.DataFrame([{
+        "identifier": "005930",
+        "event_type": "bonus_issue",
+        "effective_date": effective,
+        "match_window_days": 7,
+        "expects_price_adjustment": True,
+        "rcept_no": "r1",
+    }])
+
+    missing = _dart_actions_without_krx_adjustment(
+        frame,
+        actions,
+        {date(2026, 7, 31)},
+    )
+
+    assert missing.empty
+
+
 def test_reciprocal_share_change_explains_scale_jump_as_krx_structure():
     frame = _valid_prices({
         "open": 1_000.0,
@@ -929,6 +956,31 @@ def test_small_source_adjustment_is_applied_to_daily_continuity():
         "asset_type": "stock",
     }])
     results = check_prices(frame, target_date=DAY, history=history)
+    assert _failed(results, "ADJ_CLOSE_RETURN_CONTINUITY") == 0
+
+
+def test_daily_continuity_is_idempotent_when_history_is_already_rescaled():
+    frame = _valid_prices({
+        "open": 101.0,
+        "high": 101.0,
+        "low": 101.0,
+        "close": 101.0,
+        "adj_close": 101.0,
+        "market_cap": 101_000.0,
+        "prev_diff": 0.9,
+        "fluc_rate": 0.8991,
+    })
+    history = pd.DataFrame([{
+        "identifier": "005930",
+        "trade_date": date(2026, 7, 7),
+        "close": 100.0,
+        "adj_close": 100.1,
+        "market": "KOSPI",
+        "asset_type": "stock",
+    }])
+
+    results = check_prices(frame, target_date=DAY, history=history)
+
     assert _failed(results, "ADJ_CLOSE_RETURN_CONTINUITY") == 0
 
 

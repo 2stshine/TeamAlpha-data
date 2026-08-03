@@ -376,6 +376,14 @@ def _dart_actions_without_krx_adjustment(
         # 조정계수를 놓치므로, 허용 창 전체에 조정 행이 하나라도 있는지 본다.
         if in_window["source_adjustment_event"].fillna(False).any():
             continue
+        # 아직 효력일이 오지 않았다면 조정 누락으로 단정하지 않는다.
+        # 무상증자 기준일보다 앞선 권리락은 실제 KRX 조정행이 있으면 위에서
+        # 설명되며, 조정행이 없는 경우에는 효력일 당일 이후에만 경고한다.
+        observable = in_window[
+            in_window["trade_date"].ge(event["effective_date"])
+        ]
+        if observable.empty:
+            continue
         # DART 효력일이 실제 KRX 권리락일과 며칠 어긋나면 기준가 리셋이
         # 좁은 match window 밖에 나타난다. 더 넓은 창에 실제 리셋이 있으면
         # 그 행사가 반영된 것으로 보고 "조정 누락"으로 판정하지 않는다.
@@ -399,7 +407,7 @@ def _dart_actions_without_krx_adjustment(
                 and bool(after.iloc[0]["source_adjustment_event"])
             ):
                 continue
-        nearest_index = distances.loc[in_window.index].idxmin()
+        nearest_index = distances.loc[observable.index].idxmin()
         nearest = group.loc[nearest_index]
         if nearest["trade_date"] not in candidate_dates:
             continue
@@ -1060,8 +1068,19 @@ def check_prices(
     # 그 pending 계수를 직전 값에 먼저 반영해 연속성을 검사한다.
     pending_factor = pd.Series(1.0, index=combined.index)
     if target_date is not None and history is not None:
+        already_applied_tolerance = np.maximum(
+            0.0002,
+            combined["source_reference"].abs() * 1e-7,
+        )
+        history_already_rescaled = (
+            combined["previous_adj_close"].notna()
+            & combined["source_reference"].notna()
+            & combined["previous_adj_close"].sub(
+                combined["source_reference"]
+            ).abs().le(already_applied_tolerance)
+        )
         pending_factor = combined["source_adjustment_factor"].where(
-            combined["source_factor_applied"],
+            combined["source_factor_applied"] & ~history_already_rescaled,
             1.0,
         )
     expected_from_previous = (

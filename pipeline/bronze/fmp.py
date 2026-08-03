@@ -82,6 +82,8 @@ class FMPClient:
         self.request_count = 0
         self.retry_count = 0
         self.rate_limit_count = 0
+        self._endpoint_min_intervals: dict[str, float] = {}
+        self._endpoint_successes: dict[str, int] = {}
 
     def get(self, endpoint: str, params: dict[str, object] | None = None) -> RawResponse:
         endpoint = endpoint.strip("/")
@@ -90,9 +92,13 @@ class FMPClient:
         last_error: Exception | None = None
         self.logical_request_count += 1
         for attempt in range(1, self.max_attempts + 1):
+            request_interval = max(
+                self.min_interval,
+                self._endpoint_min_intervals.get(endpoint, 0.0),
+            )
             elapsed = time.monotonic() - self._last_request_started
-            if self._last_request_started and elapsed < self.min_interval:
-                self.sleeper(self.min_interval - elapsed)
+            if self._last_request_started and elapsed < request_interval:
+                self.sleeper(request_interval - elapsed)
             self._last_request_started = time.monotonic()
             self.request_count += 1
             try:
@@ -116,9 +122,22 @@ class FMPClient:
                     delay = min(30.0, 2 ** (attempt - 1) + random.random())
                 if response.status_code == 429:
                     self.rate_limit_count += 1
+                    self._endpoint_successes[endpoint] = 0
+                    current_interval = self._endpoint_min_intervals.get(endpoint, 0.0)
+                    if endpoint == "eod-bulk":
+                        # This large endpoint has a much lower effective rate
+                        # than lightweight APIs. Learn its cadence after the
+                        # first rejection instead of wasting three retries per
+                        # successful daily payload.
+                        learned_interval = (
+                            10.0 if current_interval < 10.0
+                            else min(30.0, current_interval * 1.2)
+                        )
+                        self._endpoint_min_intervals[endpoint] = learned_interval
                     print(
                         f"[fmp-client] rate limited attempt={attempt} "
-                        f"retry_after={delay:.2f}s",
+                        f"retry_after={delay:.2f}s "
+                        f"next_interval={self._endpoint_min_intervals.get(endpoint, self.min_interval):.2f}s",
                         flush=True,
                     )
                 self.sleeper(min(60.0, delay))
@@ -128,6 +147,15 @@ class FMPClient:
                     f"FMP request failed endpoint={endpoint} "
                     f"status={response.status_code}"
                 )
+            if endpoint in self._endpoint_min_intervals:
+                successes = self._endpoint_successes.get(endpoint, 0) + 1
+                self._endpoint_successes[endpoint] = successes
+                if successes >= 100:
+                    self._endpoint_min_intervals[endpoint] = max(
+                        self.min_interval,
+                        self._endpoint_min_intervals[endpoint] * 0.9,
+                    )
+                    self._endpoint_successes[endpoint] = 0
             return RawResponse(
                 endpoint=endpoint,
                 params=safe_params,

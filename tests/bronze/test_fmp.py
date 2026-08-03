@@ -78,6 +78,22 @@ def test_client_retries_429_without_exposing_secret():
     assert client.rate_limit_count == 1
 
 
+def test_eod_bulk_learns_endpoint_specific_rate_after_429():
+    waits = []
+    session = _Session([
+        _Response(429, b"rate limited", {"Retry-After": "0"}),
+        _Response(200, b"csv"),
+    ])
+    client = fmp.FMPClient(
+        api_key="secret", session=session, sleeper=waits.append,
+    )
+
+    assert client.get("eod-bulk", {"date": "2025-01-02"}).body == b"csv"
+    assert client._endpoint_min_intervals["eod-bulk"] == 10.0
+    assert client.logical_request_count == 1
+    assert client.request_count == 2
+
+
 def test_s3_resume_uses_manifest_and_head_without_downloading_payload(monkeypatch):
     object_uri = "s3://bronze/stock/fmp/eod-bulk/date=2026-07-31/response.csv"
     manifest_uri = "s3://bronze/stock/fmp/eod-bulk/date=2026-07-31/manifest.json"

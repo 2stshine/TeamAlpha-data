@@ -65,6 +65,7 @@ class FMPClient:
         session: requests.Session | None = None,
         max_attempts: int = 5,
         timeout: tuple[float, float] = (10.0, 180.0),
+        min_interval: float = 0.0,
         sleeper: Callable[[float], None] = time.sleep,
     ):
         self.api_key = api_key or os.environ.get("FMP_API_KEY")
@@ -73,7 +74,9 @@ class FMPClient:
         self.session = session or requests.Session()
         self.max_attempts = max_attempts
         self.timeout = timeout
+        self.min_interval = max(0.0, min_interval)
         self.sleeper = sleeper
+        self._last_request_started = 0.0
 
     def get(self, endpoint: str, params: dict[str, object] | None = None) -> RawResponse:
         endpoint = endpoint.strip("/")
@@ -81,6 +84,10 @@ class FMPClient:
         url = f"{BASE_URL}/{endpoint}"
         last_error: Exception | None = None
         for attempt in range(1, self.max_attempts + 1):
+            elapsed = time.monotonic() - self._last_request_started
+            if self._last_request_started and elapsed < self.min_interval:
+                self.sleeper(self.min_interval - elapsed)
+            self._last_request_started = time.monotonic()
             try:
                 # Header auth keeps the credential out of URLs, logs and manifests.
                 response = self.session.get(
@@ -258,7 +265,12 @@ def run_daily(day: str, dest: str = "s3") -> list[str]:
     target = datetime.strptime(day, "%Y%m%d").date()
     snapshot = target.isoformat()
     root = base_uri(dest)
-    client = FMPClient()
+    client = FMPClient(
+        max_attempts=20,
+        min_interval=float(
+            os.environ.get("FMP_BACKFILL_MIN_INTERVAL_SECONDS", "12.5")
+        ),
+    )
     paths = _collect_universe(client, root, snapshot)
     paths += collect_raw(
         client, root=root, endpoint="eod-bulk", params={"date": snapshot},

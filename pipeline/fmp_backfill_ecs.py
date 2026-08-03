@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 from pathlib import Path
 
 import boto3
@@ -71,9 +72,27 @@ def run_silver_year(year: int, *, resume: str | None = None) -> None:
     print(f"[fmp-backfill-ecs] silver complete year={year}", flush=True)
 
 
+def run_full(fromyear: int, toyear: int) -> None:
+    bronze_fmp.run_backfill(fromyear, toyear, dest="s3")
+    root = Path("/app/data")
+    for year in range(fromyear, toyear + 1):
+        # Fargate ephemeral storage is bounded. Each certified year is already
+        # durable in RDS, so discard only this task's downloaded cache before
+        # materializing the next year.
+        if root.exists():
+            shutil.rmtree(root)
+        run_silver_year(year)
+    print(
+        f"[fmp-backfill-ecs] full complete years={fromyear}-{toyear}",
+        flush=True,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("bronze", "silver-year"), required=True)
+    parser.add_argument(
+        "--phase", choices=("bronze", "silver-year", "full"), required=True,
+    )
     parser.add_argument("--from", dest="fromyear", type=int)
     parser.add_argument("--to", dest="toyear", type=int)
     parser.add_argument("--year", type=int)
@@ -83,10 +102,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.phase == "bronze":
+    if args.phase in {"bronze", "full"}:
         if args.fromyear is None or args.toyear is None:
-            raise SystemExit("bronze phase requires --from and --to")
-        bronze_fmp.run_backfill(args.fromyear, args.toyear, dest="s3")
+            raise SystemExit(f"{args.phase} phase requires --from and --to")
+        if args.phase == "full":
+            run_full(args.fromyear, args.toyear)
+        else:
+            bronze_fmp.run_backfill(args.fromyear, args.toyear, dest="s3")
         return
     if args.year is None:
         raise SystemExit("silver-year phase requires --year")

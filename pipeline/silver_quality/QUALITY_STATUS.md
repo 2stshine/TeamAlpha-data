@@ -1,6 +1,6 @@
 # Silver 데이터 품질 현황
 
-> 스냅샷: **2026-08-05 18:58 KST**, 운영 RDS 조회 및 ECS/CloudWatch
+> 스냅샷: **2026-08-05 22:00 KST**, 운영 RDS 조회 및 ECS/CloudWatch
 > 운영 로그 기준
 
 이 문서는 현재 Silver 품질 상태를 운영 데이터와 `dq_run`·`dq_result`·
@@ -9,7 +9,7 @@
 
 ## 결론
 
-- 현재 배포 ruleset: **1.22.1**, ECS daily task definition **94**
+- 현재 배포 ruleset: **1.22.1**, ECS daily task definition **96**
 - FMP 원자재 28종 2015~2026 백필: **CERTIFIED**, one-off task definition **95**
 - 최신 KRX/DART 증분: **CERTIFIED**, 대상일 `2026-08-04`
 - 최신 FMP 증분: **CERTIFIED**, 대상일 `2026-08-03`

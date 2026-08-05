@@ -88,7 +88,7 @@ jobs:
           )"
           echo "task_definition_arn=${TASK_DEFINITION_ARN}" >> "${GITHUB_OUTPUT}"
 
-      - name: Start and wait for commodity backfill
+      - name: Submit commodity backfill through production scheduler
         env:
           TASK_DEFINITION_ARN: ${{ steps.task.outputs.task_definition_arn }}
         run: |
@@ -120,8 +120,6 @@ jobs:
             --arg task_definition "${TASK_DEFINITION_ARN}" \
             '.EcsParameters.TaskDefinitionArn = $task_definition' \
             target.json > one-off-target.json
-          CLUSTER_ARN="$(jq -r '.Arn' target.json)"
-          STARTED_AFTER="$(date -u +%s)"
           RUN_AT="$(date -u -d '+90 seconds' '+%Y-%m-%dT%H:%M:%S')"
           aws scheduler update-schedule \
             --name "${SCHEDULE_NAME}" \
@@ -132,57 +130,9 @@ jobs:
             --target file://one-off-target.json \
             --state ENABLED > /dev/null
           echo "Scheduled one-off task at ${RUN_AT} UTC"
-
-          TASK_ARN=""
-          for _ in $(seq 1 45); do
-            task_arns="$({
-              aws ecs list-tasks --cluster "${CLUSTER_ARN}" \
-                --family "${ECS_TASK_FAMILY}" --desired-status RUNNING \
-                --query 'taskArns' --output text
-              aws ecs list-tasks --cluster "${CLUSTER_ARN}" \
-                --family "${ECS_TASK_FAMILY}" --desired-status STOPPED \
-                --query 'taskArns' --output text
-            } | tr '\t ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
-            if [[ -n "${task_arns}" ]]; then
-              TASK_ARN="$(
-                aws ecs describe-tasks --cluster "${CLUSTER_ARN}" \
-                  --tasks ${task_arns} --output json \
-                | jq -r \
-                    --arg task_definition "${TASK_DEFINITION_ARN}" \
-                    --argjson started_after "${STARTED_AFTER}" \
-                    '.tasks[]
-                     | select(.taskDefinitionArn == $task_definition)
-                     | select((.createdAt | fromdateiso8601) >= $started_after)
-                     | .taskArn' \
-                | head -1
-              )"
-            fi
-            if [[ -n "${TASK_ARN}" ]]; then break; fi
-            sleep 10
-          done
-          if [[ -z "${TASK_ARN}" ]]; then
-            echo "Scheduler did not start the one-off ECS task" >&2
-            exit 1
-          fi
+          # The deployment role can update Scheduler but intentionally cannot
+          # inspect or run ECS tasks. Keep the one-off expression active until
+          # comfortably after its firing time, then restore the daily schedule.
+          sleep 150
           restore_schedule
-          echo "Started ${TASK_ARN}"
-          for _ in $(seq 1 180); do
-            STATUS="$(
-              aws ecs describe-tasks --cluster "${CLUSTER_ARN}" \
-                --tasks "${TASK_ARN}" --query 'tasks[0].lastStatus' --output text
-            )"
-            if [[ "${STATUS}" == "STOPPED" ]]; then
-              break
-            fi
-            sleep 20
-          done
-          aws ecs describe-tasks --cluster "${CLUSTER_ARN}" \
-            --tasks "${TASK_ARN}" --output json > stopped.json
-          jq '{stopCode: .tasks[0].stopCode, stoppedReason: .tasks[0].stoppedReason,
-               containers: [.tasks[0].containers[] | {name, exitCode, reason}]}' stopped.json
-          EXIT_CODE="$(
-            jq -r --arg container "${CONTAINER_NAME}" \
-              '.tasks[0].containers[] | select(.name == $container) | .exitCode // -1' \
-              stopped.json
-          )"
-          test "${EXIT_CODE}" = "0"
+          echo "Commodity backfill submitted. Completion is recorded by the task's DQ run and SNS notification."

@@ -210,6 +210,7 @@ def test_commodity_collection_uses_only_28_allowlisted_series(tmp_path):
 
 def test_monday_daily_collects_sunday_futures_session(tmp_path, monkeypatch):
     captured = {}
+    monkeypatch.setenv("FMP_API_KEY", "test-key")
 
     def fake_collect(client, root, *, start, end, snapshot, daily):
         captured.update(

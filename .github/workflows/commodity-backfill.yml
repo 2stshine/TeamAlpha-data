@@ -94,36 +94,77 @@ jobs:
         run: |
           set -euo pipefail
           aws scheduler get-schedule \
-            --name "${SCHEDULE_NAME}" --query Target --output json > target.json
+            --name "${SCHEDULE_NAME}" --output json > schedule.json
+          jq '.Target' schedule.json > target.json
+          SCHEDULE_GROUP="$(jq -r '.GroupName // "default"' schedule.json)"
+          ORIGINAL_EXPRESSION="$(jq -r '.ScheduleExpression' schedule.json)"
+          ORIGINAL_TIMEZONE="$(jq -r '.ScheduleExpressionTimezone // "UTC"' schedule.json)"
+          ORIGINAL_STATE="$(jq -r '.State' schedule.json)"
+          RESTORED=false
+          restore_schedule() {
+            if [[ "${RESTORED}" == "true" ]]; then return; fi
+            aws scheduler update-schedule \
+              --name "${SCHEDULE_NAME}" \
+              --group-name "${SCHEDULE_GROUP}" \
+              --schedule-expression "${ORIGINAL_EXPRESSION}" \
+              --schedule-expression-timezone "${ORIGINAL_TIMEZONE}" \
+              --flexible-time-window '{"Mode":"OFF"}' \
+              --target file://target.json \
+              --state "${ORIGINAL_STATE}" > /dev/null
+            RESTORED=true
+            echo "Restored ${SCHEDULE_NAME} to ${ORIGINAL_EXPRESSION}"
+          }
+          trap restore_schedule EXIT
+
           jq \
             --arg task_definition "${TASK_DEFINITION_ARN}" \
-            '(
-              .EcsParameters.NetworkConfiguration.awsvpcConfiguration
-              // .EcsParameters.NetworkConfiguration.AwsvpcConfiguration
-            ) as $network
-            | {
-              cluster: .Arn,
-              taskDefinition: $task_definition,
-              launchType: (.EcsParameters.LaunchType // "FARGATE"),
-              platformVersion: (.EcsParameters.PlatformVersion // "LATEST"),
-              networkConfiguration: {
-                awsvpcConfiguration: {
-                  subnets: ($network.subnets // $network.Subnets),
-                  securityGroups: ($network.securityGroups // $network.SecurityGroups // []),
-                  assignPublicIp: ($network.assignPublicIp // $network.AssignPublicIp // "DISABLED")
-                }
-              },
-              startedBy: "github-commodity-backfill"
-            }' target.json > run-task.json
-          TASK_ARN="$(
-            aws ecs run-task --cli-input-json file://run-task.json \
-              --query 'tasks[0].taskArn' --output text
-          )"
-          if [[ -z "${TASK_ARN}" || "${TASK_ARN}" == "None" ]]; then
-            aws ecs run-task --cli-input-json file://run-task.json
+            '.EcsParameters.TaskDefinitionArn = $task_definition' \
+            target.json > one-off-target.json
+          CLUSTER_ARN="$(jq -r '.Arn' target.json)"
+          STARTED_AFTER="$(date -u +%s)"
+          RUN_AT="$(date -u -d '+90 seconds' '+%Y-%m-%dT%H:%M:%S')"
+          aws scheduler update-schedule \
+            --name "${SCHEDULE_NAME}" \
+            --group-name "${SCHEDULE_GROUP}" \
+            --schedule-expression "at(${RUN_AT})" \
+            --schedule-expression-timezone UTC \
+            --flexible-time-window '{"Mode":"OFF"}' \
+            --target file://one-off-target.json \
+            --state ENABLED > /dev/null
+          echo "Scheduled one-off task at ${RUN_AT} UTC"
+
+          TASK_ARN=""
+          for _ in $(seq 1 45); do
+            task_arns="$({
+              aws ecs list-tasks --cluster "${CLUSTER_ARN}" \
+                --family "${ECS_TASK_FAMILY}" --desired-status RUNNING \
+                --query 'taskArns' --output text
+              aws ecs list-tasks --cluster "${CLUSTER_ARN}" \
+                --family "${ECS_TASK_FAMILY}" --desired-status STOPPED \
+                --query 'taskArns' --output text
+            } | tr '\t ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+            if [[ -n "${task_arns}" ]]; then
+              TASK_ARN="$(
+                aws ecs describe-tasks --cluster "${CLUSTER_ARN}" \
+                  --tasks ${task_arns} --output json \
+                | jq -r \
+                    --arg task_definition "${TASK_DEFINITION_ARN}" \
+                    --argjson started_after "${STARTED_AFTER}" \
+                    '.tasks[]
+                     | select(.taskDefinitionArn == $task_definition)
+                     | select((.createdAt | fromdateiso8601) >= $started_after)
+                     | .taskArn' \
+                | head -1
+              )"
+            fi
+            if [[ -n "${TASK_ARN}" ]]; then break; fi
+            sleep 10
+          done
+          if [[ -z "${TASK_ARN}" ]]; then
+            echo "Scheduler did not start the one-off ECS task" >&2
             exit 1
           fi
-          CLUSTER_ARN="$(jq -r '.cluster' run-task.json)"
+          restore_schedule
           echo "Started ${TASK_ARN}"
           for _ in $(seq 1 180); do
             STATUS="$(

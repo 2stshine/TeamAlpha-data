@@ -1,4 +1,4 @@
-"""ECS daily: bronze 증분 수집 후 변경분만 내려받아 silver incremental 반영."""
+"""ECS daily: KRX·DART·FMP Bronze 증분을 수집해 Silver에 인증 반영."""
 from __future__ import annotations
 
 import os

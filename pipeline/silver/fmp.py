@@ -852,8 +852,15 @@ def prepare_commodities(
             trade_date = _parse_date(raw.get("date"))
             if trade_date is None:
                 continue
-            if target_date is not None and trade_date != target_date:
-                continue
+            if target_date is not None:
+                # A Monday daily load owns both the Sunday-evening futures
+                # session and Monday.  Equity/FX candidates remain restricted
+                # to target_date by their own normalizers.
+                accepted_dates = {target_date}
+                if target_date.weekday() == 0:
+                    accepted_dates.add(target_date - timedelta(days=1))
+                if trade_date not in accepted_dates:
+                    continue
             if year is not None and trade_date.year != year:
                 continue
             scale = spec.price_scale

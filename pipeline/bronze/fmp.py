@@ -532,7 +532,7 @@ def _collect_commodity_prices(
     for number, spec in enumerate(COMMODITY_SPECS, start=1):
         prefix = (
             f"commodities/fmp/eod/symbol={spec.symbol}/date={start.isoformat()}"
-            if daily
+            if daily and start == end
             else (
                 f"commodities/fmp/eod/symbol={spec.symbol}/"
                 f"from={start.isoformat()}/to={end.isoformat()}"
@@ -676,10 +676,16 @@ def run_daily(day: str, dest: str = "s3") -> list[str]:
         params={"symbol": "USDKRW", "from": snapshot, "to": snapshot},
         prefix=f"fx/fmp/pair=USDKRW/date={snapshot}", extension="json",
     )
+    # FMP labels Sunday-evening futures observations with the Sunday calendar
+    # date.  When the completed equity target is Monday, include Sunday so the
+    # valid opening session is not skipped by the daily incremental pipeline.
+    commodity_start = (
+        target - timedelta(days=1) if target.weekday() == 0 else target
+    )
     paths += _collect_commodity_prices(
         client,
         root,
-        start=target,
+        start=commodity_start,
         end=target,
         snapshot=snapshot,
         daily=True,

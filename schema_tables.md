@@ -34,7 +34,7 @@ erDiagram
 |---|---|
 | `asset_id` | `asset` FK |
 | `source` | `KRX`, `DART`, `FMP` |
-| `identifier` | ticker, corp code, CIK, CUSIP, ISIN, FX pair 값 |
+| `identifier` | ticker, corp code, CIK, CUSIP, ISIN, FX pair, 원자재 심볼 값 |
 | `identifier_type` | 식별자 종류 |
 | `valid_from`, `valid_to` | 심볼 변경·재사용을 표현하는 유효기간 |
 | `quality_run_id`, `loaded_at` | 인증 실행과 적재 시각 |
@@ -69,7 +69,10 @@ FMP 원자재는 제공자 연속선물 시계열이며 `source='FMP_COMMODITY'`
 `USX` 원천 가격은 100으로 나눠 USD로 표준화하고 자산별 `price_unit`을 함께
 사용해야 한다. `adj_close=close`, `total_return_close=NULL`이며 주식용 기업행사
 조정을 적용하지 않는다. 선물은 음수가 가능하므로 유한값과 OHLC 순서는 강제하되
-양수 제약은 적용하지 않는다.
+양수 제약은 적용하지 않는다. FMP가 일요일 날짜로 제공하는 야간 선물 세션은 정상
+행으로 유지한다. 토요일 원천행은 Bronze에 보존하고 Silver에서 제외하며
+`FMP_COMMODITY_NON_SESSION_EXCLUDED`로 기록한다. 월요일 daily 후보는 일요일과
+월요일 세션을 함께 처리한다.
 
 ## 4. fundamental
 

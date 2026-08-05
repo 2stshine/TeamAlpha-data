@@ -208,6 +208,40 @@ def test_commodity_collection_uses_only_28_allowlisted_series(tmp_path):
     assert requested == [spec.symbol for spec in COMMODITY_SPECS]
 
 
+def test_monday_daily_collects_sunday_futures_session(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_collect(client, root, *, start, end, snapshot, daily):
+        captured.update(
+            start=start, end=end, snapshot=snapshot, daily=daily,
+        )
+        return []
+
+    latest = tmp_path / "latest.json"
+    latest.write_bytes(b"[]")
+
+    def fake_collect_raw(*args, **kwargs):
+        if kwargs.get("endpoint") == "latest-financial-statements":
+            return [str(latest)]
+        return []
+
+    monkeypatch.setattr(fmp, "_collect_universe", lambda *args: [])
+    monkeypatch.setattr(fmp, "collect_raw", fake_collect_raw)
+    monkeypatch.setattr(fmp, "_collect_calendar_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(fmp, "_collect_market_metadata", lambda *args: [])
+    monkeypatch.setattr(fmp, "_collect_commodity_prices", fake_collect)
+    monkeypatch.setattr(fmp, "base_uri", lambda dest: str(tmp_path))
+
+    fmp.run_daily("20260803", "local")
+
+    assert captured == {
+        "start": date(2026, 8, 2),
+        "end": date(2026, 8, 3),
+        "snapshot": "2026-08-03",
+        "daily": True,
+    }
+
+
 def test_universe_collects_all_screener_and_delisted_pages(tmp_path):
     screener_full = json.dumps([
         {"symbol": f"S{i}"} for i in range(fmp.SCREENER_PAGE_SIZE)

@@ -1,5 +1,5 @@
 -- TeamAlpha silver 스키마 (PostgreSQL/RDS) — schema_tables.md 와 1:1
--- asset_id 를 중심으로 가격·재무를 연결. source 컬럼·asset_identifier 로 소스 추가에 열려 있음.
+-- asset_id 를 중심으로 가격·재무·기업행사를 연결. source 컬럼·asset_identifier 로 소스 추가에 열려 있음.
 
 -- 품질 실행 이력. Silver 행은 통과한 quality_run_id와 연결된다.
 CREATE TABLE IF NOT EXISTS dq_run (
@@ -107,8 +107,8 @@ ALTER TABLE asset ADD COLUMN IF NOT EXISTS price_unit TEXT;
 -- 2. asset_identifier — 소스별 종목코드 매핑 (소스 추가 확장점)
 CREATE TABLE IF NOT EXISTS asset_identifier (
     asset_id   BIGINT NOT NULL REFERENCES asset(asset_id) ON DELETE CASCADE,
-    source     TEXT NOT NULL,          -- 'KRX' | 'DART' | (향후 'YAHOO'·'SEC'…)
-    identifier TEXT NOT NULL,          -- KRX='005930', DART='00126380'
+    source     TEXT NOT NULL,          -- 'KRX' | 'DART' | 'FMP'
+    identifier TEXT NOT NULL,          -- ticker/corp code/CIK/CUSIP/ISIN/FX pair/원자재 심볼
     identifier_type TEXT NOT NULL DEFAULT 'ticker',
     valid_from DATE NOT NULL DEFAULT DATE '0001-01-01',
     valid_to DATE,
@@ -122,7 +122,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_asset_identifier_current
     ON asset_identifier(source, identifier_type, identifier)
     WHERE valid_to IS NULL AND identifier_type <> 'cik';
 
--- 3. price_daily — 일봉 (주식 + 지수 공용). shares/market_cap 흡수.
+-- 3. price_daily — 주식·지수·FX·원자재 일봉. shares/market_cap 흡수.
 CREATE TABLE IF NOT EXISTS price_daily (
     asset_id      BIGINT NOT NULL REFERENCES asset(asset_id) ON DELETE CASCADE,
     source        TEXT NOT NULL,       -- 가격 출처 (예: 'KRX')
@@ -140,7 +140,7 @@ CREATE TABLE IF NOT EXISTS price_daily (
     trading_value NUMERIC(30,4),
     shares        BIGINT,              -- 상장주식수 (index는 NULL)
     market_cap    NUMERIC(30,4),       -- 시가총액. FMP는 원천에 없으면 NULL
-    market        TEXT,                -- 'KOSPI' | 'KOSDAQ' | 'KONEX' (index는 NULL). 날짜별 값 — 아래 참고
+    market        TEXT,                -- 주식시장 또는 'FX'; 지수·원자재는 NULL. 날짜별 값 — 아래 참고
     quality_run_id UUID REFERENCES dq_run(run_id),
     loaded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (asset_id, source, trade_date)

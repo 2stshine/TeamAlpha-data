@@ -20,7 +20,8 @@ source-aware 검사를 거친다.
 FMP commodities는 금융선물과 micro 중복을 제외한 28개 물리 원자재 연속선물만
 허용한다. `USX`는 USD로 단위 변환하며, 선물 가격은 음수가 가능하므로 양수 대신
 유한값과 OHLC 순서를 검사한다. 20% 초과 일간 변동은 원천을 보존한 채 잠재적
-롤오버 warning으로 누적한다.
+롤오버 warning으로 누적한다. 일요일 날짜의 야간 선물 세션은 유지하고, 토요일
+원천행은 Bronze에만 남긴 뒤 Silver 제외 사실을 `MODIFIED`로 기록한다.
 
 FMP 전용 핵심 규칙은 다음과 같다.
 
@@ -34,6 +35,8 @@ FMP 전용 핵심 규칙은 다음과 같다.
 | `FMP_COMMODITY_UNIVERSE_COMPLETE` | Critical | 물리·비 micro 원자재 28개가 정확히 존재 |
 | `FMP_COMMODITY_PROVIDER_LIST` | Critical | FMP 목록의 심볼·원천 통화가 allowlist와 일치 |
 | `FMP_COMMODITY_PRICE_SEMANTICS` | Error | USD 단위, `adj_close=close`, 주식 전용 필드 NULL |
+| `FMP_COMMODITY_WEEKDAY` | Error | 일~금 세션 날짜만 허용하고 토요일 행 차단 |
+| `FMP_COMMODITY_NON_SESSION_EXCLUDED` | Modified | Bronze의 토요일 원천행을 Silver에서 제외한 건수 |
 | `FMP_COMMODITY_POSSIBLE_ROLL` | Warning | 절대 일간 변동 20% 초과, 원천값 보존 |
 
 **등급**

@@ -99,7 +99,8 @@ rank         = 같은 날짜 KOSPI·KOSDAQ 유니버스 내 value 내림차순 �
 
 ```bash
 psql "$SILVER_DB_URL" -v ON_ERROR_STOP=1 -f sql/gold_schema.sql
-uv run pytest -q tests/gold/test_gold_schema.py
+psql "$SILVER_DB_URL" -v ON_ERROR_STOP=1 -c \
+  "SELECT table_name FROM information_schema.tables WHERE table_schema='gold' ORDER BY table_name;"
 ```
 
 DDL은 idempotent하며 `gold.active_factor_catalog` view는 현재 `APPROVED`인 버전만

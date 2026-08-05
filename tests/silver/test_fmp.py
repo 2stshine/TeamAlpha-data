@@ -408,6 +408,36 @@ def test_commodities_keep_sunday_sessions_and_exclude_saturday_rows(tmp_path):
     assert modified.actual == "affected_rows=1"
 
 
+def test_monday_daily_commodity_candidate_includes_sunday_session(tmp_path):
+    _commodity_list(tmp_path, "2026-08-03")
+    path = (
+        tmp_path
+        / "commodities/fmp/eod/symbol=ZRUSD/"
+        "from=2026-08-02/to=2026-08-03/response.json"
+    )
+    _write(path, json.dumps([
+        {
+            "symbol": "ZRUSD", "date": "2026-08-02",
+            "open": 10.0, "high": 10.2, "low": 9.9,
+            "close": 10.1, "volume": 20,
+        },
+        {
+            "symbol": "ZRUSD", "date": "2026-08-03",
+            "open": 10.1, "high": 10.3, "low": 10.0,
+            "close": 10.2, "volume": 30,
+        },
+    ]).encode())
+    _manifest(path)
+
+    _, _, prices, _ = fmp.prepare_commodities(
+        str(tmp_path), target_date=date(2026, 8, 3),
+    )
+
+    assert prices["trade_date"].tolist() == [
+        date(2026, 8, 2), date(2026, 8, 3),
+    ]
+
+
 def test_universe_excludes_same_issuer_nasdaq_suffix_instruments(tmp_path):
     rows = []
     for symbol, name in (

@@ -26,15 +26,25 @@ KRX OpenAPI / OpenDART / marcap / FMP stable API
   source-aware 품질 게이트를 통과한 데이터만 publish합니다.
 - **gold**: 팩터 정의·버전·평가와 종목별 값·순위, 팩터 간 상관관계를 저장합니다.
   현재 12-1 모멘텀 계산 SQL이 구현되어 있으며 평가 기준은 아직 확정 전입니다.
-- **운영 스케줄**: 화~토 오전 08:30 KST에 실행해 전날 KRX 데이터를 적재합니다.
+- **운영 스케줄**: 화~토 오전 08:30 KST에 실행해 전날 KRX와 완료된 FMP
+  세션 데이터를 적재합니다.
 - **자동 배포**: `main` 브랜치에 push하면 GitHub Actions가 ECR/ECS/Scheduler를 갱신합니다.
 - **결과 알림**: daily ECS task가 종료되면 SNS 이메일로 성공/실패 결과를 받습니다.
+
+현재 운영 스냅샷은 2026-08-05 기준 ruleset `1.22.1`이며, FMP 물리 원자재
+연속선물 28종의 2015~2026 Bronze/Silver 백필이 인증 완료됐습니다. 최신 행 수,
+기간, warning과 DQ run ID는
+[`pipeline/silver_quality/QUALITY_STATUS.md`](pipeline/silver_quality/QUALITY_STATUS.md)에
+기록합니다.
 
 ## 폴더 구조
 
 ```text
 .
-├── .github/workflows/deploy.yml  # GitHub Actions 자동 배포
+├── .github/workflows/            # 자동 배포·테스트·원자재 one-off
+│   ├── deploy.yml
+│   ├── test.yml
+│   └── commodity-backfill.yml
 ├── deploy/Dockerfile             # ECS/Fargate 실행 이미지
 ├── pipeline/                     # Bronze 수집, Silver 적재, Gold 계산 코드
 │   ├── bronze/                   # S3 bronze 원천 데이터 수집기
@@ -214,8 +224,8 @@ bronze 원칙:
 - 값은 원천 응답 그대로 저장합니다.
 - FMP 글로벌/broad 응답을 미국 주식만 골라 다시 쓰지 않습니다. `response.*`와
   SHA-256·요청정보만 담은 별도 `manifest.json`을 저장하며 API key는 기록하지 않습니다.
-- FMP commodities 목록 40개는 원문 그대로 보존합니다. 가격은 금융선물 10개와
-  금·은 micro 중복 2개를 제외한 물리 원자재 연속선물 28개만 수집합니다.
+- FMP commodities 전체 목록은 원문 그대로 보존합니다. 가격은 금융선물과
+  micro 중복을 제외한 물리 원자재 연속선물 28개만 수집합니다.
 - FMP 과거 가격은 XNYS의 실제 완료 거래일만 대상으로 `eod-bulk`를 날짜당 한 번
   호출합니다. 현재 미국 세션과 미래 날짜를 빈 immutable 파티션으로 확정하지 않습니다.
 - 재개 시 S3 payload 전체를 다시 내려받지 않고 완료 manifest와 객체 크기로 빠르게
@@ -293,7 +303,10 @@ FMP 원자재는 `asset_type=commodity`,
 `FMP_COMMODITY`를 사용합니다. FMP의 `USX`(미국 센트) 가격은 Silver에서 USD로
 나눠 표준화하고 `asset.price_unit`에 `USD/barrel`, `USD/bushel` 같은 단위를
 기록합니다. 선물에는 분할·배당 조정을 적용하지 않아 `adj_close=close`,
-`total_return_close=NULL`이며 롤오버 가능 급변은 값을 고치지 않고 warning으로 남깁니다.
+`total_return_close=NULL`입니다. FMP가 일요일 날짜로 제공하는 야간 선물 세션은
+유지하고, 거래 세션이 아닌 토요일 행과 OHLC 불일치 행은 Bronze에 보존하되
+Silver에서 제외해 `MODIFIED`로 기록합니다. 롤오버 가능 급변은 값을 고치지 않고
+warning으로 남깁니다.
 
 컬럼별 상세 설계는 [schema_tables.md](schema_tables.md)와 [sql/schema.sql](sql/schema.sql)를 참고합니다.
 
@@ -354,7 +367,9 @@ python -m pipeline.daily_full
 3. 필요한 S3 객체만 ECS 컨테이너의 `/app/data`로 다운로드합니다.
 4. KRX/DART Silver 후보를 생성하고 자동 품질 검사를 수행합니다.
 5. Critical/Error가 없을 때만 대상 날짜 교체와 upsert를 하나의 transaction으로 반영합니다.
-6. 완료된 직전 미국 세션의 FMP Bronze와 Silver를 별도 transaction으로 처리합니다.
+6. 완료된 직전 미국 세션의 FMP 주식·재무·기업행사·USDKRW와 원자재 28종을
+   Bronze/Silver 별도 transaction으로 처리합니다. 월요일 target에는 일요일 야간
+   선물 세션도 함께 조회·교체합니다.
 7. 실패하면 이미 인증된 Silver는 유지하고 `dq_run`·`dq_result`에 원인을 기록합니다.
 8. 인증된 증분 warning은 `dq_warning_state`에 누적하고, 같은 변경 파티션의 재검사가
    PASS일 때만 해소합니다. 미해결 warning은 `dq_open_warning`에서 바로 조회합니다.
@@ -476,6 +491,13 @@ uv run python -m pipeline.fmp_backfill_ecs --phase commodities --from 2015 --to 
 `silver-range`는 FMP API를 다시 호출하지 않고 S3 Bronze만 내려받아 연도별
 RDS transaction을 순차 실행한다.
 
+원자재 28종 전체 백필은 GitHub Actions의
+[`commodity-backfill.yml`](.github/workflows/commodity-backfill.yml)을 수동 실행할
+수도 있습니다. 운영 배포 role에 ECS `RunTask` 권한을 추가하지 않기 위해 workflow가
+Scheduler를 잠시 one-off task definition으로 바꿔 한 번 실행한 뒤 원래 daily
+스케줄로 복원합니다. workflow 성공은 **제출과 스케줄 복원 성공**을 뜻하며, 실제
+적재 완료는 ECS exit code, SNS 알림과 `dq_run`의 `CERTIFIED` 상태로 확인합니다.
+
 기존 DART 배당·기업행사 Bronze와 KRX 누락일을 Silver에 반영하는 ECS용 진입점:
 
 ```bash
@@ -534,7 +556,10 @@ docker buildx build \
 
 ## 자동 배포
 
-자동 배포는 [.github/workflows/deploy.yml](.github/workflows/deploy.yml)에서 관리합니다.
+자동 배포는 [.github/workflows/deploy.yml](.github/workflows/deploy.yml)에서,
+수동 원자재 백필은
+[.github/workflows/commodity-backfill.yml](.github/workflows/commodity-backfill.yml)에서
+관리합니다.
 
 `main` 브랜치에 push하면 다음 작업이 실행됩니다.
 
@@ -597,4 +622,5 @@ push 전 확인:
 ```bash
 git status --short
 uv run python -m compileall -q pipeline
+uv run pytest -q
 ```

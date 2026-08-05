@@ -5,7 +5,7 @@ import argparse
 import hashlib
 import json
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -144,6 +144,12 @@ def _publish(
                 "AND trade_date=%s",
                 (target_date,),
             )
+            if target_date.weekday() == 0:
+                cur.execute(
+                    "DELETE FROM price_daily "
+                    "WHERE source='FMP_COMMODITY' AND trade_date=%s",
+                    (target_date - timedelta(days=1),),
+                )
     fmp.publish_prices(conn, bundle.prices, identifier_map, context.run_id)
     fmp.publish_fundamentals(
         conn, bundle.fundamentals, identifier_map, context.run_id,

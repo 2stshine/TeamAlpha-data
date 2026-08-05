@@ -1,7 +1,7 @@
 [project]
 name = "teamalpha-data"
 version = "0.1.0"
-description = "KRX·DART 데이터 파이프라인 — bronze(S3) 수집 + silver(RDS) 정규화 (배치)"
+description = "KRX·DART·FMP Bronze/Silver와 Gold 팩터를 운영하는 배치 데이터 파이프라인"
 requires-python = ">=3.12"
 dependencies = [
     "pandas",

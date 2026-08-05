@@ -97,16 +97,20 @@ jobs:
             --name "${SCHEDULE_NAME}" --query Target --output json > target.json
           jq \
             --arg task_definition "${TASK_DEFINITION_ARN}" \
-            '{
+            '(
+              .EcsParameters.NetworkConfiguration.awsvpcConfiguration
+              // .EcsParameters.NetworkConfiguration.AwsvpcConfiguration
+            ) as $network
+            | {
               cluster: .Arn,
               taskDefinition: $task_definition,
               launchType: (.EcsParameters.LaunchType // "FARGATE"),
               platformVersion: (.EcsParameters.PlatformVersion // "LATEST"),
               networkConfiguration: {
                 awsvpcConfiguration: {
-                  subnets: .EcsParameters.NetworkConfiguration.AwsvpcConfiguration.Subnets,
-                  securityGroups: (.EcsParameters.NetworkConfiguration.AwsvpcConfiguration.SecurityGroups // []),
-                  assignPublicIp: (.EcsParameters.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp // "DISABLED")
+                  subnets: ($network.subnets // $network.Subnets),
+                  securityGroups: ($network.securityGroups // $network.SecurityGroups // []),
+                  assignPublicIp: ($network.assignPublicIp // $network.AssignPublicIp // "DISABLED")
                 }
               },
               startedBy: "github-commodity-backfill"

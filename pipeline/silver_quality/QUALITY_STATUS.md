@@ -1,6 +1,7 @@
 # Silver 데이터 품질 현황
 
-> 스냅샷: **2026-08-05 17:03 KST**, 운영 RDS 읽기 전용 조회 기준
+> 스냅샷: **2026-08-05 18:58 KST**, 운영 RDS 조회 및 ECS/CloudWatch
+> 운영 로그 기준
 
 이 문서는 현재 Silver 품질 상태를 운영 데이터와 `dq_run`·`dq_result`·
 `dq_warning_state`에서 다시 집계한 결과다. 최신 증분 검사와 전체 역사 감사는 검사
@@ -8,7 +9,8 @@
 
 ## 결론
 
-- 현재 배포 ruleset: **1.21.0**, ECS daily task definition **88**
+- 현재 배포 ruleset: **1.22.1**, ECS daily task definition **94**
+- FMP 원자재 28종 2015~2026 백필: **CERTIFIED**, one-off task definition **95**
 - 최신 KRX/DART 증분: **CERTIFIED**, 대상일 `2026-08-04`
 - 최신 FMP 증분: **CERTIFIED**, 대상일 `2026-08-03`
 - 마지막 전체 역사 감사: **CERTIFIED**, 차단 Critical/Error 실패 **0**
@@ -19,6 +21,28 @@
 
 현재 데이터는 전략 개발에 사용할 수 있는 인증 상태다. 다만 Warning은 원천값을
 보존한 검토 대상이며, 아래 항목을 해소된 데이터로 간주하면 안 된다.
+
+## FMP 원자재 백필
+
+| 항목 | 결과 |
+|---|---|
+| 대상 | 물리 원자재 연속선물 28종 |
+| 기간 | `2015-01-01`~`2026-08-05` |
+| Bronze | 28/28, 객체 58개, rate limit 0 |
+| Silver 가격 | 82,960행, 자산 28개 |
+| parent run ID | `60f63dc8-5d39-4fc6-911c-e4c40ca3fe74` |
+| ruleset | `1.22.1` |
+| 상태 | `CERTIFIED` |
+| ECS | task definition `95`, exit code `0` |
+
+2015~2026의 12개 연도 가격 파티션과 `asset:commodity` 파티션이 모두
+인증됐다. FMP가 제공하는 일요일 저녁 선물 세션 657건은 정상 세션으로 유지했다.
+거래 세션이 아닌 Saturday 원천행 30건과 OHLC 불일치 원천행 140건은 Bronze에
+보존하고 Silver에서는 제외했으며 `MODIFIED` 결과로 기록한다.
+
+`FMP_COMMODITY_POSSIBLE_ROLL`은 만기 롤오버로 추정되는 일간 20% 초과 변동을
+보존·추적하는 비차단 Warning이다. Critical/Error 실패는 없으며 모든 연도
+파티션이 publish됐다.
 
 ## 최신 일별 증분 검사
 
@@ -114,6 +138,7 @@ FMP daily의 OPEN warning은 0건이다.
 | KRX | 6,769,289 | 3,303 | 2015-01-02~2026-08-04 |
 | FMP | 14,505,614 | 8,718 | 2015-01-02~2026-08-03 |
 | FMP_FX | 3,094 | 1 | 2015-01-01~2026-08-03 |
+| FMP_COMMODITY | 82,960 | 28 | 2015-01-01~2026-08-05 |
 
 ### 재무·배당 지표
 

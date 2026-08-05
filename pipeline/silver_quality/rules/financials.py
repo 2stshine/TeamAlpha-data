@@ -7,7 +7,7 @@ from pipeline.silver_quality.models import CheckResult, CheckStatus, Severity
 from pipeline.silver_quality.rules.common import duplicate_keys, null_keys, result
 
 FUNDAMENTAL_KEYS = [
-    "identifier", "source", "period_end", "fiscal_period",
+    "identifier", "source", "statement_type", "data_basis", "period_end", "fiscal_period",
     "fs_type", "revision_key", "metric",
 ]
 
@@ -17,6 +17,23 @@ def check_financials(
     partition_key: str | None = None,
     source_inconsistency: dict | None = None,
 ) -> list[CheckResult]:
+    # Older unit-test fixtures and persisted candidate artifacts predate v2
+    # discriminator columns. Normalize them before applying the v1.18 rules.
+    df = df.copy()
+    if "statement_type" not in df:
+        bs_metrics = {
+            "total_assets", "current_assets", "noncurrent_assets",
+            "total_liabilities", "current_liabilities",
+            "noncurrent_liabilities", "total_equity", "capital_stock",
+            "retained_earnings",
+        }
+        df["statement_type"] = df["metric"].map(
+            lambda metric: "BS" if metric in bs_metrics else "IS"
+        )
+    if "data_basis" not in df:
+        df["data_basis"] = "STANDARDIZED"
+    if "unit_type" not in df:
+        df["unit_type"] = "currency"
     checks = [
         null_keys(
             df, "fundamental",
@@ -28,9 +45,11 @@ def check_financials(
     if df.empty:
         return checks
 
+    dividend = df["statement_type"].eq("DIVIDEND")
     enum_bad = df[
         ~df["fiscal_period"].isin(["FY", "Q1", "Q2", "Q3", "Q4"])
         | ~df["fs_type"].isin(["CFS", "OFS"])
+        & ~(dividend & df["fs_type"].eq("UNKNOWN"))
         | ~df["currency"].astype(str).str.fullmatch(r"[A-Z]{3}")
     ]
     checks.append(result(
@@ -62,7 +81,8 @@ def check_financials(
         partition_key=partition_key,
     ))
 
-    pivot = df.pivot_table(
+    accounting_df = df[~dividend]
+    pivot = accounting_df.pivot_table(
         index=filing_scope,
         columns="metric",
         values="value",
@@ -88,8 +108,8 @@ def check_financials(
             ],
             names=all_bad_idx.names,
         )
-        source_index = pd.MultiIndex.from_frame(df[filing_scope])
-        accounting_bad = df[source_index.isin(bad_idx)]
+        source_index = pd.MultiIndex.from_frame(accounting_df[filing_scope])
+        accounting_bad = accounting_df[source_index.isin(bad_idx)]
         accounting_scopes = pivot.loc[bad_idx].reset_index()
         accounting_scopes["relative_error"] = rel.loc[bad_idx].to_numpy()
     else:
@@ -145,18 +165,22 @@ def check_financials(
     ))
 
     major = {"total_assets", "revenue", "net_income"}
-    scope_metrics = (
-        df.groupby(filing_scope, dropna=False)["metric"]
-        .agg(lambda values: sorted(set(values)))
-        .rename("present_metrics")
-        .reset_index()
-    )
-    missing_major_scopes = scope_metrics[
-        ~scope_metrics["present_metrics"].map(
-            lambda values: bool(set(values) & major)
+    if accounting_df.empty:
+        scope_metrics = pd.DataFrame(
+            columns=[*filing_scope, "present_metrics"],
         )
-    ]
-    source_index = pd.MultiIndex.from_frame(df[filing_scope])
+    else:
+        scope_metrics = (
+            accounting_df.groupby(filing_scope, dropna=False)["metric"]
+            .agg(lambda values: sorted(set(values)))
+            .rename("present_metrics")
+            .reset_index()
+        )
+    covered_major = scope_metrics["present_metrics"].map(
+        lambda values: bool(set(values) & major)
+    ).astype(bool)
+    missing_major_scopes = scope_metrics.loc[~covered_major]
+    source_index = pd.MultiIndex.from_frame(accounting_df[filing_scope])
     missing_index = pd.MultiIndex.from_frame(
         missing_major_scopes[filing_scope]
     )
@@ -187,4 +211,37 @@ def check_financials(
         samples=major_samples,
         partition_key=partition_key,
     ))
+    if dividend.any():
+        dividend_rows = df[dividend]
+        specs = {
+            "total_cash_dividend": "currency",
+            "payout_ratio": "percent",
+            "dividend_yield": "percent",
+            "cash_dividend_per_share": "per_share",
+            "stock_dividend_per_share": "shares",
+        }
+        bad_dividend = dividend_rows[
+            ~dividend_rows["metric"].isin(specs)
+            | dividend_rows.apply(
+                lambda row: specs.get(row["metric"]) != row["unit_type"],
+                axis=1,
+            )
+        ]
+        checks.append(result(
+            "DIVIDEND_METRIC_UNIT", "fundamental", Severity.ERROR,
+            bad_dividend, "known dividend metric with its canonical unit_type",
+            partition_key=partition_key,
+        ))
+        nonnegative = dividend_rows[
+            dividend_rows["metric"].isin({
+                "total_cash_dividend", "dividend_yield",
+                "cash_dividend_per_share", "stock_dividend_per_share",
+            })
+            & pd.to_numeric(dividend_rows["value"], errors="coerce").lt(0)
+        ]
+        checks.append(result(
+            "DIVIDEND_NONNEGATIVE", "fundamental", Severity.WARNING,
+            nonnegative, "cash amount, yield and per-share dividend >= 0",
+            partition_key=partition_key,
+        ))
     return checks

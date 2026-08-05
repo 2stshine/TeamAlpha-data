@@ -12,9 +12,8 @@ JSON API:
   stkExtrDecsn.json      주식교환·이전
 
 document.xml은 이름과 달리 공시 원문 ZIP binary를 반환한다. 액면분할·병합,
-권리락·배당락처럼 가격조정 효력일·비율 확인이 필요하지만 전용 구조화 API가
-없는 거래소 공시에만 사용한다. 배당결정, 변경상장, 거래정지·상장폐지는
-목록 JSON만 보존한다.
+권리락·배당락과 현금·현물배당결정처럼 효력일·금액 확인에 원문이 필요한
+공시에 사용한다. 변경상장, 거래정지·상장폐지는 목록 JSON만 보존한다.
 
 저장:
   corporate_actions/dart/disclosures/year=YYYY/date=YYYY-MM-DD/
@@ -256,12 +255,12 @@ DOCUMENT_KEYWORDS = (
     "주식병합",
     "권리락",
     "배당락",
+    "현금현물배당결정",
 )
 
 # 목록 JSON만으로 공시 발생과 접수일을 보존한다. 가격조정 효력일·비율을
 # 확인해야 하는 위 DOCUMENT_KEYWORDS만 원문 ZIP을 추가 다운로드한다.
 DISCLOSURE_ONLY_KEYWORDS = (
-    "현금현물배당결정",
     "변경상장",
     "신규상장",
     "재상장",
@@ -520,6 +519,8 @@ def run(
     download_documents: bool = True,
     include_dependencies: bool = False,
     dependency_fromdate: str | None = None,
+    document_shard_index: int | None = None,
+    document_shard_count: int | None = None,
 ) -> list[str]:
     """기간 내 기업행사 원본을 수집하고 Silver 입력 URI를 반환한다.
 
@@ -530,6 +531,14 @@ def run(
     api_key = os.environ.get("DART_API_KEY")
     if not api_key:
         raise SystemExit("DART_API_KEY 환경변수가 없습니다 (.env 확인)")
+    if (document_shard_index is None) != (document_shard_count is None):
+        raise ValueError("document shard index/count must be provided together")
+    if document_shard_count is not None and (
+        document_shard_count < 1
+        or document_shard_index is None
+        or not 0 <= document_shard_index < document_shard_count
+    ):
+        raise ValueError("invalid document shard index/count")
     base = base_uri(dest)
     corps = financials.ensure_corp_code_xml(base)
     corp_to_stock = dict(corps)
@@ -725,11 +734,13 @@ def run(
                 changed_paths.append(structured_marker)
 
         if download_documents:
+            # v2는 현금·현물배당결정 원문을 추가한다. 기존 v1 완료 marker가
+            # 있어도 한 번 더 후보를 검사하되 이미 받은 ZIP은 재사용한다.
             documents_marker = _manifest_path(
                 base,
                 fromdate,
                 todate,
-                "documents_complete",
+                "documents_complete_v2",
             )
             if writer.exists(documents_marker):
                 print(
@@ -760,6 +771,21 @@ def run(
                         unavailable_path
                     ):
                         missing_documents.append((rcept_no, path))
+                total_missing_documents = len(missing_documents)
+                if document_shard_count is not None:
+                    missing_documents = [
+                        item
+                        for item in missing_documents
+                        if int(item[0]) % document_shard_count
+                        == document_shard_index
+                    ]
+                    print(
+                        "[corporate-actions] document shard "
+                        f"{document_shard_index + 1}/{document_shard_count} "
+                        f"selected={len(missing_documents)}/"
+                        f"{total_missing_documents}",
+                        flush=True,
+                    )
                 for document_no, (rcept_no, path) in enumerate(
                     missing_documents,
                     start=1,
@@ -791,17 +817,21 @@ def run(
                             flush=True,
                         )
                     time.sleep(CALL_GAP_SEC)
-                marker = {
-                    "status": "COMPLETE",
-                    "fromdate": fromdate,
-                    "todate": todate,
-                    "candidate_count": len(document_candidates),
-                    "requested_count": len(missing_documents),
-                    "downloaded_count": document_calls,
-                    "unavailable_count": unavailable_documents,
-                }
-                if writer.save_json(marker, documents_marker):
-                    changed_paths.append(documents_marker)
+                # Shards deliberately do not claim global completion.  A final
+                # unsharded resume sees no missing documents and writes the
+                # single authoritative v2 marker.
+                if document_shard_count is None:
+                    marker = {
+                        "status": "COMPLETE",
+                        "fromdate": fromdate,
+                        "todate": todate,
+                        "candidate_count": len(document_candidates),
+                        "requested_count": len(missing_documents),
+                        "downloaded_count": document_calls,
+                        "unavailable_count": unavailable_documents,
+                    }
+                    if writer.save_json(marker, documents_marker):
+                        changed_paths.append(documents_marker)
     finally:
         writer.close()
 
@@ -829,6 +859,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="전용 API 없는 공시의 ZIP 원문 다운로드 생략",
     )
+    parser.add_argument("--document-shard-index", type=int)
+    parser.add_argument("--document-shard-count", type=int)
     return parser.parse_args()
 
 
@@ -839,6 +871,8 @@ def main() -> None:
         args.todate,
         args.dest,
         download_documents=not args.no_documents,
+        document_shard_index=args.document_shard_index,
+        document_shard_count=args.document_shard_count,
     )
 
 

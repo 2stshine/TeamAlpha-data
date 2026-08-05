@@ -189,7 +189,12 @@ corporate_actions/
       from=YYYYMMDD/to=YYYYMMDD/
         disclosures.json
         structured_complete.json
-        documents_complete.json
+        documents_complete_v2.json
+
+dividends/dart/alot-matter/
+  year=YYYY/report=<보고서코드>/corp=<ticker>/rcept=<접수번호>/
+    response.json                 # API 응답 byte-for-byte
+    manifest.json                 # 요청정보·크기·SHA-256, API key 제외
 
 stock/fmp/
   universe/                         # stock-list, screener, profile bulk 원문
@@ -197,6 +202,9 @@ stock/fmp/
 financials/fmp/                     # 글로벌 bulk + 변경 종목별 JSON 원문
 corporate_actions/fmp/              # 배당·분할 calendar 전체 응답
 fx/fmp/pair=USDKRW/                 # USD/KRW 원문
+commodities/fmp/
+  list/snapshot_date=YYYY-MM-DD/     # FMP 전체 commodities 목록 원문
+  eod/symbol=<symbol>/               # 허용된 28개 연속선물 OHLCV 원문
 market/fmp/                         # 미국 거래소 시간·휴일 원문
 ```
 
@@ -206,12 +214,17 @@ bronze 원칙:
 - 값은 원천 응답 그대로 저장합니다.
 - FMP 글로벌/broad 응답을 미국 주식만 골라 다시 쓰지 않습니다. `response.*`와
   SHA-256·요청정보만 담은 별도 `manifest.json`을 저장하며 API key는 기록하지 않습니다.
+- FMP commodities 목록 40개는 원문 그대로 보존합니다. 가격은 금융선물 10개와
+  금·은 micro 중복 2개를 제외한 물리 원자재 연속선물 28개만 수집합니다.
 - FMP 과거 가격은 XNYS의 실제 완료 거래일만 대상으로 `eod-bulk`를 날짜당 한 번
   호출합니다. 현재 미국 세션과 미래 날짜를 빈 immutable 파티션으로 확정하지 않습니다.
 - 재개 시 S3 payload 전체를 다시 내려받지 않고 완료 manifest와 객체 크기로 빠르게
   판정합니다. 전체 SHA-256 재검증 함수는 별도 품질 감사에 사용할 수 있습니다.
 - EOD Bulk가 `429`를 반환하면 엔드포인트별 실질 호출 간격을 학습하며, 재무·유니버스
   등 작은 endpoint의 속도는 별도로 유지합니다.
+- FMP `company-screener`는 10,000행 페이지를 끝까지 순회하고, `delisted-companies`는
+  실제 100행 페이지 크기로 순회합니다. `symbol-change`는 명시적 10,000행 limit으로
+  전체 이력을 보존합니다. 현재연도 split 백필의 종료일은 실행 당일까지만 사용합니다.
 - Bronze에서는 `isEtf`·`isFund` 조건으로 행을 제거하지 않습니다. ETF/fund 및
   비주식 상품 제외는 Silver 후보 생성과 DQ에서만 수행합니다.
 - `stock/marcap`은 과거 주식 가격 백필에 사용합니다.
@@ -219,9 +232,13 @@ bronze 원칙:
 - `financials/dart/corpCode.xml`은 bronze에 저장하고 silver에서 재사용합니다.
 - DART 공시 목록과 유상·무상증자, 감자, 합병·분할, 주식교환의
   구조화 API 응답은 JSON 원문으로 저장합니다.
-- 액면분할·병합, 권리락·배당락처럼 가격조정 효력일·비율 확인에 원문이
-  필요한 공시는 `document.xml` 응답인 ZIP도 함께 저장합니다. 배당결정,
-  변경상장, 거래정지·상장폐지는 목록 JSON을 보존하되 ZIP은 받지 않습니다.
+- 액면분할·병합, 권리락·배당락과 현금·현물배당결정처럼 효력일·금액 확인에
+  원문이 필요한 공시는 `document.xml` 응답인 ZIP도 함께 저장합니다.
+  변경상장, 거래정지·상장폐지는 목록 JSON만 보존합니다.
+- 국내 보고기간별 배당은 OpenDART `alotMatter.json` 원문을 접수번호별로
+  보존합니다. 과거 기본 백필은 실제 DART 사업보고서가 있는 종목만 호출하고,
+  일일 증분은 새로 생기거나 정정된 분기·반기·사업보고서만 호출합니다.
+  `status=013`도 완료 응답으로 저장해 같은 무데이터 조합을 반복 호출하지 않습니다.
 - 목록에는 있지만 DART 원문 파일이 없는 `status=014` 응답은
   `documents_unavailable`에 원문 XML로 기록하고 재요청하지 않습니다.
 - 기간별 manifest와 단계 완료 marker를 저장해 중단 후 완료된 API 단계를
@@ -237,14 +254,15 @@ asset_identifier
 price_daily
 fundamental
 corporate_action
+dividend_history  # corporate_action의 cash_dividend 조회 view
 ```
 
 관계:
 
 ```text
 asset
-  -> asset_identifier  # KRX/DART/FMP ticker·corp_code·CIK·CUSIP·ISIN
-  -> price_daily       # 주식/지수 일봉, 수정종가, 거래량, 시가총액
+  -> asset_identifier  # ticker·corp_code·CIK·CUSIP·ISIN·FX/원자재 심볼
+  -> price_daily       # 주식/지수/FX/원자재 연속선물 일봉
   -> fundamental       # DART 재무 지표 long format
   -> corporate_action  # DART/FMP 배당·분할·자본변동
 ```
@@ -253,9 +271,15 @@ asset
 |---|---|---|
 | `asset` | 종목/지수 마스터 | `asset_id` |
 | `asset_identifier` | KRX/DART/FMP 식별자 매핑과 유효기간 | `(asset_id, source, identifier_type, identifier, valid_from)` |
-| `price_daily` | 주식/벤치마크 지수 일봉 | `(asset_id, source, trade_date)` |
+| `price_daily` | 주식·지수·FX·원자재 연속선물 일봉 | `(asset_id, source, trade_date)` |
 | `fundamental` | DART/FMP 재무계정 long format | `(asset_id, source, statement_type, data_basis, period_end, fiscal_period, fs_type, revision_key, metric)` |
 | `corporate_action` | 배당·분할·증자·감자 등 기업행사 | `(asset_id, source, action_key)` |
+
+배당은 별도 물리 테이블을 추가하지 않는다. 이벤트 날짜·원/분할조정 주당배당금·통화·
+지급주기는 `corporate_action`에 저장하고 `dividend_history` view로 조회한다. DART
+정기보고서의 배당총액·배당성향·배당수익률은 `fundamental`의 `DIVIDEND` 지표로
+저장한다. 원천 가격과 결합해 다시 계산할 수 있는 시점별 배당수익률은
+`corporate_action`에 저장하지 않는다.
 
 FMP Silver 편입 대상은 NASDAQ·NYSE·AMEX에서 거래되는 common stock,
 preferred stock, ADR, REIT입니다. ETF, fund, ETN, warrant, unit, listed note는
@@ -263,6 +287,13 @@ Silver에서 제외하고 제외 건수·사유를 `dq_result`/`dq_metric`에 �
 FMP `close`는 `adj_close`(분할조정), `adjClose`는 `total_return_close`(배당조정)로
 보존하고, 원 OHLC는 수집한 split ratio로 복원합니다. USD 가격·보고통화는 각
 행의 `currency`에 기록하며 `USDKRW`도 FX asset의 `price_daily`로 적재합니다.
+
+FMP 원자재는 `asset_type=commodity`,
+`instrument_type=commodity_future_continuous`로 구분하며 `price_daily.source`는
+`FMP_COMMODITY`를 사용합니다. FMP의 `USX`(미국 센트) 가격은 Silver에서 USD로
+나눠 표준화하고 `asset.price_unit`에 `USD/barrel`, `USD/bushel` 같은 단위를
+기록합니다. 선물에는 분할·배당 조정을 적용하지 않아 `adj_close=close`,
+`total_return_close=NULL`이며 롤오버 가능 급변은 값을 고치지 않고 warning으로 남깁니다.
 
 컬럼별 상세 설계는 [schema_tables.md](schema_tables.md)와 [sql/schema.sql](sql/schema.sql)를 참고합니다.
 
@@ -319,12 +350,18 @@ python -m pipeline.daily_full
 실행 순서:
 
 1. 대상 날짜의 KRX 주식/지수 Bronze를 S3에 저장합니다.
-2. 당해 연도 DART 재무와 기업행사를 확인하고 변경 원문만 저장합니다.
+2. 당해 연도 DART 재무·정기보고서 배당과 기업행사를 확인하고 변경 원문만 저장합니다.
 3. 필요한 S3 객체만 ECS 컨테이너의 `/app/data`로 다운로드합니다.
 4. KRX/DART Silver 후보를 생성하고 자동 품질 검사를 수행합니다.
 5. Critical/Error가 없을 때만 대상 날짜 교체와 upsert를 하나의 transaction으로 반영합니다.
 6. 완료된 직전 미국 세션의 FMP Bronze와 Silver를 별도 transaction으로 처리합니다.
 7. 실패하면 이미 인증된 Silver는 유지하고 `dq_run`·`dq_result`에 원인을 기록합니다.
+8. 인증된 증분 warning은 `dq_warning_state`에 누적하고, 같은 변경 파티션의 재검사가
+   PASS일 때만 해소합니다. 미해결 warning은 `dq_open_warning`에서 바로 조회합니다.
+
+Critical/Error 중 단일 행 불변조건은 RDS CHECK·PK·UNIQUE·FK로도 강제합니다.
+따라서 애플리케이션 품질검사를 우회한 쓰기도 DB에서 거부되며, 시계열·소스 간 대사와
+Warning은 계속 Python 품질 게이트에서 검사합니다.
 
 Gold 팩터는 평가 정책과 갱신 주기가 확정되기 전까지 daily 흐름에 포함하지 않습니다.
 
@@ -350,6 +387,7 @@ cp .env.example .env
 KRX_API_KEY=...
 DART_API_KEY=...
 FMP_API_KEY=...
+DART_DIVIDENDS_ENABLED=true
 AWS_PROFILE=<aws-profile>
 S3_BRONZE_BUCKET=<bronze-bucket>
 SILVER_DB_URL=postgresql://<user>:<password>@<rds-endpoint>:5432/<database>
@@ -401,6 +439,8 @@ uv run python -m pipeline.silver_quality.audit --scope all
 전체 후보를 누적하지 않습니다. 일별 `pipeline.daily_full`과 수동 incremental도
 동일한 품질 게이트를 자동 실행하며 우회 옵션은 없습니다. 규칙과 severity는
 [`pipeline/silver_quality/README.md`](pipeline/silver_quality/README.md)에 정리되어 있습니다.
+현재 운영 RDS의 인증 실행·OPEN warning·DB guard 결과 스냅샷은
+[`pipeline/silver_quality/QUALITY_STATUS.md`](pipeline/silver_quality/QUALITY_STATUS.md)에서 확인합니다.
 
 특정 날짜를 production daily 방식으로 실행:
 
@@ -418,6 +458,9 @@ uv run python -m pipeline.bronze.financials --from 2026 --to 2026 --dest s3
 uv run python -m pipeline.bronze.financials_full \
   --scope 004990:2015:11011:CFS --dest s3
 uv run python -m pipeline.bronze.corporate_actions --from 20150101 --to 20260713 --dest s3
+uv run python -m pipeline.bronze.dividends --from 2015 --to 2026 --dest s3 --reports annual
+uv run python -m pipeline.bronze.fmp --mode dividends --from 2015 --to 2026 --dest s3
+uv run python -m pipeline.bronze.fmp --mode commodities --from 2015 --to 2026 --dest s3
 uv run python -m pipeline.bronze.fmp --mode backfill --from 2015 --to 2026 --dest s3
 uv run python -m pipeline.bronze.fmp --mode daily --date 20260713 --dest s3
 ```
@@ -426,7 +469,24 @@ FMP 전체 Bronze 이후 Silver를 연도별로 이어서 실행하는 ECS용 �
 
 ```bash
 uv run python -m pipeline.fmp_backfill_ecs --phase full --from 2015 --to 2026
+uv run python -m pipeline.fmp_backfill_ecs --phase silver-range --from 2015 --to 2026
+uv run python -m pipeline.fmp_backfill_ecs --phase commodities --from 2015 --to 2026
 ```
+
+`silver-range`는 FMP API를 다시 호출하지 않고 S3 Bronze만 내려받아 연도별
+RDS transaction을 순차 실행한다.
+
+기존 DART 배당·기업행사 Bronze와 KRX 누락일을 Silver에 반영하는 ECS용 진입점:
+
+```bash
+uv run python -m pipeline.dart_silver_backfill_ecs --phase dart-extras
+uv run python -m pipeline.dart_silver_backfill_ecs --phase krx-gap
+```
+
+`dart-extras`는 정기보고서 배당 이력을 `fundamental`의
+`DIVIDEND/REPORTED` 행으로, 배당결정 공시는 `corporate_action`의
+`cash_dividend` 행으로 적재한다. 기존 KRX 식별자에 매핑되는 후보만 품질
+게이트를 통과시킨 뒤 source-scoped transaction으로 반영한다.
 
 완료된 `response.*`/`manifest.json` 파티션은 재호출하지 않으므로 같은 범위로
 재실행해도 이어서 진행합니다. 운영에서는 daily task와 겹치지 않도록 Scheduler를
@@ -440,6 +500,8 @@ uv run python -m pipeline.silver.load --mode incremental --date 20260713
 uv run python -m pipeline.silver.fmp_load --mode backfill --from 2015 --to 2026
 uv run python -m pipeline.silver.fmp_load --mode backfill --resume <dq-run-uuid>
 uv run python -m pipeline.silver.fmp_load --mode daily --date 20260713
+uv run python -m pipeline.silver.fmp_load --mode commodities --from 2015 --to 2026
+uv run python -m pipeline.silver.dart_extra_load
 ```
 
 Gold schema 생성:
@@ -476,7 +538,7 @@ docker buildx build \
 
 `main` 브랜치에 push하면 다음 작업이 실행됩니다.
 
-1. PostgreSQL integration test를 포함한 전체 pytest를 실행합니다.
+1. 외부 DB 접속이 필요 없는 전체 pytest를 실행합니다.
 2. GitHub OIDC로 AWS deploy role을 assume합니다.
 3. `linux/amd64` Docker 이미지를 빌드합니다.
 4. ECR에 commit SHA 태그와 `latest` 태그를 push합니다.

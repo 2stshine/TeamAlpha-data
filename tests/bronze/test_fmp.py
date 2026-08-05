@@ -3,6 +3,7 @@ import json
 from datetime import date
 
 from pipeline.bronze import fmp
+from pipeline.fmp_commodities import COMMODITY_SPECS
 
 
 class _Response:
@@ -122,3 +123,120 @@ def test_xnys_sessions_exclude_weekdays_when_market_is_closed():
     assert date(2025, 1, 1) not in sessions
     assert date(2025, 1, 9) not in sessions  # Carter national day of mourning
     assert date(2025, 1, 2) in sessions
+
+
+def test_calendar_window_bisects_capped_response(tmp_path):
+    capped = json.dumps([
+        {"symbol": f"S{i}", "date": "2015-01-02"}
+        for i in range(fmp.CALENDAR_ROW_LIMIT)
+    ]).encode()
+    left = b'[{"symbol":"AAPL","date":"2015-01-01"}]'
+    right = b'[{"symbol":"MSFT","date":"2015-01-02"}]'
+    session = _Session([
+        _Response(200, capped),
+        _Response(200, left),
+        _Response(200, right),
+    ])
+    client = fmp.FMPClient(api_key="secret", session=session)
+
+    paths = fmp._collect_calendar_window(
+        client,
+        root=str(tmp_path),
+        endpoint="dividends-calendar",
+        prefix="corporate_actions/fmp/dividends/year=2015/window=2015-01",
+        start=date(2015, 1, 1),
+        end=date(2015, 1, 2),
+    )
+
+    parent = (
+        tmp_path
+        / "corporate_actions/fmp/dividends/year=2015/window=2015-01"
+    )
+    assert not (parent / "response.json").exists()
+    assert (parent / "segment=2015-01-01_2015-01-01/response.json").read_bytes() == left
+    assert (parent / "segment=2015-01-02_2015-01-02/response.json").read_bytes() == right
+    assert len(paths) == 4
+    assert len(session.calls) == 3
+
+
+def test_month_windows_cover_requested_years():
+    windows = fmp._month_windows(date(2019, 12, 15), date(2020, 2, 2))
+
+    assert windows == [
+        (date(2019, 12, 15), date(2019, 12, 31)),
+        (date(2020, 1, 1), date(2020, 1, 31)),
+        (date(2020, 2, 1), date(2020, 2, 2)),
+    ]
+
+
+def test_commodity_collection_uses_only_28_allowlisted_series(tmp_path):
+    provider_list = json.dumps([
+        {"symbol": spec.symbol, "currency": spec.raw_currency}
+        for spec in COMMODITY_SPECS
+    ]).encode()
+    price_payloads = [
+        json.dumps([{
+            "symbol": spec.symbol,
+            "date": "2026-08-04",
+            "open": 1,
+            "high": 2,
+            "low": 0.5,
+            "close": 1.5,
+            "volume": 10,
+        }]).encode()
+        for spec in COMMODITY_SPECS
+    ]
+    session = _Session([
+        _Response(200, provider_list),
+        *[_Response(200, payload) for payload in price_payloads],
+    ])
+    client = fmp.FMPClient(api_key="secret", session=session)
+
+    paths = fmp._collect_commodity_prices(
+        client,
+        str(tmp_path),
+        start=date(2026, 8, 4),
+        end=date(2026, 8, 4),
+        snapshot="2026-08-04",
+        daily=True,
+    )
+
+    assert len(paths) == 2 * (1 + len(COMMODITY_SPECS))
+    calls = session.calls
+    assert calls[0][0].endswith("/commodities-list")
+    requested = [call[1]["params"]["symbol"] for call in calls[1:]]
+    assert requested == [spec.symbol for spec in COMMODITY_SPECS]
+
+
+def test_universe_collects_all_screener_and_delisted_pages(tmp_path):
+    screener_full = json.dumps([
+        {"symbol": f"S{i}"} for i in range(fmp.SCREENER_PAGE_SIZE)
+    ]).encode()
+    delisted_full = json.dumps([
+        {"symbol": f"D{i}"} for i in range(fmp.DELISTED_PAGE_SIZE)
+    ]).encode()
+    session = _Session([
+        _Response(200, b"[]"),             # stock-list
+        _Response(200, screener_full),      # screener page 0
+        _Response(200, b'[{"symbol":"LAST"}]'),
+        *[_Response(200, b"") for _ in fmp.PROFILE_PARTS],
+        _Response(200, b'[{"oldSymbol":"OLD","newSymbol":"NEW"}]'),
+        _Response(200, delisted_full),      # delisted page 0
+        _Response(200, b'[{"symbol":"FINAL"}]'),
+    ])
+    client = fmp.FMPClient(api_key="secret", session=session)
+
+    paths = fmp._collect_universe(
+        client,
+        str(tmp_path),
+        "2026-08-04",
+        all_delisted_pages=True,
+    )
+
+    assert any("company-screener/snapshot_date=2026-08-04/page=1" in p for p in paths)
+    assert any("delisted/snapshot_date=2026-08-04/page=1" in p for p in paths)
+    assert any("symbol-change/snapshot_date=2026-08-04/limit=10000" in p for p in paths)
+    requested = [call[1].get("params") for call in session.calls]
+    assert {"page": 1, "limit": fmp.SCREENER_PAGE_SIZE} in requested
+    assert {"limit": fmp.SYMBOL_CHANGE_LIMIT} in requested
+    assert {"page": 1, "limit": fmp.DELISTED_PAGE_SIZE} in requested

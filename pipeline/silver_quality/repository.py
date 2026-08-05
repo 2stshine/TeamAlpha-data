@@ -2,13 +2,32 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import date
 from uuid import UUID, uuid4
 
 import pandas as pd
 
 from pipeline.silver_quality import QUALITY_RULESET_VERSION
-from pipeline.silver_quality.models import BatchContext, CheckResult
+from pipeline.silver_quality.models import (
+    BatchContext,
+    CheckResult,
+    CheckStatus,
+    Severity,
+)
+
+
+INCREMENTAL_WARNING_MODES = frozenset({"daily", "fmp_daily"})
+
+
+def _json_safe(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def assert_schema(conn) -> None:
@@ -87,9 +106,184 @@ def save_results(conn, run_id: UUID, results: list[CheckResult]) -> None:
                 (
                     run_id, r.partition_key, r.dataset, r.rule_code,
                     r.severity.value, r.status.value, r.expected, r.actual,
-                    r.failed_count, json.dumps(r.samples, ensure_ascii=False, default=str),
+                    r.failed_count,
+                    json.dumps(
+                        _json_safe(r.samples), ensure_ascii=False,
+                        default=str, allow_nan=False,
+                    ),
                 ),
             )
+
+
+def _warning_scope_key(
+    context: BatchContext,
+    result: CheckResult,
+) -> tuple[str, str | None]:
+    partition_key = result.partition_key or context.partition_key
+    if partition_key:
+        return f"partition={partition_key}", partition_key
+    if context.target_date:
+        return f"date={context.target_date.isoformat()}", None
+    return f"run={context.run_id}", None
+
+
+def _incremental_warning_entries(
+    context: BatchContext,
+    results: list[CheckResult],
+) -> list[dict]:
+    """Consolidate warning observations to one row per evaluated scope/rule."""
+    entries: dict[tuple[str, str, str], dict] = {}
+    for result in results:
+        if result.severity != Severity.WARNING:
+            continue
+        scope_key, partition_key = _warning_scope_key(context, result)
+        key = (scope_key, result.dataset, result.rule_code)
+        entry = entries.setdefault(
+            key,
+            {
+                "scope_key": scope_key,
+                "partition_key": partition_key,
+                "dataset_name": result.dataset,
+                "rule_code": result.rule_code,
+                "status": CheckStatus.PASS,
+                "failed_count": 0,
+                "expected_value": result.expected,
+                "actual_values": [],
+                "sample_records": [],
+            },
+        )
+        if result.status == CheckStatus.FAIL:
+            entry["status"] = CheckStatus.FAIL
+        entry["failed_count"] += int(result.failed_count)
+        entry["actual_values"].append(result.actual)
+        remaining = 20 - len(entry["sample_records"])
+        if remaining > 0:
+            entry["sample_records"].extend(result.samples[:remaining])
+    return list(entries.values())
+
+
+def sync_incremental_warning_state(
+    conn,
+    context: BatchContext,
+    results: list[CheckResult],
+) -> None:
+    """Project certified incremental warning observations into OPEN/RESOLVED state.
+
+    The immutable observation history remains in dq_result. A warning is only
+    resolved by a PASS for the same mode, changed partition/date, dataset and
+    rule. Missing rules do not implicitly resolve anything.
+    """
+    if context.mode not in INCREMENTAL_WARNING_MODES:
+        return
+    entries = _incremental_warning_entries(context, results)
+    if not entries:
+        return
+    with conn.cursor() as cur:
+        for entry in entries:
+            actual_value = " | ".join(entry["actual_values"])
+            identity = (
+                context.mode,
+                entry["scope_key"],
+                entry["dataset_name"],
+                entry["rule_code"],
+            )
+            if entry["status"] == CheckStatus.FAIL:
+                cur.execute(
+                    """
+                    INSERT INTO dq_warning_state (
+                        mode, scope_key, target_date, partition_key,
+                        dataset_name, rule_code, status,
+                        first_seen_run_id, last_failed_run_id,
+                        last_evaluated_run_id, observation_count,
+                        latest_failed_count, expected_value, actual_value,
+                        sample_records
+                    ) VALUES (
+                        %s,%s,%s,%s,%s,%s,'OPEN',%s,%s,%s,1,%s,%s,%s,%s::jsonb
+                    )
+                    ON CONFLICT (mode, scope_key, dataset_name, rule_code)
+                    DO UPDATE SET
+                        status='OPEN',
+                        last_failed_run_id=EXCLUDED.last_failed_run_id,
+                        last_evaluated_run_id=EXCLUDED.last_evaluated_run_id,
+                        resolved_run_id=NULL,
+                        last_failed_at=now(),
+                        last_evaluated_at=now(),
+                        resolved_at=NULL,
+                        observation_count=dq_warning_state.observation_count + 1,
+                        reopen_count=dq_warning_state.reopen_count +
+                            CASE WHEN dq_warning_state.status='RESOLVED' THEN 1 ELSE 0 END,
+                        latest_failed_count=EXCLUDED.latest_failed_count,
+                        expected_value=EXCLUDED.expected_value,
+                        actual_value=EXCLUDED.actual_value,
+                        sample_records=EXCLUDED.sample_records
+                    """,
+                    (
+                        context.mode,
+                        entry["scope_key"],
+                        context.target_date,
+                        entry["partition_key"],
+                        entry["dataset_name"],
+                        entry["rule_code"],
+                        context.run_id,
+                        context.run_id,
+                        context.run_id,
+                        entry["failed_count"],
+                        entry["expected_value"],
+                        actual_value,
+                        json.dumps(
+                            _json_safe(entry["sample_records"]),
+                            ensure_ascii=False,
+                            default=str,
+                            allow_nan=False,
+                        ),
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE dq_warning_state
+                    SET status='RESOLVED',
+                        last_evaluated_run_id=%s,
+                        resolved_run_id=%s,
+                        last_evaluated_at=now(),
+                        resolved_at=now(),
+                        latest_failed_count=0,
+                        expected_value=%s,
+                        actual_value=%s,
+                        sample_records=%s::jsonb
+                    WHERE mode=%s AND scope_key=%s
+                      AND dataset_name=%s AND rule_code=%s
+                      AND status='OPEN'
+                    """,
+                    (
+                        context.run_id,
+                        context.run_id,
+                        entry["expected_value"],
+                        actual_value,
+                        json.dumps(
+                            _json_safe(entry["sample_records"]),
+                            ensure_ascii=False,
+                            default=str,
+                            allow_nan=False,
+                        ),
+                        *identity,
+                    ),
+                )
+
+
+def open_warning_counts(conn, mode: str | None = None) -> tuple[int, int]:
+    where = "WHERE mode=%s" if mode else ""
+    params = (mode,) if mode else ()
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT count(*), COALESCE(sum(latest_failed_count), 0)
+            FROM dq_open_warning {where}
+            """,
+            params,
+        )
+        row = cur.fetchone()
+    return int(row[0]), int(row[1])
 
 
 def save_metrics(conn, run_id: UUID, bundle) -> None:
@@ -246,6 +440,8 @@ def finish_run(
     commit: bool = True,
 ) -> None:
     save_results(conn, context.run_id, results)
+    if status == "CERTIFIED":
+        sync_incremental_warning_state(conn, context, results)
     failed = sum(1 for r in results if r.status.value == "FAIL")
     with conn.cursor() as cur:
         cur.execute(

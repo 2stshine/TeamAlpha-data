@@ -4,11 +4,48 @@ import json
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from pipeline.silver import fmp
+from pipeline.fmp_commodities import COMMODITY_SPECS
 from pipeline.silver_quality.models import CheckStatus
 from pipeline.silver_quality.rules.fmp import check_fmp
+
+
+class _ReusedTickerCursor:
+    def __init__(self):
+        self._row = None
+        self.queries = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def execute(self, query, params=None):
+        normalized = " ".join(query.split())
+        self.queries.append((normalized, params))
+        if normalized.startswith("SELECT asset_id FROM asset_identifier"):
+            # The database contains only a closed historical COIN episode.
+            # The fixed lookup must not accept it for a current candidate.
+            self._row = None if "valid_to IS NULL" in normalized else (45925,)
+        elif normalized.startswith("INSERT INTO asset("):
+            self._row = (90001,)
+        else:
+            self._row = None
+
+    def fetchone(self):
+        return self._row
+
+
+class _ReusedTickerConnection:
+    def __init__(self):
+        self.cur = _ReusedTickerCursor()
+
+    def cursor(self):
+        return self.cur
 
 
 def _write(path: Path, payload: bytes):
@@ -66,6 +103,57 @@ def _universe(root: Path):
         root / "stock/fmp/universe/profile-bulk/snapshot_date=2020-08-28/part=0/response.csv",
         _csv(rows),
     )
+    _commodity_list(root, "2020-08-28")
+
+
+def _commodity_list(root: Path, snapshot: str):
+    _write(
+        root
+        / f"commodities/fmp/list/snapshot_date={snapshot}/response.json",
+        json.dumps([
+            {
+                "symbol": spec.symbol,
+                "name": f"{spec.name} Futures",
+                "currency": spec.raw_currency,
+                "tradeMonth": "Dec",
+            }
+            for spec in COMMODITY_SPECS
+        ]).encode(),
+    )
+
+
+def test_current_ticker_reuse_does_not_merge_with_closed_historical_asset():
+    assets = pd.DataFrame([{
+        "natural_key": "FMP:COIN",
+        "name": "Coinbase Global, Inc.",
+        "asset_type": "stock",
+        "instrument_type": "common_stock",
+        "exchange": "NASDAQ",
+        "currency": "USD",
+        "country_code": "US",
+        "base_currency": "USD",
+        "listed_from": date(2021, 4, 14),
+        "listed_to": None,
+    }])
+    identifiers = pd.DataFrame([{
+        "natural_key": "FMP:COIN",
+        "source": "FMP",
+        "identifier": "COIN",
+        "identifier_type": "ticker",
+        "valid_from": date(2021, 4, 14),
+        "valid_to": None,
+    }])
+    conn = _ReusedTickerConnection()
+
+    mapping = fmp.publish_assets(conn, assets, identifiers, "quality-run")
+
+    assert mapping["FMP:COIN"] == 90001
+    assert mapping["COIN"] == 90001
+    lookup = next(
+        query for query, _ in conn.cur.queries
+        if query.startswith("SELECT asset_id FROM asset_identifier")
+    )
+    assert "valid_to IS NULL" in lookup
 
 
 def test_silver_filters_instruments_but_keeps_bronze_and_maps_price_semantics(tmp_path):
@@ -104,7 +192,12 @@ def test_silver_filters_instruments_but_keeps_bronze_and_maps_price_semantics(tm
 
     bundle = fmp.build_candidates(str(tmp_path), date(2020, 8, 28))
 
-    assert set(bundle.assets["natural_key"]) == {"FMP:AAPL"}
+    assert set(
+        bundle.assets.loc[
+            bundle.assets["asset_type"].eq("stock"), "natural_key"
+        ]
+    ) == {"FMP:AAPL"}
+    assert bundle.assets["asset_type"].eq("commodity").sum() == 28
     assert bundle.stats["asset"]["excluded_by_reason"] == {
         "NON_EQUITY_NAME": 1,
         "FUND": 1,
@@ -144,6 +237,7 @@ def test_financials_and_actions_are_long_pit_candidates(tmp_path):
         tmp_path / "corporate_actions/fmp/dividends/year=2025/from=2025-01-01/to=2025-12-31/response.json",
         json.dumps([{
             "symbol": "AAPL", "date": "2025-08-11", "dividend": 0.25,
+            "adjDividend": 0.24, "frequency": "Quarterly",
             "declarationDate": "2025-07-31", "recordDate": "2025-08-11",
             "paymentDate": "2025-08-14",
         }]).encode(),
@@ -161,7 +255,189 @@ def test_financials_and_actions_are_long_pit_candidates(tmp_path):
     dividend = actions.iloc[0]
     assert dividend["action_type"] == "cash_dividend"
     assert dividend["cash_amount"] == pytest.approx(0.25)
+    assert dividend["adjusted_cash_amount"] == pytest.approx(0.24)
+    assert dividend["frequency"] == "Quarterly"
     assert dividend["currency"] == "USD"
+
+
+def test_prices_exclude_invalid_ohlc_and_reduce_duplicate_keys(tmp_path):
+    _universe(tmp_path)
+    price_path = tmp_path / "stock/fmp/eod-bulk/date=2020-08-28/response.csv"
+    _write(price_path, _csv([
+        {
+            "symbol": "AAPL", "date": "2020-08-28", "open": 100,
+            "low": 90, "high": 110, "close": 105, "adjClose": 104,
+            "volume": 100,
+        },
+        {
+            "symbol": "AAPL", "date": "2020-08-28", "open": 100,
+            "low": 90, "high": 110, "close": 105, "adjClose": 104,
+            "volume": 200,
+        },
+        {
+            "symbol": "AAPL", "date": "2020-08-28", "open": 100,
+            "low": 90, "high": 99, "close": 105, "adjClose": 104,
+            "volume": 300,
+        },
+    ]))
+    _manifest(price_path)
+    _commodity_list(tmp_path, "2026-07-31")
+    assets, identifiers, _ = fmp.prepare_universe(str(tmp_path))
+    frame, stats = fmp.prepare_prices(
+        str(tmp_path), assets, identifiers, year=2020,
+    )
+    assert len(frame) == 1
+    assert frame.iloc[0]["volume"] == 200
+    assert stats["invalid_ohlc_excluded"]["row_count"] == 1
+    assert stats["duplicate_price_rows_removed"]["row_count"] == 1
+
+
+def test_prices_exclude_global_bulk_rows_outside_xnys_sessions(tmp_path):
+    _universe(tmp_path)
+    holiday_path = tmp_path / "stock/fmp/eod-bulk/date=2020-09-07/response.csv"
+    _write(holiday_path, _csv([{
+        "symbol": "AAPL", "date": "2020-09-07", "open": 120,
+        "low": 119, "high": 121, "close": 120, "adjClose": 119,
+        "volume": 100,
+    }]))
+    _manifest(holiday_path)
+
+    assets, identifiers, _ = fmp.prepare_universe(str(tmp_path))
+    frame, stats = fmp.prepare_prices(
+        str(tmp_path), assets, identifiers, year=2020,
+    )
+
+    assert frame.empty
+    assert stats["non_session_rows_excluded"]["row_count"] == 1
+    assert stats["non_session_rows_excluded"]["samples"][0]["symbol"] == "AAPL"
+
+
+def test_commodities_normalize_usx_and_preserve_negative_futures_ohlc(tmp_path):
+    _commodity_list(tmp_path, "2020-04-20")
+    corn = (
+        tmp_path
+        / "commodities/fmp/eod/symbol=ZCUSX/"
+        "from=2020-01-01/to=2020-12-31/response.json"
+    )
+    crude = (
+        tmp_path
+        / "commodities/fmp/eod/symbol=CLUSD/"
+        "from=2020-01-01/to=2020-12-31/response.json"
+    )
+    _write(corn, json.dumps([{
+        "symbol": "ZCUSX", "date": "2020-04-20",
+        "open": 462.5, "high": 470, "low": 460, "close": 465,
+        "vwap": 464, "volume": 100,
+    }]).encode())
+    _write(crude, json.dumps([{
+        "symbol": "CLUSD", "date": "2020-04-20",
+        "open": 17.73, "high": 17.85, "low": -40.32, "close": 17.73,
+        "vwap": 1.0, "volume": 200,
+    }]).encode())
+    _manifest(corn)
+    _manifest(crude)
+
+    assets, identifiers, prices, stats = fmp.prepare_commodities(
+        str(tmp_path), year=2020,
+    )
+
+    assert len(assets) == 28
+    assert set(identifiers["identifier_type"]) == {"commodity_symbol"}
+    corn_row = prices[prices["identifier"].eq("ZCUSX")].iloc[0]
+    assert corn_row["close"] == pytest.approx(4.65)
+    assert corn_row["vwap"] == pytest.approx(4.64)
+    assert corn_row["currency"] == "USD"
+    assert corn_row["price_unit"] == "USD/bushel"
+    crude_row = prices[prices["identifier"].eq("CLUSD")].iloc[0]
+    assert crude_row["low"] == pytest.approx(-40.32)
+    assert crude_row["adj_close"] == crude_row["close"]
+    assert pd.isna(crude_row["total_return_close"])
+    bundle = fmp.CandidateBundle(
+        assets=assets,
+        identifiers=identifiers,
+        prices=prices,
+        stats={
+            "commodity": stats,
+            "_source_scope": "commodity",
+        },
+    )
+    assert not any(result.blocks_publish for result in check_fmp(bundle))
+
+
+def test_universe_excludes_same_issuer_nasdaq_suffix_instruments(tmp_path):
+    rows = []
+    for symbol, name in (
+        ("BBLG", "Bone Biologics Corporation"),
+        ("BBLGW", "Bone Biologics Corp"),
+        ("GMBL", "Esports Entertainment Group Inc"),
+        ("GMBLW", "Esports Entertainment Group, Inc. Common Stock"),
+        ("GMBLZ", "Esports Entertainment Group Inc"),
+        ("ACME", "Acme Holdings"),
+        ("ACMEU", "Acme Holdings Unit"),
+        # A suffix-looking ticker without a same-issuer base must survive.
+        ("AROW", "Arrow Financial Corporation"),
+    ):
+        rows.append({
+            "symbol": symbol, "companyName": name, "exchange": "NASDAQ",
+            "currency": "USD", "country": "US", "isEtf": False,
+            "isFund": False, "isAdr": False, "isActivelyTrading": True,
+            "industry": "Financial Services", "ipoDate": "2020-01-01",
+            "cik": "", "cusip": "", "isin": "",
+        })
+    _write(
+        tmp_path
+        / "stock/fmp/universe/profile-bulk/snapshot_date=2026-07-31/part=0/response.csv",
+        _csv(rows),
+    )
+
+    assets, identifiers, stats = fmp.prepare_universe(str(tmp_path))
+
+    assert set(assets["natural_key"]) == {
+        "FMP:BBLG", "FMP:GMBL", "FMP:ACME", "FMP:AROW",
+    }
+    assert stats["excluded_by_reason"] == {
+        "WARRANT_SUFFIX": 2,
+        "DERIVATIVE_SUFFIX": 1,
+        "NON_EQUITY_NAME": 1,
+    }
+    assert set(identifiers["identifier"]) >= {"BBLG", "GMBL", "ACME", "AROW"}
+
+
+def test_symbol_change_does_not_admit_unit_ticker_episode(tmp_path):
+    rows = [{
+        "symbol": "FG", "companyName": "F&G Annuities & Life, Inc.",
+        "exchange": "NYSE", "currency": "USD", "country": "US",
+        "isEtf": False, "isFund": False, "isAdr": False,
+        "isActivelyTrading": True, "industry": "Insurance",
+        "ipoDate": "2022-12-01", "cik": "", "cusip": "", "isin": "",
+    }]
+    _write(
+        tmp_path
+        / "stock/fmp/universe/profile-bulk/snapshot_date=2026-07-31/part=0/response.csv",
+        _csv(rows),
+    )
+    _write(
+        tmp_path
+        / "stock/fmp/universe/symbol-change/snapshot_date=2026-07-31/response.json",
+        json.dumps([
+            {
+                "companyName": "Fgl Holdings", "oldSymbol": "CFCO",
+                "newSymbol": "FG", "date": "2018-02-14",
+            },
+            {
+                "companyName": "Fgl Holdings", "oldSymbol": "CFCOU",
+                "newSymbol": "FG", "date": "2016-07-25",
+            },
+        ]).encode(),
+    )
+
+    _, identifiers, stats = fmp.prepare_universe(str(tmp_path))
+
+    tickers = set(
+        identifiers.loc[identifiers["identifier_type"].eq("ticker"), "identifier"]
+    )
+    assert tickers == {"FG", "CFCO"}
+    assert stats["excluded_symbol_change_identifier_count"] == 1
 
 
 def test_universe_excludes_stale_profiles_and_ambiguous_security_ids(tmp_path):
@@ -261,12 +537,78 @@ def test_prices_respect_ticker_validity_after_symbol_change(tmp_path):
         },
     ]))
     _manifest(price_path)
+    _commodity_list(tmp_path, "2026-07-31")
 
     bundle = fmp.build_candidates(str(tmp_path), date(2026, 7, 31))
 
     assert list(bundle.prices["identifier"]) == ["NEW"]
     assert list(bundle.prices["natural_key"]) == ["FMP:NEW"]
     assert not any(result.status == CheckStatus.FAIL for result in check_fmp(bundle))
+
+
+def test_fundamentals_deduplicate_old_and_new_tickers_by_asset(tmp_path):
+    rows = [
+        {
+            "symbol": symbol, "companyName": "Renamed Corp",
+            "exchange": "NASDAQ", "currency": "USD", "country": "US",
+            "isEtf": False, "isFund": False, "isAdr": False,
+            "isActivelyTrading": True, "industry": "Software",
+            "ipoDate": "2010-01-01", "cik": "1",
+            "cusip": "111111111", "isin": "US1111111111",
+        }
+        for symbol in ("OLD", "NEW")
+    ]
+    _write(
+        tmp_path
+        / "stock/fmp/universe/profile-bulk/snapshot_date=2026-07-31/part=0/response.csv",
+        _csv(rows),
+    )
+    _write(
+        tmp_path
+        / "stock/fmp/universe/symbol-change/snapshot_date=2026-07-31/response.json",
+        json.dumps([{
+            "oldSymbol": "OLD", "newSymbol": "NEW", "date": "2026-01-01",
+        }]).encode(),
+    )
+    statement = {
+        "date": "2015-12-31", "reportedCurrency": "USD",
+        "filingDate": "2016-03-01", "acceptedDate": "2016-03-01T12:00:00Z",
+        "period": "FY", "revenue": 100,
+    }
+    _write(
+        tmp_path / "financials/fmp/income/year=2015/period=FY/response.csv",
+        _csv([{**statement, "symbol": "OLD"}, {**statement, "symbol": "NEW"}]),
+    )
+
+    _, identifiers, _ = fmp.prepare_universe(str(tmp_path))
+    fundamentals, stats = fmp.prepare_fundamentals(
+        str(tmp_path), identifiers, year=2015,
+    )
+
+    assert len(fundamentals) == 1
+    assert fundamentals.iloc[0]["natural_key"] == "FMP:NEW"
+    assert stats["duplicate_rows_removed"] == 1
+
+
+def test_fundamentals_exclude_values_without_pit_availability(tmp_path):
+    _universe(tmp_path)
+    _write(
+        tmp_path / "financials/fmp/income/year=2018/period=FY/response.csv",
+        _csv([{
+            "date": "2018-12-31", "symbol": "AAPL",
+            "reportedCurrency": "USD", "filingDate": "",
+            "acceptedDate": "", "period": "FY", "revenue": 100,
+            "netIncome": 20,
+        }]),
+    )
+
+    _, identifiers, _ = fmp.prepare_universe(str(tmp_path))
+    fundamentals, stats = fmp.prepare_fundamentals(
+        str(tmp_path), identifiers, year=2018,
+    )
+
+    assert fundamentals.empty
+    assert stats["missing_available_at_values_excluded"] == 2
 
 
 def test_usdkrw_is_an_fx_price_asset(tmp_path):
@@ -296,3 +638,22 @@ def test_usdkrw_is_an_fx_price_asset(tmp_path):
     assert identifiers.iloc[0]["identifier_type"] == "fx_pair"
     assert prices.iloc[0]["close"] == pytest.approx(1388.4)
     assert prices.iloc[0]["currency"] == "KRW"
+
+
+def test_usdkrw_excludes_invalid_ohlc_rows(tmp_path):
+    path = tmp_path / "fx/fmp/pair=USDKRW/from=2015/to=2026/response.json"
+    _write(path, json.dumps([{
+        "symbol": "USDKRW", "date": "2025-09-14", "open": 1393.69995,
+        "high": 1392.88, "low": 1384.18994, "close": 1393.69995,
+        "volume": 0,
+    }]).encode())
+    _manifest(path)
+
+    assets, identifiers, prices, stats = fmp.prepare_fx(
+        str(tmp_path), year=2025,
+    )
+
+    assert assets.empty
+    assert identifiers.empty
+    assert prices.empty
+    assert stats["invalid_ohlc_excluded"]["row_count"] == 1

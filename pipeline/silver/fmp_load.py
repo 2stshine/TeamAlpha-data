@@ -55,15 +55,93 @@ def _fingerprint(base: str, target_date: date | None) -> str:
     return digest.hexdigest()
 
 
-def _publish(conn, bundle, context, target_date: date | None) -> None:
-    identifier_map = fmp.publish_assets(
-        conn, bundle.assets, bundle.identifiers, context.run_id,
+def _existing_identifier_map(
+    conn,
+    identifier_candidates: pd.DataFrame,
+) -> dict[str, int]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT identifier_type, identifier, asset_id, valid_to, valid_from
+            FROM asset_identifier
+            WHERE source='FMP'
+            ORDER BY identifier_type, identifier,
+                     (valid_to IS NULL) DESC, valid_from DESC
+            """
+        )
+        rows = cur.fetchall()
+    stored: dict[tuple[str, str], int] = {}
+    for identifier_type, identifier, asset_id, _, _ in rows:
+        stored.setdefault(
+            (str(identifier_type), str(identifier)), int(asset_id),
+        )
+    output: dict[str, int] = {}
+    # Facts and actions can retain a historical ticker after a symbol change.
+    # Resolve every stored ticker episode directly, while keeping asset identity
+    # anchored to the current primary ticker below.  This avoids creating or
+    # merging assets from untrusted CUSIP/ISIN values.
+    for row in identifier_candidates.itertuples(index=False):
+        if row.identifier_type not in {"ticker", "fx_pair", "commodity_symbol"}:
+            continue
+        asset_id = stored.get(
+            (str(row.identifier_type), str(row.identifier)),
+        )
+        if asset_id is not None:
+            output[str(row.identifier)] = asset_id
+    for natural_key, group in identifier_candidates.groupby(
+        "natural_key", sort=False,
+    ):
+        rendered_key = str(natural_key)
+        primary_ticker = rendered_key.removeprefix("FMP:")
+        if rendered_key.startswith("FMP:COMMODITY:"):
+            primary_ticker = rendered_key.removeprefix("FMP:COMMODITY:")
+        ordered = sorted(
+            group.itertuples(index=False),
+            key=lambda row: (
+                0 if row.identifier_type == "ticker" and pd.isna(row.valid_to)
+                else 1 if row.identifier_type == "ticker"
+                else 2 if pd.isna(row.valid_to) else 3
+            ),
+        )
+        for row in ordered:
+            if not (
+                row.identifier_type in {"fx_pair", "commodity_symbol"}
+                or (
+                    row.identifier_type == "ticker"
+                    and str(row.identifier) == primary_ticker
+                )
+            ):
+                continue
+            asset_id = stored.get(
+                (str(row.identifier_type), str(row.identifier)),
+            )
+            if asset_id is not None:
+                output[str(natural_key)] = asset_id
+                break
+    return output
+
+
+def _publish(
+    conn,
+    bundle,
+    context,
+    target_date: date | None,
+    *,
+    publish_asset_candidates: bool = True,
+) -> None:
+    identifier_map = (
+        fmp.publish_assets(
+            conn, bundle.assets, bundle.identifiers, context.run_id,
+        )
+        if publish_asset_candidates
+        else _existing_identifier_map(conn, bundle.identifiers)
     )
     if target_date is not None:
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM price_daily "
-                "WHERE source IN ('FMP','FMP_FX') AND trade_date=%s",
+                "WHERE source IN ('FMP','FMP_FX','FMP_COMMODITY') "
+                "AND trade_date=%s",
                 (target_date,),
             )
     fmp.publish_prices(conn, bundle.prices, identifier_map, context.run_id)
@@ -71,6 +149,58 @@ def _publish(conn, bundle, context, target_date: date | None) -> None:
         conn, bundle.fundamentals, identifier_map, context.run_id,
     )
     fmp.publish_actions(conn, bundle.actions, identifier_map, context.run_id)
+
+
+def _add_previous_commodity_roll_check(conn, bundle: CandidateBundle) -> None:
+    """Compare a daily candidate with the latest certified commodity close."""
+    if bundle.prices.empty or "source" not in bundle.prices:
+        return
+    current = bundle.prices[
+        bundle.prices["source"].eq("FMP_COMMODITY")
+    ]
+    if current.empty:
+        return
+    symbols = sorted(current["identifier"].astype(str).unique())
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (ai.identifier)
+                   ai.identifier, p.trade_date, p.close
+            FROM asset_identifier ai
+            JOIN price_daily p ON p.asset_id=ai.asset_id
+            WHERE ai.source='FMP'
+              AND ai.identifier_type='commodity_symbol'
+              AND ai.identifier=ANY(%s)
+              AND p.source='FMP_COMMODITY'
+            ORDER BY ai.identifier, p.trade_date DESC
+            """,
+            (symbols,),
+        )
+        previous = {
+            str(symbol): (trade_date, float(close))
+            for symbol, trade_date, close in cur.fetchall()
+        }
+    samples = []
+    for row in current.itertuples(index=False):
+        prior = previous.get(str(row.identifier))
+        if prior is None or prior[1] == 0 or row.close is None:
+            continue
+        move = float(row.close) / prior[1] - 1
+        if abs(move) <= 0.20:
+            continue
+        samples.append({
+            "identifier": str(row.identifier),
+            "trade_date": row.trade_date,
+            "close": float(row.close),
+            "previous_trade_date": prior[0],
+            "previous_close": prior[1],
+            "return": move,
+        })
+    detail = bundle.stats.setdefault("commodity", {}).setdefault(
+        "possible_roll", {},
+    )
+    detail["row_count"] = len(samples)
+    detail["samples"] = samples[:20]
 
 
 def _daily(*, src: str, day: str) -> None:
@@ -89,6 +219,7 @@ def _daily(*, src: str, day: str) -> None:
         )
         try:
             bundle = fmp.build_candidates(base, target_date)
+            _add_previous_commodity_roll_check(conn, bundle)
         except Exception as exc:
             failure = CheckResult(
                 rule_code="FMP_CANDIDATE_TRANSFORMATION",
@@ -119,6 +250,9 @@ def _daily(*, src: str, day: str) -> None:
                 repository.finish_run(
                     conn, context, "CERTIFIED", results, commit=False,
                 )
+                open_scopes, open_rows = repository.open_warning_counts(
+                    conn, context.mode,
+                )
         except Exception as exc:
             conn.rollback()
             failure = CheckResult(
@@ -137,6 +271,11 @@ def _daily(*, src: str, day: str) -> None:
             raise
         print(
             f"[silver-fmp] certified run={context.run_id} date={target_date}",
+            flush=True,
+        )
+        print(
+            f"[silver-quality] open warnings mode={context.mode} "
+            f"scopes={open_scopes} failed_rows={open_rows}",
             flush=True,
         )
     finally:
@@ -170,6 +309,24 @@ def _completed_partitions(conn, parent_run_id: UUID) -> set[str]:
         return {str(row[0]) for row in cur.fetchall()}
 
 
+def _fundamental_partitions(
+    year: int,
+    frame: pd.DataFrame,
+) -> list[tuple[str, pd.DataFrame]]:
+    if frame.empty:
+        return []
+    output = []
+    for (statement_type, fiscal_period), partition in frame.groupby(
+        ["statement_type", "fiscal_period"], sort=True,
+    ):
+        key = (
+            f"fundamental:year={year}:statement={statement_type}:"
+            f"period={fiscal_period}"
+        )
+        output.append((key, partition.reset_index(drop=True)))
+    return output
+
+
 def _certify_partition(conn, parent, key: str, bundle: CandidateBundle) -> None:
     child = repository.start_run(
         conn,
@@ -182,7 +339,13 @@ def _certify_partition(conn, parent, key: str, bundle: CandidateBundle) -> None:
     try:
         assert_publishable(results)
         with conn.transaction():
-            _publish(conn, bundle, child, None)
+            _publish(
+                conn,
+                bundle,
+                child,
+                None,
+                publish_asset_candidates=key in {"asset:all", "asset:commodity"},
+            )
             repository.save_metrics(conn, child.run_id, bundle)
             repository.finish_run(
                 conn, child, "CERTIFIED", results, commit=False,
@@ -202,6 +365,7 @@ def _backfill(
     fromyear: int | None,
     toyear: int | None,
     resume: str | None,
+    skip_assets: bool = False,
 ) -> None:
     base = base_uri(src)
     fingerprint = _fingerprint(base, None)
@@ -233,12 +397,20 @@ def _backfill(
 
         assets, identifiers, universe_stats = fmp.prepare_universe(base)
         fx_assets, fx_identifiers, _, _ = fmp.prepare_fx(base)
-        assets = pd.concat([assets, fx_assets], ignore_index=True)
-        identifiers = pd.concat([identifiers, fx_identifiers], ignore_index=True)
+        commodity_assets, commodity_identifiers, _, commodity_stats = (
+            fmp.prepare_commodities(base)
+        )
+        assets = pd.concat(
+            [assets, fx_assets, commodity_assets], ignore_index=True,
+        )
+        identifiers = pd.concat(
+            [identifiers, fx_identifiers, commodity_identifiers],
+            ignore_index=True,
+        )
         completed = _completed_partitions(conn, parent.run_id)
 
         key = "asset:all"
-        if key not in completed:
+        if not skip_assets and key not in completed:
             _certify_partition(
                 conn,
                 parent,
@@ -246,7 +418,11 @@ def _backfill(
                 CandidateBundle(
                     assets=assets,
                     identifiers=identifiers,
-                    stats={"asset": universe_stats, "_source": "FMP"},
+                    stats={
+                        "asset": universe_stats,
+                        "commodity": commodity_stats,
+                        "_source": "FMP",
+                    },
                 ),
             )
 
@@ -257,8 +433,11 @@ def _backfill(
                     base, assets, identifiers, year=year,
                 )
                 _, _, fx_prices, fx_stats = fmp.prepare_fx(base, year=year)
+                _, _, commodity_prices, commodity_stats = (
+                    fmp.prepare_commodities(base, year=year)
+                )
                 price_frame = pd.concat(
-                    [stock_prices, fx_prices], ignore_index=True,
+                    [stock_prices, fx_prices, commodity_prices], ignore_index=True,
                 )
                 if not price_frame.empty:
                     _certify_partition(
@@ -273,17 +452,19 @@ def _backfill(
                                 "asset": universe_stats,
                                 "price_daily": price_stats,
                                 "fx": fx_stats,
+                                "commodity": commodity_stats,
                                 "_source": "FMP",
                             },
                         ),
                     )
 
-            fundamental_key = f"fundamental:year={year}"
-            if fundamental_key not in completed:
-                fundamentals, stats = fmp.prepare_fundamentals(
-                    base, identifiers, year=year,
-                )
-                if not fundamentals.empty:
+            fundamentals, stats = fmp.prepare_fundamentals(
+                base, identifiers, year=year,
+            )
+            for fundamental_key, partition in _fundamental_partitions(
+                year, fundamentals,
+            ):
+                if fundamental_key not in completed:
                     _certify_partition(
                         conn,
                         parent,
@@ -291,7 +472,7 @@ def _backfill(
                         CandidateBundle(
                             assets=assets,
                             identifiers=identifiers,
-                            fundamentals=fundamentals,
+                            fundamentals=partition,
                             stats={
                                 "asset": universe_stats,
                                 "fundamental": stats,
@@ -335,6 +516,73 @@ def _backfill(
         conn.close()
 
 
+def _commodity_backfill(*, src: str, fromyear: int, toyear: int) -> None:
+    """Publish only the commodity assets/prices from an S3-backed one-off."""
+    if fromyear > toyear:
+        raise ValueError("fromyear must be <= toyear")
+    base = base_uri(src)
+    conn = db.connect()
+    parent = None
+    try:
+        repository.assert_schema(conn)
+        parent = repository.start_run(
+            conn,
+            mode="fmp_commodity_backfill",
+            status="BUILDING",
+            input_fingerprint=_fingerprint(base, None),
+        )
+        assets, identifiers, _, stats = fmp.prepare_commodities(base)
+        _certify_partition(
+            conn,
+            parent,
+            "asset:commodity",
+            CandidateBundle(
+                assets=assets,
+                identifiers=identifiers,
+                stats={
+                    "commodity": stats,
+                    "_source": "FMP",
+                    "_source_scope": "commodity",
+                },
+            ),
+        )
+        for year in range(fromyear, toyear + 1):
+            _, _, prices, year_stats = fmp.prepare_commodities(
+                base, year=year,
+            )
+            if prices.empty:
+                continue
+            _certify_partition(
+                conn,
+                parent,
+                f"commodity_price:year={year}",
+                CandidateBundle(
+                    assets=assets,
+                    identifiers=identifiers,
+                    prices=prices,
+                    stats={
+                        "commodity": year_stats,
+                        "_source": "FMP",
+                        "_source_scope": "commodity",
+                    },
+                ),
+            )
+        repository.finish_run(conn, parent, "CERTIFIED", [])
+        print(
+            f"[silver-fmp] certified commodity backfill run={parent.run_id}",
+            flush=True,
+        )
+    except Exception as exc:
+        if parent is not None:
+            conn.rollback()
+            repository.finish_run(
+                conn, parent, "FAILED", [], error_message=str(exc),
+            )
+        raise
+    finally:
+        conn.close()
+
+
 def run(
     *,
     src: str = "local",
@@ -342,25 +590,38 @@ def run(
     fromyear: int | None = None,
     toyear: int | None = None,
     resume: str | None = None,
+    skip_assets: bool = False,
+    commodities_only: bool = False,
 ) -> None:
     if day is not None:
         _daily(src=src, day=day)
+        return
+    if commodities_only:
+        if fromyear is None or toyear is None:
+            raise ValueError("commodity backfill requires fromyear and toyear")
+        _commodity_backfill(
+            src=src, fromyear=fromyear, toyear=toyear,
+        )
         return
     _backfill(
         src=src,
         fromyear=fromyear,
         toyear=toyear,
         resume=resume,
+        skip_assets=skip_assets,
     )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("daily", "backfill"), required=True)
+    parser.add_argument(
+        "--mode", choices=("daily", "backfill", "commodities"), required=True,
+    )
     parser.add_argument("--date")
     parser.add_argument("--from", dest="fromyear", type=int)
     parser.add_argument("--to", dest="toyear", type=int)
     parser.add_argument("--resume")
+    parser.add_argument("--skip-assets", action="store_true")
     parser.add_argument("--src", choices=("local",), default="local")
     return parser.parse_args()
 
@@ -375,6 +636,8 @@ def main() -> None:
         fromyear=args.fromyear,
         toyear=args.toyear,
         resume=args.resume,
+        skip_assets=args.skip_assets,
+        commodities_only=args.mode == "commodities",
     )
 
 

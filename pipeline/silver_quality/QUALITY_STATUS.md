@@ -1,81 +1,187 @@
 # Silver 데이터 품질 현황
 
-> **2026-08-03 운영 전환 상태:** 아래 수치는 기존 KRX/DART Silver 전체 감사의
-> 확정 스냅샷이다. FMP 미국주식 Bronze(2015~현재) 수집과 Silver v2 연도별 적재는
-> one-off ECS backfill로 진행 중이며, 완료 후 FMP를 포함한 전체 품질 감사를 새로
-> 실행해 이 문서의 기준 cutoff와 수치를 갱신한다. 중복 방지를 위해 해당 기간 daily
-> Scheduler는 일시 중지되어 있다.
+> 스냅샷: **2026-08-05 17:03 KST**, 운영 RDS 읽기 전용 조회 기준
 
-Silver 품질 게이트의 현재 상태 기록. 아래 **전체 silver 수치**는 최근 전체 감사
-(`s3_domain_audit`) 기준이고, 일별 증분은 그날 델타만 평가하므로 전체 수치를
-바꾸지 않는다. 전체 수치는 새 전체 감사를 돌릴 때 갱신한다.
+이 문서는 현재 Silver 품질 상태를 운영 데이터와 `dq_run`·`dq_result`·
+`dq_warning_state`에서 다시 집계한 결과다. 최신 증분 검사와 전체 역사 감사는 검사
+범위가 다르므로 아래에서 분리해 기록한다.
 
-- 룰셋: **1.17.0** — 2026-07-28 운영 배포 완료
-- 전체 수치 기준: Bronze cutoff `f6d0af48…` (2026-07-24), 가격 6,749,929행 · 재무 2,195,327행
-- 운영 검증: 2026-07-27 daily 증분 **CERTIFIED**(2,767행 publish, 차단 실패 0,
-  Modified 정상 기록) — 새 룰셋이 운영에서 정상 동작 확인
-- 종합: **차단 실패 0, 파이프라인發 데이터 오류 0.** Warning 376건은 전부 원인별로
-  분류·설명했고 의심되는 극단치는 개별 확인함(실제 이벤트 또는 DART 원천 오류).
-  Modified는 결정적 규칙 변환.
+## 결론
 
----
+- 현재 배포 ruleset: **1.21.0**, ECS daily task definition **88**
+- 최신 KRX/DART 증분: **CERTIFIED**, 대상일 `2026-08-04`
+- 최신 FMP 증분: **CERTIFIED**, 대상일 `2026-08-03`
+- 마지막 전체 역사 감사: **CERTIFIED**, 차단 Critical/Error 실패 **0**
+- 미인증 Silver 행: 모든 핵심 테이블 **0**
+- 핵심 NULL·비양수 가격·현재 식별자 중복: **0**
+- RDS Critical/Error guard 5개: 모두 **validated=true**
+- 현재 OPEN warning: **9개 검사 범위, 26건**
 
-## 차단 (Critical / Error) — **없음**
+현재 데이터는 전략 개발에 사용할 수 있는 인증 상태다. 다만 Warning은 원천값을
+보존한 검토 대상이며, 아래 항목을 해소된 데이터로 간주하면 안 된다.
 
-전체 감사에서 CRITICAL·ERROR 실패 0건. publish 게이트 통과 상태.
-중복키·필수키·OHLC 논리·시장 완전성·벤치마크·수정종가 대사(전체 시계열/스트리밍)·
-회계식·통화·행수 대사 등 모든 차단 검사 통과.
+## 최신 일별 증분 검사
 
-## Warning (비차단, 검토 대상) — 총 **376건**
+### KRX/DART
 
-376건 전부 원인별로 분류·설명했고 의심되는 극단치는 개별 확인했다.
-**모두 정당한 값이며 파이프라인이 만든 데이터 오류가 아니다.**
+| 항목 | 결과 |
+|---|---|
+| 대상일 | `2026-08-04` |
+| run ID | `cf4ee001-2193-434e-abf0-e4c2b387d110` |
+| 실행 ruleset | `1.19.3` |
+| 상태 | `CERTIFIED` |
+| Critical | PASS 13, 실패 0 |
+| Error | PASS 19, 실패 0 |
+| Warning | FAIL 규칙 2, 실패 건수 16 |
+| Modified | PASS 2 |
 
-| 규칙 | 건수 | 성격 | 판정 |
-|---|---:|---|---|
-| `PRICE_ADJUSTMENT_WITHOUT_DART_EVENT` | 316 | DART·거래재개 근거 없는 KRX 기준가 리셋 | 권리락·배당락·펀드분배 등 실제 이벤트. 값 정상 |
-| `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` | 20 | DART 효력일에 KRX 조정계수 없음 | 효력일 오정렬/거래정지/무효력. adj_close 무결 |
-| `PRICE_DISTRIBUTION_DRIFT` | 10 | 횡단면 수익률 이상치 | 전부 실제 시장 급변일(벤치마크·종목폭 확인) |
-| `DART_SOURCE_ACCOUNTING_INCONSISTENCY` | 30 | 재무 회계식 불일치 | DART 원천 오류(우리 매핑 정확). 원값 보존+플래그 |
+Warning 16건은 `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` 1건과
+`CASH_DIVIDEND_AMOUNT_COVERAGE` 15건이다. 차단 조건이 아니므로 원천값을
+보존하고 warning 상태로 추적한다.
 
-### `PRICE_ADJUSTMENT_WITHOUT_DART_EVENT` 316 세부
+### FMP
 
-| 구성 | 대략 | 비고 |
+| 항목 | 결과 |
+|---|---|
+| 대상일 | `2026-08-03` |
+| run ID | `27558df9-1d3c-418d-b7ea-f5ba5845ed8a` |
+| 실행 ruleset | `1.19.3` |
+| 상태 | `CERTIFIED` |
+| Critical | PASS 18, 실패 0 |
+| Error | PASS 5, 실패 0 |
+| Warning | 없음 |
+| Modified | PASS 5 |
+
+2026-08-05 08:30 KST 최초 실행은 `ACTION_IDENTIFIER_MAPPING` 오류로 Silver
+publish 전에 중단됐다. 수정 후 같은 대상일을 재실행해 KRX/DART는 15:12 KST,
+FMP는 15:14 KST에 인증 완료했다. 오전 수집 Bronze는 재실행에서 그대로 사용됐다.
+
+ruleset 1.21.0은 이 인증 실행 이후 배포됐다. 규칙 판정 의미는 유지하고 RDS의
+단일행 Critical/Error 방어 제약을 추가한 버전이며, 다음 daily가 첫 1.21.0 증분
+실행이다.
+
+## 현재 OPEN warning
+
+`dq_open_warning` 기준이다. 같은 실행 모드·대상일/파티션·데이터셋·규칙을 다시
+검사해 PASS가 나올 때만 RESOLVED가 된다.
+
+| 규칙 | OPEN 범위 | 실패 건수 | 대상일 범위 | 의미 |
+|---|---:|---:|---|---|
+| `CASH_DIVIDEND_AMOUNT_COVERAGE` | 1 | 15 | 2026-08-04 | DART 의사결정 문서에서 보통주 주당 현금액 미노출 |
+| `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` | 5 | 6 | 2026-07-27~2026-08-04 | 가격조정형 DART 행사 주변에 KRX 기준가 리셋 없음 |
+| `PRICE_ADJUSTMENT_WITHOUT_DART_EVENT` | 3 | 5 | 2026-07-27~2026-08-03 | KRX 기준가 조정에 대응하는 DART/거래재개 근거 없음 |
+| **합계** | **9** | **26** |  |  |
+
+FMP daily의 OPEN warning은 0건이다.
+
+## 마지막 전체 역사 감사
+
+| 항목 | 결과 |
+|---|---|
+| parent run ID | `bfd6d724-c405-422e-b1a5-8b29a3bad37b` |
+| 실행 시각 | 2026-08-05 00:01~00:10 KST |
+| ruleset | `1.19.1` |
+| 상태 | `CERTIFIED` |
+| Critical | PASS 143, 실패 0 |
+| Error | PASS 211, 실패 0 |
+| Modified | PASS 63 |
+| Warning | FAIL 결과 38개 |
+
+역사 감사에서 확인된 비차단 warning은 다음과 같다.
+
+| 규칙 | 실패 건수 | 판정 |
 |---|---:|---|
-| 유상증자 권리락 | ~203 | KOSPI. DART에 권리락일이 없어 자동 확인 불가 |
-| 연말 배당락류 | ~63 | 연말 기준가 조정 |
-| 무상증자 권리락 | ~18 | |
-| 미분류 | ~32 | 자원·개발펀드 원금상환/분배 등. 개별 확인 완료, 데이터 오류 0 (극단치 예: 152550 한국ANKOR유전) |
+| `PRICE_ADJUSTMENT_WITHOUT_DART_EVENT` | 303 | DART 근거가 없는 KRX 조정 이벤트, 원값 보존 |
+| `DART_SOURCE_ACCOUNTING_INCONSISTENCY` | 30 | DART 두 API에서 동일한 회계식 불일치 확인, 원천 오류로 플래그 |
+| `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` | 17 | 행사·가격조정 시점 불일치 또는 비가격조정 행사 |
+| `PRICE_DISTRIBUTION_DRIFT` | 10 | 실제 시장 급변일, 벤치마크·종목폭 확인 |
+| `CASH_DIVIDEND_AMOUNT_COVERAGE` | 현재 물리행 745 | DART 현금배당 18,476행 중 cash amount가 있는 행 17,731개 |
 
-## Modified (실제 값 변경) — 수정 행 수 포함
+`CASH_DIVIDEND_AMOUNT_COVERAGE`의 감사 파티션 합계 243,804는 연도별 파티션이
+누적 기업행사 후보를 반복 평가한 값이므로 고유 결측 행 수가 아니다. 현재 Silver의
+고유 물리행 기준 결측은 745건을 사용한다.
 
-Silver 생성 시 **행 안의 값을 실제로 바꾼** 것만 기록한다. 모두 규칙 기반 결정적 변환.
+전체 감사 이후 배당 적재와 ruleset 1.21.0 배포가 있었으므로, 이 감사는 최신 daily
+상태와 동일한 cutoff의 재감사가 아니다. 현재 증분의 차단 여부는 위 최신 일별 검사,
+전체 역사 품질의 마지막 확정선은 이 섹션을 기준으로 한다.
 
-| 규칙 | 값 변경 | 수정 행 수 |
-|---|---|---:|
-| `SOURCE_NO_TRADE_OHLC` | 무거래 행의 O/H/L `0 → NULL` (실거래 없는 sentinel 정규화) | 206,005 |
-| `SOURCE_INCOMPLETE_OHLC` | 거래 있으나 O/H/L=0인 행의 O/H/L `0 → NULL` (close·거래량·시총은 원본 보존) | 10 |
-| `DART_ACCOUNTING_EQUATION_SUPPLEMENT_REPLACEMENT` | 회계식 불일치 시 자산·부채·자본을 전체재무제표 값으로 교체 | 0 |
+## 현재 Silver 적재 범위
 
-- 대부분(206,005행)은 무거래일 O/H/L 결측 정규화이고, 실거래 값을 덮어쓴 건 아니다.
-- 값 교체(REPLACEMENT)는 독립 신뢰 출처(같은 revision 전체재무제표)가 회계식을
-  대사할 때만 하며, 발동 시 원값·교체값·출처를 기록한다. 이 스냅샷에선 0건.
-- 원천(KRX·DART) 오류는 값을 고치지 않고 보존 + 플래그가 원칙이다.
+### 가격
 
----
+| source | 행 수 | 자산 수 | 기간 |
+|---|---:|---:|---|
+| KRX | 6,769,289 | 3,303 | 2015-01-02~2026-08-04 |
+| FMP | 14,505,614 | 8,718 | 2015-01-02~2026-08-03 |
+| FMP_FX | 3,094 | 1 | 2015-01-01~2026-08-03 |
 
-## 갱신 방법
+### 재무·배당 지표
 
-이 문서는 스냅샷 기준 시점 기록이다. 운영 Silver는 매일 증분이 누적되므로,
-현재 전체 상태를 다시 확정하려면 전체 감사를 재실행하고 수치를 갱신한다.
+| source | statement | basis | 행 수 | 자산 수 | 기간 |
+|---|---|---|---:|---:|---|
+| DART | BS | STANDARDIZED | 1,479,913 | 3,038 | 2015-03-31~2026-06-30 |
+| DART | IS | STANDARDIZED | 715,559 | 3,038 | 2015-03-31~2026-06-30 |
+| DART | DIVIDEND | REPORTED | 96,763 | 1,888 | 2013-09-30~2026-04-30 |
+| FMP | BS | STANDARDIZED | 2,602,497 | 8,462 | 2003-09-30~2026-07-15 |
+| FMP | IS | STANDARDIZED | 3,291,802 | 8,457 | 2001-12-31~2026-07-15 |
+| FMP | CF | STANDARDIZED | 1,299,567 | 8,430 | 2001-12-31~2026-07-26 |
+
+### 주요 기업행사
+
+| source | action | 행 수 | 자산 수 |
+|---|---|---:|---:|
+| DART_DISCLOSURE | cash_dividend | 18,476 | 1,813 |
+| FMP_DIVIDEND | cash_dividend | 113,172 | 3,633 |
+| FMP_SPLIT | stock_split | 1,104 | 854 |
+
+## DB 무결성 방어
+
+기존 PK·UNIQUE·FK와 함께 다음 CHECK가 운영 RDS에서 모두 검증됐다.
+
+| 테이블 | 제약 | validated |
+|---|---|---|
+| `asset` | `asset_critical_error_guard` | true |
+| `asset_identifier` | `asset_identifier_critical_error_guard` | true |
+| `price_daily` | `price_daily_critical_error_guard` | true |
+| `fundamental` | `fundamental_critical_error_guard` | true |
+| `corporate_action` | `corporate_action_critical_error_guard` | true |
+
+대표적인 잘못된 쓰기 다섯 종류(빈 자산명, 빈 식별자, `close=0`, DART PIT 날짜
+역전, 빈 action type)를 rollback transaction으로 시험했고 모두 CHECK 위반으로
+거부됐다.
+
+현재 무결성 집계:
+
+- `asset`, `asset_identifier`, `price_daily`, `fundamental`, `corporate_action`
+  미인증 행: 각각 0
+- NULL/비양수 `price_daily.close`: 0
+- NULL value·available date/time 재무행: 0
+- action type/key 결측: 0
+- CIK를 제외한 현재 ticker/CUSIP/ISIN 등 중복 식별자 값: 0
+
+DB guard는 한 행만으로 판정 가능한 Critical/Error를 방어한다. 시장 완전성, 거래일
+캘린더, 수정종가 전체 시계열, 기업행사 대사처럼 여러 행이나 외부 문맥이 필요한
+규칙은 계속 Python 품질 게이트에서 검사한다. Warning은 원천 보존 정책상 DB에서
+차단하지 않는다.
+
+## 재검증 방법
+
+현재 운영 상태와 OPEN warning 조회:
+
+```bash
+uv run python -m pipeline.silver.status
+```
+
+전체 역사 감사를 새 cutoff와 ruleset으로 갱신:
 
 ```bash
 uv run python -m pipeline.silver_quality.s3_domain_audit --action init
-uv run python -m pipeline.silver_quality.s3_domain_audit --action domain --domain prices --parent-run-id <run-id>
-uv run python -m pipeline.silver_quality.s3_domain_audit --action domain --domain fundamentals --parent-run-id <run-id>
-uv run python -m pipeline.silver_quality.s3_domain_audit --action finalize --parent-run-id <run-id>
+uv run python -m pipeline.silver_quality.s3_domain_audit \
+  --action domain --domain prices --parent-run-id <run-id>
+uv run python -m pipeline.silver_quality.s3_domain_audit \
+  --action domain --domain fundamentals --parent-run-id <run-id>
+uv run python -m pipeline.silver_quality.s3_domain_audit \
+  --action finalize --parent-run-id <run-id>
 ```
 
-일별 증분은 그날 델타만 평가하므로 `dq_run`·`dq_result`의 daily 기록은 "그날
-무엇이 flag됐나"의 로그다. 전체 Silver 진단은 위 전체 감사 결과를 기준으로 한다.
-규칙 정의는 [`README.md`](README.md) 참고.
+규칙 정의와 severity 정책은 [`README.md`](README.md)를 참고한다.

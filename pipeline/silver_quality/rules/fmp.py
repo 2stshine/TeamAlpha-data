@@ -1,8 +1,10 @@
 """Source-aware quality gates for FMP Silver candidates."""
 from __future__ import annotations
 
+import exchange_calendars as xcals
 import pandas as pd
 
+from pipeline.fmp_commodities import COMMODITY_BY_SYMBOL, COMMODITY_SYMBOLS
 from pipeline.silver_quality.models import (
     CandidateBundle,
     CheckResult,
@@ -24,16 +26,26 @@ def check_fmp(bundle: CandidateBundle) -> list[CheckResult]:
     prices = bundle.prices
     fundamentals = bundle.fundamentals
     actions = bundle.actions
+    commodity_enabled = (
+        bundle.stats.get("_source_scope") == "commodity"
+        or "commodity" in bundle.stats
+        or (
+            "asset_type" in assets
+            and assets["asset_type"].eq("commodity").any()
+        )
+    )
 
     stock_assets = (
         assets[assets["asset_type"].eq("stock")]
         if "asset_type" in assets else assets.iloc[0:0]
     )
-    checks.append(result(
-        "FMP_REQUIRED_UNIVERSE", "asset", Severity.CRITICAL,
-        int(stock_assets.empty), "at least one admitted FMP equity",
-        "empty" if stock_assets.empty else f"rows={len(stock_assets)}",
-    ))
+    commodity_scope = bundle.stats.get("_source_scope") == "commodity"
+    if not commodity_scope:
+        checks.append(result(
+            "FMP_REQUIRED_UNIVERSE", "asset", Severity.CRITICAL,
+            int(stock_assets.empty), "at least one admitted FMP equity",
+            "empty" if stock_assets.empty else f"rows={len(stock_assets)}",
+        ))
 
     checks.extend([
         null_keys(
@@ -64,6 +76,52 @@ def check_fmp(bundle: CandidateBundle) -> list[CheckResult]:
             "FMP_SILVER_UNIVERSE", "asset", Severity.CRITICAL, invalid,
             "only non-ETF/non-fund US-exchange equities are admitted",
         ))
+        commodities = assets[assets["asset_type"].eq("commodity")]
+        expected_units = commodities["natural_key"].astype(str).map(
+            lambda key: (
+                COMMODITY_BY_SYMBOL.get(
+                    key.removeprefix("FMP:COMMODITY:")
+                ).price_unit
+                if key.removeprefix("FMP:COMMODITY:") in COMMODITY_BY_SYMBOL
+                else None
+            )
+        )
+        invalid_commodities = commodities[
+            ~commodities["natural_key"].astype(str).str.removeprefix(
+                "FMP:COMMODITY:"
+            ).isin(COMMODITY_SYMBOLS)
+            | ~commodities["instrument_type"].eq(
+                "commodity_future_continuous"
+            )
+            | ~commodities["exchange"].eq("COMMODITY")
+            | ~commodities["currency"].eq("USD")
+            | ~commodities["base_currency"].eq("USD")
+            | commodities.get("price_unit", pd.Series(index=commodities.index)).isna()
+            | ~commodities.get(
+                "price_unit", pd.Series(index=commodities.index)
+            ).eq(expected_units)
+        ]
+        checks.append(result(
+            "FMP_COMMODITY_UNIVERSE", "asset", Severity.CRITICAL,
+            invalid_commodities,
+            "only the 28 allowlisted normalized continuous-futures assets",
+        ))
+        if commodity_enabled:
+            commodity_symbols = set(
+                commodities["natural_key"].astype(str).str.removeprefix(
+                    "FMP:COMMODITY:"
+                )
+            )
+            checks.append(result(
+                "FMP_COMMODITY_UNIVERSE_COMPLETE", "asset", Severity.CRITICAL,
+                int(commodity_symbols != set(COMMODITY_SYMBOLS)),
+                "exactly 28 physical non-micro commodity series",
+                actual=(
+                    f"count={len(commodity_symbols)} "
+                    f"missing={sorted(set(COMMODITY_SYMBOLS)-commodity_symbols)} "
+                    f"extra={sorted(commodity_symbols-set(COMMODITY_SYMBOLS))}"
+                ),
+            ))
     if not identifiers.empty:
         orphans = identifiers[
             ~identifiers["natural_key"].isin(set(assets["natural_key"]))
@@ -80,8 +138,10 @@ def check_fmp(bundle: CandidateBundle) -> list[CheckResult]:
             ["source", "identifier_type", "identifier"],
         ))
     symbols = set(
-        identifiers.loc[
-            identifiers["identifier_type"].isin(["ticker", "fx_pair"]),
+            identifiers.loc[
+            identifiers["identifier_type"].isin(
+                ["ticker", "fx_pair", "commodity_symbol"]
+            ),
             "identifier",
         ].astype(str)
     ) if not identifiers.empty else set()
@@ -108,15 +168,68 @@ def check_fmp(bundle: CandidateBundle) -> list[CheckResult]:
         numeric = prices[["open", "high", "low", "close"]].apply(
             pd.to_numeric, errors="coerce",
         )
+        commodity_price = prices["source"].eq("FMP_COMMODITY")
         bad_ohlc = prices[
             numeric["high"].lt(numeric[["open", "close"]].max(axis=1))
             | numeric["low"].gt(numeric[["open", "close"]].min(axis=1))
-            | numeric[["open", "high", "low", "close"]].le(0).any(axis=1)
+            | numeric.isna().any(axis=1)
+            | (
+                ~commodity_price
+                & numeric[["open", "high", "low", "close"]].le(0).any(axis=1)
+            )
         ]
         checks.append(result(
             "FMP_PRICE_OHLC", "price_daily", Severity.ERROR, bad_ohlc,
-            "positive OHLC with low <= open/close <= high",
+            "finite OHLC with low <= open/close <= high; non-futures positive",
         ))
+        commodities = prices[commodity_price]
+        if not commodities.empty:
+            semantic_bad = commodities[
+                ~commodities["currency"].eq("USD")
+                | commodities["total_return_close"].notna()
+                | commodities["shares"].notna()
+                | commodities["market_cap"].notna()
+                | commodities["trading_value"].notna()
+                | commodities["market"].notna()
+                | ~commodities["adj_close"].eq(commodities["close"])
+                | commodities.get(
+                    "price_unit", pd.Series(index=commodities.index)
+                ).isna()
+            ]
+            checks.append(result(
+                "FMP_COMMODITY_PRICE_SEMANTICS", "price_daily",
+                Severity.ERROR, semantic_bad,
+                "USD normalized continuous-future price; adj_close=close; "
+                "equity-only fields null",
+            ))
+            dates = pd.to_datetime(
+                commodities["trade_date"], errors="coerce",
+            )
+            checks.append(result(
+                "FMP_COMMODITY_WEEKDAY", "price_daily", Severity.ERROR,
+                commodities[dates.dt.weekday.ge(5).to_numpy()],
+                "commodity EOD observations are dated Monday-Friday",
+            ))
+        equity_prices = prices[prices["source"].eq("FMP")]
+        if not equity_prices.empty:
+            parsed_dates = pd.to_datetime(
+                equity_prices["trade_date"], errors="coerce",
+            )
+            start = parsed_dates.min()
+            end = parsed_dates.max()
+            sessions = set(
+                xcals.get_calendar("XNYS")
+                .sessions_in_range(start, end)
+                .tz_localize(None)
+                .date
+            )
+            non_session = equity_prices[
+                ~parsed_dates.dt.date.isin(sessions).to_numpy()
+            ]
+            checks.append(result(
+                "FMP_PRICE_TRADING_SESSION", "price_daily", Severity.ERROR,
+                non_session, "every FMP equity price is on an XNYS session",
+            ))
 
     target_date = bundle.stats.get("_target_date")
     if target_date is not None and not bundle.stats.get("_market_closed", False):
@@ -132,7 +245,12 @@ def check_fmp(bundle: CandidateBundle) -> list[CheckResult]:
 
     if not fundamentals.empty:
         fundamental_key = [
-            "identifier", "source", "statement_type", "data_basis", "period_end",
+            (
+                "natural_key"
+                if "natural_key" in fundamentals
+                else "identifier"
+            ),
+            "source", "statement_type", "data_basis", "period_end",
             "fiscal_period", "fs_type", "revision_key", "metric",
         ]
         checks.extend([
@@ -147,9 +265,12 @@ def check_fmp(bundle: CandidateBundle) -> list[CheckResult]:
         ))
 
     if not actions.empty:
+        action_identity = (
+            "natural_key" if "natural_key" in actions else "identifier"
+        )
         checks.extend([
-            null_keys(actions, "corporate_action", ["identifier", "source", "action_key", "action_type", "ex_date"]),
-            duplicate_keys(actions, "corporate_action", ["identifier", "source", "action_key"]),
+            null_keys(actions, "corporate_action", [action_identity, "source", "action_key", "action_type", "ex_date"]),
+            duplicate_keys(actions, "corporate_action", [action_identity, "source", "action_key"]),
         ])
         checks.append(result(
             "FMP_ACTION_IDENTIFIER_MAPPING", "corporate_action", Severity.CRITICAL,
@@ -190,4 +311,64 @@ def check_fmp(bundle: CandidateBundle) -> list[CheckResult]:
             universe.get("ambiguous_identifier_samples", [])
         )[:20],
     ))
+    price_stats = bundle.stats.get("price_daily", {})
+    for code, detail_key, expected in (
+        (
+            "FMP_NON_SESSION_PRICE_EXCLUDED", "non_session_rows_excluded",
+            "global-bulk rows outside XNYS sessions remain in Bronze and are excluded from Silver",
+        ),
+        (
+            "FMP_INVALID_OHLC_EXCLUDED", "invalid_ohlc_excluded",
+            "invalid source OHLC rows remain in Bronze and are excluded from Silver",
+        ),
+        (
+            "FMP_DUPLICATE_PRICE_REMOVED", "duplicate_price_rows_removed",
+            "duplicate source price keys are deterministically reduced to one Silver row",
+        ),
+    ):
+        detail = price_stats.get(detail_key, {})
+        count = int(detail.get("row_count", 0))
+        checks.append(CheckResult(
+            rule_code=code,
+            dataset="price_daily",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected=expected,
+            actual=f"affected_rows={count}",
+            failed_count=0,
+            samples=list(detail.get("samples", []))[:20],
+        ))
+    if commodity_enabled:
+        commodity_stats = bundle.stats.get("commodity", {})
+        missing_provider = list(commodity_stats.get("missing_from_provider", []))
+        currency_mismatches = list(
+            commodity_stats.get("provider_currency_mismatches", [])
+        )
+        checks.append(result(
+            "FMP_COMMODITY_PROVIDER_LIST", "asset", Severity.CRITICAL,
+            len(missing_provider) + int(
+                not commodity_stats.get("provider_list_present", False)
+            ) + len(currency_mismatches),
+            "the current FMP commodities-list contains all 28 allowlisted symbols",
+            actual=(
+                f"list_present={commodity_stats.get('provider_list_present', False)} "
+                f"missing={missing_provider} "
+                f"currency_mismatches={currency_mismatches}"
+            ),
+        ))
+        roll = commodity_stats.get("possible_roll", {})
+        roll_count = int(roll.get("row_count", 0))
+        checks.append(CheckResult(
+            rule_code="FMP_COMMODITY_POSSIBLE_ROLL",
+            dataset="price_daily",
+            severity=Severity.WARNING,
+            status=CheckStatus.FAIL if roll_count else CheckStatus.PASS,
+            expected=(
+                "no unreviewed absolute one-day move above 20%; "
+                "source values preserved"
+            ),
+            actual=f"possible_roll_rows={roll_count}",
+            failed_count=roll_count,
+            samples=list(roll.get("samples", []))[:20],
+        ))
     return checks

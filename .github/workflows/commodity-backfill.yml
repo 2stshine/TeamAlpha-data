@@ -1,0 +1,143 @@
+name: Backfill FMP commodities
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_year:
+        description: First history year
+        required: true
+        default: "2015"
+      to_year:
+        description: Last history year
+        required: true
+        default: "2026"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: fmp-commodity-backfill
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECS_TASK_FAMILY: ${{ vars.ECS_TASK_FAMILY }}
+  CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
+  SCHEDULE_NAME: ${{ vars.SCHEDULE_NAME }}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve production resources
+        run: |
+          set -euo pipefail
+          DEFAULT_FAMILY="$(basename "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')-daily-full"
+          ECS_TASK_FAMILY="${ECS_TASK_FAMILY:-${DEFAULT_FAMILY}}"
+          CONTAINER_NAME="${CONTAINER_NAME:-${ECS_TASK_FAMILY}}"
+          SCHEDULE_NAME="${SCHEDULE_NAME:-${ECS_TASK_FAMILY}-tue-sat-0830-kst}"
+          {
+            echo "ECS_TASK_FAMILY=${ECS_TASK_FAMILY}"
+            echo "CONTAINER_NAME=${CONTAINER_NAME}"
+            echo "SCHEDULE_NAME=${SCHEDULE_NAME}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Register one-off task definition
+        id: task
+        env:
+          FROM_YEAR: ${{ inputs.from_year }}
+          TO_YEAR: ${{ inputs.to_year }}
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition \
+            --task-definition "${ECS_TASK_FAMILY}" \
+            --query taskDefinition --output json > current.json
+          jq \
+            --arg container "${CONTAINER_NAME}" \
+            --arg from_year "${FROM_YEAR}" \
+            --arg to_year "${TO_YEAR}" \
+            '
+            {
+              family, taskRoleArn, executionRoleArn, networkMode,
+              containerDefinitions, volumes, placementConstraints,
+              requiresCompatibilities, cpu, memory, runtimePlatform,
+              ephemeralStorage, ipcMode, pidMode, proxyConfiguration,
+              inferenceAccelerators
+            }
+            | with_entries(select(.value != null and .value != [] and .value != {}))
+            | .containerDefinitions |= map(
+                if .name == $container then
+                  .entryPoint = ["uv","run","python","-m","pipeline.fmp_backfill_ecs"]
+                  | .command = ["--phase","commodities","--from",$from_year,"--to",$to_year]
+                else . end
+              )
+            ' current.json > one-off.json
+          TASK_DEFINITION_ARN="$(
+            aws ecs register-task-definition \
+              --cli-input-json file://one-off.json \
+              --query taskDefinition.taskDefinitionArn --output text
+          )"
+          echo "task_definition_arn=${TASK_DEFINITION_ARN}" >> "${GITHUB_OUTPUT}"
+
+      - name: Start and wait for commodity backfill
+        env:
+          TASK_DEFINITION_ARN: ${{ steps.task.outputs.task_definition_arn }}
+        run: |
+          set -euo pipefail
+          aws scheduler get-schedule \
+            --name "${SCHEDULE_NAME}" --query Target --output json > target.json
+          jq \
+            --arg task_definition "${TASK_DEFINITION_ARN}" \
+            '{
+              cluster: .Arn,
+              taskDefinition: $task_definition,
+              launchType: (.EcsParameters.LaunchType // "FARGATE"),
+              platformVersion: (.EcsParameters.PlatformVersion // "LATEST"),
+              networkConfiguration: {
+                awsvpcConfiguration: {
+                  subnets: .EcsParameters.NetworkConfiguration.AwsvpcConfiguration.Subnets,
+                  securityGroups: (.EcsParameters.NetworkConfiguration.AwsvpcConfiguration.SecurityGroups // []),
+                  assignPublicIp: (.EcsParameters.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp // "DISABLED")
+                }
+              },
+              startedBy: "github-commodity-backfill"
+            }' target.json > run-task.json
+          TASK_ARN="$(
+            aws ecs run-task --cli-input-json file://run-task.json \
+              --query 'tasks[0].taskArn' --output text
+          )"
+          if [[ -z "${TASK_ARN}" || "${TASK_ARN}" == "None" ]]; then
+            aws ecs run-task --cli-input-json file://run-task.json
+            exit 1
+          fi
+          CLUSTER_ARN="$(jq -r '.cluster' run-task.json)"
+          echo "Started ${TASK_ARN}"
+          for _ in $(seq 1 180); do
+            STATUS="$(
+              aws ecs describe-tasks --cluster "${CLUSTER_ARN}" \
+                --tasks "${TASK_ARN}" --query 'tasks[0].lastStatus' --output text
+            )"
+            if [[ "${STATUS}" == "STOPPED" ]]; then
+              break
+            fi
+            sleep 20
+          done
+          aws ecs describe-tasks --cluster "${CLUSTER_ARN}" \
+            --tasks "${TASK_ARN}" --output json > stopped.json
+          jq '{stopCode: .tasks[0].stopCode, stoppedReason: .tasks[0].stoppedReason,
+               containers: [.tasks[0].containers[] | {name, exitCode, reason}]}' stopped.json
+          EXIT_CODE="$(
+            jq -r --arg container "${CONTAINER_NAME}" \
+              '.tasks[0].containers[] | select(.name == $container) | .exitCode // -1' \
+              stopped.json
+          )"
+          test "${EXIT_CODE}" = "0"

@@ -602,6 +602,11 @@ def prepare(
     df = pd.concat([primary, supplemental_df], ignore_index=True).drop(
         columns="_supplemental", errors="ignore",
     )
+    # pandas can discard the schema when both inputs are empty. Daily jobs
+    # legitimately pass an explicit empty changed-file list.
+    for column in candidate_cols:
+        if column != "_supplemental" and column not in df:
+            df[column] = pd.Series(dtype="object")
     balance_metrics = {
         metric
         for metric, statements in SUPPLEMENT_STATEMENT_BY_METRIC.items()

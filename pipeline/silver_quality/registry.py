@@ -9,6 +9,7 @@ from pipeline.silver_quality.models import (
 )
 from pipeline.silver_quality.rules.common import result
 from pipeline.silver_quality.rules.assets import check_assets
+from pipeline.silver_quality.rules.actions import check_actions
 from pipeline.silver_quality.rules.financials import check_financials
 from pipeline.silver_quality.rules.prices import check_prices
 from pipeline.silver_quality.rules.reconciliation import check_reconciliation
@@ -46,6 +47,15 @@ def run_registered_rules(
         results.append(result(
             "FUNDAMENTAL_IDENTIFIER_MAPPING", "fundamental", Severity.ERROR,
             missing, "every fundamental ticker maps to a KRX asset",
+            partition_key=partition_key,
+        ))
+    if not bundle.actions.empty:
+        missing = bundle.actions[
+            ~bundle.actions["identifier"].astype(str).isin(krx)
+        ]
+        results.append(result(
+            "ACTION_IDENTIFIER_MAPPING", "corporate_action", Severity.ERROR,
+            missing, "every corporate action maps to a KRX asset",
             partition_key=partition_key,
         ))
     unsupported_market = bundle.stats.get("price_daily", {}).get(
@@ -120,6 +130,38 @@ def run_registered_rules(
             samples=list(nontradable.get("samples", []))[:20],
             partition_key=partition_key,
         ))
+    for stat_key, code, expected in (
+        (
+            "unsupported_market_action",
+            "UNSUPPORTED_MARKET_ACTION_EXCLUDED",
+            "corporate actions for KONEX-only assets are excluded from Silver",
+        ),
+        (
+            "no_tradable_price_action",
+            "NO_TRADABLE_PRICE_ACTION",
+            "corporate actions require a ticker in the complete KRX price universe",
+        ),
+    ):
+        detail = bundle.stats.get("corporate_action", {}).get(
+            stat_key,
+            {"row_count": 0, "ticker_count": 0, "samples": []},
+        )
+        row_count = int(detail.get("row_count", 0))
+        if row_count > 0:
+            results.append(CheckResult(
+                rule_code=code,
+                dataset="corporate_action",
+                severity=Severity.MODIFIED,
+                status=CheckStatus.PASS,
+                expected=expected,
+                actual=(
+                    f"excluded_rows={row_count}, "
+                    f"excluded_tickers={int(detail.get('ticker_count', 0))}"
+                ),
+                failed_count=0,
+                samples=list(detail.get("samples", []))[:20],
+                partition_key=partition_key,
+            ))
     full_statement = bundle.stats.get("fundamental", {}).get(
         "full_statement_supplement",
         {"row_count": 0, "file_count": 0},
@@ -183,5 +225,7 @@ def run_registered_rules(
                 {},
             ).get("source_accounting_inconsistency"),
         ))
+    if not bundle.actions.empty:
+        results.extend(check_actions(bundle.actions, partition_key))
     results.extend(check_reconciliation(bundle.stats, partition_key))
     return results

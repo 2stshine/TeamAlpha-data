@@ -19,6 +19,7 @@ from datetime import date, datetime, timedelta
 
 from pipeline.bronze import (
     corporate_actions,
+    dividends,
     financials,
     fmp as fmp_bronze,
     index,
@@ -37,6 +38,7 @@ def run_backfill(fromyear: int, toyear: int, dest: str) -> None:
     stock_marcap.run(fromyear, toyear, dest)                  # 시세 marcap (전종목·전기간)
     index.run(f"{fromyear}0101", f"{toyear}1231", dest)        # 지수 KRX OpenAPI
     financials.run(fromyear, toyear, dest)                     # 재무 DART
+    dividends.run(fromyear, toyear, dest)                      # 국내 연간 배당 DART
     corporate_actions.run(
         f"{fromyear}0101",
         f"{toyear}1231",
@@ -54,7 +56,8 @@ def run_daily(day: str, dest: str) -> None:
     """수동 증분: 지정 날짜 bronze → silver 증분 반영. 재개(exists)로 중복 방지."""
     stock_krxapi.run(day, day, dest)                          # 시세 KRX OpenAPI (지정 날짜)
     index.run(day, day, dest)                                  # 지수 KRX OpenAPI (지정 날짜)
-    financials.run(int(day[:4]), int(day[:4]), dest, refresh_existing=True)  # 재무: 당해 연도 재조회 → 신규 공시 반영
+    changed_financials = financials.run(int(day[:4]), int(day[:4]), dest, refresh_existing=True)  # 재무: 당해 연도 재조회 → 신규 공시 반영
+    dividends.run_for_financial_paths(changed_financials, dest)  # 새·정정 정기보고서 배당
     action_from = (
         datetime.strptime(day, "%Y%m%d").date() - timedelta(days=14)
     ).strftime("%Y%m%d")

@@ -22,11 +22,16 @@ import requests
 
 from pipeline.common.paths import base_uri
 from pipeline.common.sink import object_size, read_bytes, write_bytes
+from pipeline.fmp_commodities import COMMODITY_SPECS
 
 BASE_URL = "https://financialmodelingprep.com/stable"
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 PROFILE_PARTS = range(4)
 US_EXCHANGES = ("NASDAQ", "NYSE", "AMEX")
+CALENDAR_ROW_LIMIT = 4000
+SCREENER_PAGE_SIZE = 10000
+DELISTED_PAGE_SIZE = 100
+SYMBOL_CHANGE_LIMIT = 10000
 
 
 class FMPError(RuntimeError):
@@ -261,6 +266,147 @@ def collect_raw(
     return [object_uri, manifest_uri]
 
 
+def _calendar_rows(payload: bytes) -> list[dict]:
+    try:
+        value = json.loads(payload)
+    except (TypeError, ValueError) as exc:
+        raise FMPError("calendar response is not valid JSON") from exc
+    if not isinstance(value, list):
+        raise FMPError(
+            f"calendar response must be a list: type={type(value).__name__}"
+        )
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _collect_calendar_window(
+    client: FMPClient,
+    *,
+    root: str,
+    endpoint: str,
+    prefix: str,
+    start: date,
+    end: date,
+) -> list[str]:
+    """Collect one calendar window, bisecting any capped 4,000-row response."""
+    object_uri = f"{root.rstrip('/')}/{prefix.strip('/')}/response.json"
+    manifest_uri = f"{root.rstrip('/')}/{prefix.strip('/')}/manifest.json"
+    if verify_raw_object_for_resume(object_uri, manifest_uri):
+        return [object_uri, manifest_uri]
+
+    response = client.get(
+        endpoint,
+        {"from": start.isoformat(), "to": end.isoformat()},
+    )
+    rows = _calendar_rows(response.body)
+    if len(rows) >= CALENDAR_ROW_LIMIT:
+        if start >= end:
+            raise FMPError(
+                f"calendar daily response is capped: endpoint={endpoint} "
+                f"date={start.isoformat()} rows={len(rows)}"
+            )
+        midpoint = start + timedelta(days=(end - start).days // 2)
+        paths: list[str] = []
+        for child_start, child_end in (
+            (start, midpoint),
+            (midpoint + timedelta(days=1), end),
+        ):
+            paths += _collect_calendar_window(
+                client,
+                root=root,
+                endpoint=endpoint,
+                prefix=(
+                    f"{prefix.rstrip('/')}/segment="
+                    f"{child_start.isoformat()}_{child_end.isoformat()}"
+                ),
+                start=child_start,
+                end=child_end,
+            )
+        return paths
+
+    write_bytes(response.body, object_uri)
+    write_bytes(_manifest(response, object_uri), manifest_uri)
+    if not object_uri.startswith("s3://") and not verify_raw_object(
+        object_uri,
+        manifest_uri,
+    ):
+        raise FMPError(f"Bronze checksum verification failed: {object_uri}")
+    return [object_uri, manifest_uri]
+
+
+def _month_windows(start: date, end: date) -> list[tuple[date, date]]:
+    windows = []
+    current = start
+    while current <= end:
+        next_month = (
+            date(current.year + 1, 1, 1)
+            if current.month == 12
+            else date(current.year, current.month + 1, 1)
+        )
+        window_end = min(end, next_month - timedelta(days=1))
+        windows.append((current, window_end))
+        current = window_end + timedelta(days=1)
+    return windows
+
+
+def _collect_dividend_backfill(
+    client: FMPClient,
+    root: str,
+    fromyear: int,
+    toyear: int,
+) -> list[str]:
+    paths: list[str] = []
+    windows = _month_windows(
+        date(fromyear, 1, 1),
+        date(toyear, 12, 31),
+    )
+    for number, (start, end) in enumerate(windows, start=1):
+        paths += _collect_calendar_window(
+            client,
+            root=root,
+            endpoint="dividends-calendar",
+            prefix=(
+                f"corporate_actions/fmp/dividends/year={start.year}/"
+                f"window={start:%Y-%m}"
+            ),
+            start=start,
+            end=end,
+        )
+        print(
+            f"[fmp-dividends] windows={number}/{len(windows)} "
+            f"through={end.isoformat()}",
+            flush=True,
+        )
+    return paths
+
+
+def run_dividend_backfill(
+    fromyear: int,
+    toyear: int,
+    dest: str = "s3",
+) -> list[str]:
+    if fromyear > toyear:
+        raise ValueError("fromyear must be <= toyear")
+    root = base_uri(dest)
+    client = FMPClient(
+        max_attempts=20,
+        min_interval=float(
+            os.environ.get("FMP_BACKFILL_MIN_INTERVAL_SECONDS", "0.5")
+        ),
+    )
+    print(
+        f"[fmp-dividends] backfill start years={fromyear}-{toyear} dest={dest}",
+        flush=True,
+    )
+    paths = _collect_dividend_backfill(client, root, fromyear, toyear)
+    print(
+        f"[fmp-dividends] backfill complete objects={len(paths)} "
+        f"api_calls={client.logical_request_count} "
+        f"rate_limits={client.rate_limit_count}",
+        flush=True,
+    )
+    return paths
+
+
 def _json_rows(payload: bytes) -> list[dict]:
     try:
         value = json.loads(payload)
@@ -288,11 +434,32 @@ def _collect_universe(
         prefix=f"stock/fmp/universe/stock-list/snapshot_date={snapshot}",
         extension="json",
     )
-    paths += collect_raw(
-        client, root=root, endpoint="company-screener", params={"limit": 100000},
-        prefix=f"stock/fmp/universe/company-screener/snapshot_date={snapshot}",
-        extension="json",
-    )
+    # The stable screener caps each page at 10,000 rows even when a larger
+    # limit is requested.  Preserve each provider page instead of silently
+    # accepting only the first 10,000 instruments.
+    for page in range(100):
+        page_prefix = (
+            f"stock/fmp/universe/company-screener/snapshot_date={snapshot}"
+            if page == 0
+            else (
+                f"stock/fmp/universe/company-screener/snapshot_date={snapshot}/"
+                f"page={page}"
+            )
+        )
+        page_paths = collect_raw(
+            client,
+            root=root,
+            endpoint="company-screener",
+            params={"page": page, "limit": SCREENER_PAGE_SIZE},
+            prefix=page_prefix,
+            extension="json",
+        )
+        paths += page_paths
+        payload = read_bytes(page_paths[0]) or b"[]"
+        if len(_json_rows(payload)) < SCREENER_PAGE_SIZE:
+            break
+    else:
+        raise FMPError("company-screener pagination exceeded 100 pages")
     for part in PROFILE_PARTS:
         paths += collect_raw(
             client, root=root, endpoint="profile-bulk", params={"part": part},
@@ -301,17 +468,23 @@ def _collect_universe(
             ),
             extension="csv",
         )
+    # Without an explicit limit FMP returns only the latest 100 changes.
     paths += collect_raw(
-        client, root=root, endpoint="symbol-change", params=None,
-        prefix=f"stock/fmp/universe/symbol-change/snapshot_date={snapshot}",
+        client,
+        root=root,
+        endpoint="symbol-change",
+        params={"limit": SYMBOL_CHANGE_LIMIT},
+        prefix=(
+            f"stock/fmp/universe/symbol-change/snapshot_date={snapshot}/"
+            f"limit={SYMBOL_CHANGE_LIMIT}"
+        ),
         extension="json",
     )
-    limit = 1000
     max_pages = 100 if all_delisted_pages else 1
     for page in range(max_pages):
         page_paths = collect_raw(
             client, root=root, endpoint="delisted-companies",
-            params={"page": page, "limit": limit},
+            params={"page": page, "limit": DELISTED_PAGE_SIZE},
             prefix=(
                 f"stock/fmp/universe/delisted/snapshot_date={snapshot}/page={page}"
             ),
@@ -319,7 +492,7 @@ def _collect_universe(
         )
         paths += page_paths
         payload = read_bytes(page_paths[0]) or b"[]"
-        if len(_json_rows(payload)) < limit:
+        if len(_json_rows(payload)) < DELISTED_PAGE_SIZE:
             break
     return paths
 
@@ -335,6 +508,93 @@ def _collect_market_metadata(client: FMPClient, root: str, snapshot: str) -> lis
                 ),
                 extension="json",
             )
+    return paths
+
+
+def _collect_commodity_prices(
+    client: FMPClient,
+    root: str,
+    *,
+    start: date,
+    end: date,
+    snapshot: str,
+    daily: bool,
+) -> list[str]:
+    """Preserve the full provider list and the 28 admitted price responses."""
+    paths = collect_raw(
+        client,
+        root=root,
+        endpoint="commodities-list",
+        params=None,
+        prefix=f"commodities/fmp/list/snapshot_date={snapshot}",
+        extension="json",
+    )
+    for number, spec in enumerate(COMMODITY_SPECS, start=1):
+        prefix = (
+            f"commodities/fmp/eod/symbol={spec.symbol}/date={start.isoformat()}"
+            if daily
+            else (
+                f"commodities/fmp/eod/symbol={spec.symbol}/"
+                f"from={start.isoformat()}/to={end.isoformat()}"
+            )
+        )
+        paths += collect_raw(
+            client,
+            root=root,
+            endpoint="historical-price-eod/full",
+            params={
+                "symbol": spec.symbol,
+                "from": start.isoformat(),
+                "to": end.isoformat(),
+            },
+            prefix=prefix,
+            extension="json",
+        )
+        if not daily and (number % 7 == 0 or number == len(COMMODITY_SPECS)):
+            print(
+                f"[fmp-commodities] collected={number}/{len(COMMODITY_SPECS)}",
+                flush=True,
+            )
+    return paths
+
+
+def run_commodity_backfill(
+    fromyear: int,
+    toyear: int,
+    dest: str = "s3",
+) -> list[str]:
+    """Collect continuous-futures history with one price call per series."""
+    if fromyear > toyear:
+        raise ValueError("fromyear must be <= toyear")
+    start = date(fromyear, 1, 1)
+    end = min(date(toyear, 12, 31), date.today())
+    if start > end:
+        return []
+    root = base_uri(dest)
+    client = FMPClient(
+        max_attempts=20,
+        min_interval=float(
+            os.environ.get("FMP_BACKFILL_MIN_INTERVAL_SECONDS", "0.5")
+        ),
+    )
+    print(
+        f"[fmp-commodities] backfill start range={start}:{end} dest={dest}",
+        flush=True,
+    )
+    paths = _collect_commodity_prices(
+        client,
+        root,
+        start=start,
+        end=end,
+        snapshot=date.today().isoformat(),
+        daily=False,
+    )
+    print(
+        f"[fmp-commodities] backfill complete objects={len(paths)} "
+        f"api_calls={client.logical_request_count} "
+        f"rate_limits={client.rate_limit_count}",
+        flush=True,
+    )
     return paths
 
 
@@ -355,19 +615,26 @@ def run_daily(day: str, dest: str = "s3") -> list[str]:
     )
     action_from = (target - timedelta(days=30)).isoformat()
     action_to = (target + timedelta(days=30)).isoformat()
-    for endpoint, directory in (
-        ("splits-calendar", "splits"),
-        ("dividends-calendar", "dividends"),
-    ):
-        paths += collect_raw(
-            client, root=root, endpoint=endpoint,
-            params={"from": action_from, "to": action_to},
-            prefix=(
-                f"corporate_actions/fmp/{directory}/snapshot_date={snapshot}/"
-                f"from={action_from}/to={action_to}"
-            ),
-            extension="json",
-        )
+    paths += collect_raw(
+        client, root=root, endpoint="splits-calendar",
+        params={"from": action_from, "to": action_to},
+        prefix=(
+            f"corporate_actions/fmp/splits/snapshot_date={snapshot}/"
+            f"from={action_from}/to={action_to}"
+        ),
+        extension="json",
+    )
+    paths += _collect_calendar_window(
+        client,
+        root=root,
+        endpoint="dividends-calendar",
+        prefix=(
+            f"corporate_actions/fmp/dividends/snapshot_date={snapshot}/"
+            f"from={action_from}/to={action_to}"
+        ),
+        start=date.fromisoformat(action_from),
+        end=date.fromisoformat(action_to),
+    )
     latest_paths = collect_raw(
         client, root=root, endpoint="latest-financial-statements",
         params={"page": 0, "limit": 250},
@@ -408,6 +675,14 @@ def run_daily(day: str, dest: str = "s3") -> list[str]:
         client, root=root, endpoint="historical-price-eod/full",
         params={"symbol": "USDKRW", "from": snapshot, "to": snapshot},
         prefix=f"fx/fmp/pair=USDKRW/date={snapshot}", extension="json",
+    )
+    paths += _collect_commodity_prices(
+        client,
+        root,
+        start=target,
+        end=target,
+        snapshot=snapshot,
+        daily=True,
     )
     paths += _collect_market_metadata(client, root, snapshot)
     return paths
@@ -488,21 +763,22 @@ def run_backfill(fromyear: int, toyear: int, dest: str = "s3") -> list[str]:
                     ),
                     extension="csv",
                 )
-        start = date(year, 1, 1).isoformat()
-        finish = date(year, 12, 31).isoformat()
-        for endpoint, directory in (
-            ("splits-calendar", "splits"),
-            ("dividends-calendar", "dividends"),
-        ):
-            paths += collect_raw(
-                client, root=root, endpoint=endpoint,
-                params={"from": start, "to": finish},
-                prefix=(
-                    f"corporate_actions/fmp/{directory}/year={year}/"
-                    f"from={start}/to={finish}"
-                ),
-                extension="json",
-            )
+        start_date = date(year, 1, 1)
+        finish_date = min(date(year, 12, 31), date.today())
+        if start_date > finish_date:
+            continue
+        start = start_date.isoformat()
+        finish = finish_date.isoformat()
+        paths += collect_raw(
+            client, root=root, endpoint="splits-calendar",
+            params={"from": start, "to": finish},
+            prefix=(
+                f"corporate_actions/fmp/splits/year={year}/"
+                f"from={start}/to={finish}"
+            ),
+            extension="json",
+        )
+    paths += _collect_dividend_backfill(client, root, fromyear, toyear)
     paths += collect_raw(
         client, root=root, endpoint="historical-price-eod/full",
         params={
@@ -512,6 +788,14 @@ def run_backfill(fromyear: int, toyear: int, dest: str = "s3") -> list[str]:
         },
         prefix=f"fx/fmp/pair=USDKRW/from={fromyear}/to={toyear}",
         extension="json",
+    )
+    paths += _collect_commodity_prices(
+        client,
+        root,
+        start=date(fromyear, 1, 1),
+        end=min(date(toyear, 12, 31), date.today()),
+        snapshot=snapshot,
+        daily=False,
     )
     paths += _collect_market_metadata(client, root, snapshot)
     print(
@@ -523,7 +807,11 @@ def run_backfill(fromyear: int, toyear: int, dest: str = "s3") -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("daily", "backfill"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("daily", "backfill", "dividends", "commodities"),
+        required=True,
+    )
     parser.add_argument("--date", help="daily date YYYYMMDD")
     parser.add_argument("--from", dest="fromyear", type=int)
     parser.add_argument("--to", dest="toyear", type=int)
@@ -539,7 +827,13 @@ def main() -> None:
         run_daily(args.date, args.dest)
         return
     if args.fromyear is None or args.toyear is None:
-        raise SystemExit("backfill mode requires --from and --to")
+        raise SystemExit("backfill/dividends/commodities mode requires --from and --to")
+    if args.mode == "dividends":
+        run_dividend_backfill(args.fromyear, args.toyear, args.dest)
+        return
+    if args.mode == "commodities":
+        run_commodity_backfill(args.fromyear, args.toyear, args.dest)
+        return
     run_backfill(args.fromyear, args.toyear, args.dest)
 
 

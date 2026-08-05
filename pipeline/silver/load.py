@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime
 
+import pandas as pd
+
 from pipeline.common import db
 from pipeline.common.paths import base_uri
-from pipeline.silver import assets, corporate_actions, financials, prices
+from pipeline.silver import assets, corporate_actions, dividends, financials, prices
 from pipeline.silver_quality.models import (
     CandidateBundle,
     CheckResult,
@@ -34,6 +36,7 @@ def _build_candidates(
     *,
     target_date: date | None,
     financial_files: list[str] | None,
+    dividend_files: list[str] | None,
 ) -> CandidateBundle:
     asset_df, identifier_df = assets.prepare(base)
     preferred_to_common = assets.preferred_share_issuer_map(asset_df)
@@ -60,6 +63,25 @@ def _build_candidates(
     else:
         years = {target_date.year} if target_date else None
         fundamental_df, fundamental_stats = financials.prepare(base, years=years)
+    if dividend_files is not None:
+        dividend_df, dividend_stats = dividends.prepare(
+            base, files=dividend_files,
+        )
+    else:
+        years = {target_date.year} if target_date else None
+        dividend_df, dividend_stats = dividends.prepare(base, years=years)
+    fundamental_df = pd.concat(
+        [fundamental_df, dividend_df], ignore_index=True,
+    )
+    fundamental_stats = dict(fundamental_stats)
+    fundamental_stats["dividend"] = dividend_stats
+    for metric in (
+        "input_rows", "transformed_rows", "excluded_rows", "rejected_rows",
+    ):
+        fundamental_stats[metric] = (
+            int(fundamental_stats.get(metric, 0))
+            + int(dividend_stats.get(metric, 0))
+        )
     action_df, action_stats = corporate_actions.prepare(
         base,
         target_date=target_date,
@@ -86,10 +108,37 @@ def _build_candidates(
     )
 
 
+def _exclude_nontradable_candidates(
+    bundle: CandidateBundle,
+    full_price_universe: set[str],
+    unsupported_market_identifiers: set[str],
+) -> None:
+    """Apply the same explicit universe exclusions to every DART fact."""
+    (
+        bundle.fundamentals,
+        bundle.stats["fundamental"],
+    ) = financials.exclude_nontradable(
+        bundle.fundamentals,
+        bundle.stats["fundamental"],
+        full_price_universe,
+        unsupported_market_identifiers,
+    )
+    (
+        bundle.actions,
+        bundle.stats["corporate_action"],
+    ) = corporate_actions.exclude_nontradable(
+        bundle.actions,
+        bundle.stats["corporate_action"],
+        full_price_universe,
+        unsupported_market_identifiers,
+    )
+
+
 def incremental(
     day: str | None = None,
     src: str = "local",
     financial_files: list[str] | None = None,
+    dividend_files: list[str] | None = None,
     market_closed: bool = False,
 ) -> None:
     target_date = _parse_day(day)
@@ -102,7 +151,7 @@ def incremental(
         context = repository.start_run(
             conn, mode="daily", target_date=target_date, status="RUNNING",
         )
-        if market_closed and not financial_files:
+        if market_closed and not financial_files and not dividend_files:
             repository.finish_run(conn, context, "SKIPPED", [])
             print(
                 f"[silver-quality] skipped market holiday date={target_date}",
@@ -114,6 +163,7 @@ def incremental(
                 base,
                 target_date=target_date,
                 financial_files=financial_files,
+                dividend_files=dividend_files,
             )
         except Exception as exc:
             transform_failure = CheckResult(
@@ -142,12 +192,8 @@ def incremental(
             candidate_krx_identifiers
             | bundle.stats["_existing_krx_identifiers"]
         )
-        (
-            bundle.fundamentals,
-            bundle.stats["fundamental"],
-        ) = financials.exclude_nontradable(
-            bundle.fundamentals,
-            bundle.stats["fundamental"],
+        _exclude_nontradable_candidates(
+            bundle,
             full_price_universe,
             bundle.stats["_unsupported_market_identifiers"],
         )
@@ -198,6 +244,9 @@ def incremental(
                 repository.finish_run(
                     conn, context, "CERTIFIED", results, commit=False,
                 )
+                open_scopes, open_rows = repository.open_warning_counts(
+                    conn, context.mode,
+                )
         except Exception as exc:
             conn.rollback()
             publish_failure = CheckResult(
@@ -220,6 +269,11 @@ def incremental(
         print(
             f"[silver-quality] certified daily run={context.run_id} "
             f"date={target_date}",
+            flush=True,
+        )
+        print(
+            f"[silver-quality] open warnings mode={context.mode} "
+            f"scopes={open_scopes} failed_rows={open_rows}",
             flush=True,
         )
     finally:

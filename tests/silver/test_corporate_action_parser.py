@@ -209,6 +209,40 @@ def test_ex_dividend_notice_is_evidence_not_required_price_adjustment(tmp_path):
     assert event["effective_date"] == date(2026, 7, 7)
 
 
+def test_cash_dividend_decision_parses_common_amount_dates_and_frequency(tmp_path):
+    manifest = (
+        tmp_path / "corporate_actions/dart/manifests"
+        / "from=20260724/to=20260724/disclosures.json"
+    )
+    _write_json(manifest, [{
+        "stock_code": "006120",
+        "rcept_no": "20260724800658",
+        "rcept_dt": "20260724",
+        "report_nm": "현금ㆍ현물배당결정",
+    }])
+    document = (
+        tmp_path / "corporate_actions/dart/documents/year=2026/corp=006120"
+        / "rcept=20260724800658.zip"
+    )
+    _write_document(document, """
+        <document>1. 배당구분 중간배당 2. 배당종류 현금배당
+        3. 1주당 배당금(원) 보통주식 500 종류주식 500
+        6. 배당기준일 2026-08-10
+        7. 배당금지급 예정일자 2026-08-21</document>
+    """)
+
+    events, _ = corporate_actions.prepare(str(tmp_path))
+    event = events.iloc[0]
+    assert event["event_type"] == "cash_dividend"
+    assert event["cash_amount"] == pytest.approx(500)
+    assert event["record_date"] == date(2026, 8, 10)
+    assert event["payment_date"] == date(2026, 8, 21)
+    assert event["frequency"] == "interim"
+    published = corporate_actions.normalize_for_publish(events).iloc[0]
+    assert published["cash_amount"] == pytest.approx(500)
+    assert published["adjusted_cash_amount"] is None
+
+
 def test_common_issuer_events_are_inherited_by_preferred_share():
     event = pd.DataFrame([{
         "identifier": "001520",
@@ -223,3 +257,33 @@ def test_common_issuer_events_are_inherited_by_preferred_share():
     assert inherited["issuer_event_inherited"]
     assert inherited["issuer_parent_identifier"] == "001520"
     assert stats["inherited_event_count"] == 1
+
+
+def test_nontradable_actions_are_explicitly_excluded():
+    events = pd.DataFrame([
+        {
+            "identifier": "005930", "event_type": "bonus_issue",
+            "effective_date": date(2026, 8, 1), "announcement_date": None,
+        },
+        {
+            "identifier": "026870", "event_type": "bonus_issue",
+            "effective_date": date(2026, 8, 2), "announcement_date": None,
+        },
+        {
+            "identifier": "123456", "event_type": "cash_dividend",
+            "effective_date": None, "announcement_date": date(2026, 8, 3),
+        },
+    ])
+
+    retained, stats = corporate_actions.exclude_nontradable(
+        events,
+        {"row_count": 3},
+        {"005930"},
+        {"123456"},
+    )
+
+    assert list(retained["identifier"]) == ["005930"]
+    assert stats["transformed_rows"] == 1
+    assert stats["excluded_rows"] == 2
+    assert stats["no_tradable_price_action"]["row_count"] == 1
+    assert stats["unsupported_market_action"]["row_count"] == 1

@@ -29,6 +29,7 @@ def test_event_title_classification():
         "상장폐지에 따른 정리매매"
     )
     assert corporate_actions._is_relevant_disclosure("현금ㆍ현물배당결정")
+    assert corporate_actions._needs_document("현금ㆍ현물배당결정")
     assert not corporate_actions._needs_document("분기보고서")
 
 

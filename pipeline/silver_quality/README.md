@@ -6,10 +6,21 @@ Silver는 이 폴더의 규칙을 통과한 데이터만 담는다. 모든 적�
 `MODIFIED`로 기록한다. FMP는 별도의 source-aware gate를 거치며 ETF/fund·비주식
 상품 제외 건수도 `MODIFIED`에 남긴다. 제외된 원문 행은 Bronze에서 삭제하지 않는다.
 
+인증된 일별 증분의 warning은 `dq_warning_state`에 누적된다. 동일한 실행 모드·
+대상일(또는 명시적 파티션)·데이터셋·규칙을 다시 검사해 PASS가 나올 때만
+`RESOLVED`가 되며, 현재 미해결 항목은 `dq_open_warning`에서 조회한다. 실패하여
+Silver에 publish되지 않은 실행과 전체 감사는 이 상태를 변경하지 않는다.
+최초 마이그레이션은 기존 인증된 증분 이력도 같은 기준으로 초기화한다.
+
 FMP 편입 범위는 NASDAQ·NYSE·AMEX의 common stock, preferred stock, ADR,
 REIT이다. ETF, fund, ETN, warrant, unit, listed note, 분류가 모호한 행은 제외하고
 사유별 건수와 표본을 DQ 결과에 남긴다. USD 가격·재무와 `USDKRW` FX도 동일한
 source-aware 검사를 거친다.
+
+FMP commodities는 금융선물과 micro 중복을 제외한 28개 물리 원자재 연속선물만
+허용한다. `USX`는 USD로 단위 변환하며, 선물 가격은 음수가 가능하므로 양수 대신
+유한값과 OHLC 순서를 검사한다. 20% 초과 일간 변동은 원천을 보존한 채 잠재적
+롤오버 warning으로 누적한다.
 
 FMP 전용 핵심 규칙은 다음과 같다.
 
@@ -20,6 +31,10 @@ FMP 전용 핵심 규칙은 다음과 같다.
 | `FMP_PRICE_OHLC` | Error | 복원 OHLC 범위와 양수 조건 |
 | `FMP_*_IDENTIFIER_MAPPING` | Critical | 가격·재무·기업행사가 편입 자산에 매핑됨 |
 | `FMP_SILVER_UNIVERSE_EXCLUDED` | Modified | Bronze에 보존된 제외 행의 사유·건수 |
+| `FMP_COMMODITY_UNIVERSE_COMPLETE` | Critical | 물리·비 micro 원자재 28개가 정확히 존재 |
+| `FMP_COMMODITY_PROVIDER_LIST` | Critical | FMP 목록의 심볼·원천 통화가 allowlist와 일치 |
+| `FMP_COMMODITY_PRICE_SEMANTICS` | Error | USD 단위, `adj_close=close`, 주식 전용 필드 NULL |
+| `FMP_COMMODITY_POSSIBLE_ROLL` | Warning | 절대 일간 변동 20% 초과, 원천값 보존 |
 
 **등급**
 
@@ -29,6 +44,18 @@ FMP 전용 핵심 규칙은 다음과 같다.
 
 규칙은 daily 적재(`python -m pipeline.daily_full`)와 전체 감사
 (`python -m pipeline.silver_quality.s3_domain_audit`)에서 자동 실행되며 우회 옵션은 없다.
+
+## RDS 방어 제약
+
+Python gate의 Critical/Error 중 한 행만으로 결정 가능한 불변조건은 RDS CHECK·
+PK·UNIQUE·FK로도 강제한다. 현재 DB guard는 인증 실행 연결, 필수 문자열, 자산
+유니버스 형태, 자산별 가격 부호 정책·비음수/유한값/OHLC/시가총액 대사, 재무 PIT·통화·
+배당 metric-unit, FMP 기업행사 효력일을 검사한다. DB guard 위반은 publish
+transaction을 즉시 rollback한다.
+
+시장 완전성, 거래일 캘린더, 시계열 수정종가, 소스 간 대사와 Warning은 여러 행이나
+외부 문맥이 필요하므로 Python gate에 유지한다. Warning 원천값을 DB CHECK로 차단하지
+않는다.
 
 ## 규칙 목록
 

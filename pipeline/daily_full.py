@@ -12,6 +12,7 @@ import boto3
 
 from pipeline.bronze import (
     corporate_actions,
+    dividends,
     financials,
     fmp as fmp_bronze,
     index,
@@ -119,8 +120,25 @@ def main() -> None:
     stock_krxapi.run(day, day, "s3")
     index.run(day, day, "s3")
     changed_financial_uris = financials.run(int(day[:4]), int(day[:4]), "s3", refresh_existing=True)
+    if os.environ.get("DART_DIVIDENDS_ENABLED", "true").lower() in {
+        "1", "true", "yes", "on",
+    }:
+        changed_dividend_uris = dividends.run_for_financial_paths(
+            changed_financial_uris,
+            "s3",
+        )
+    else:
+        changed_dividend_uris = []
+        print("[daily] DART regular-report dividends disabled", flush=True)
     changed_financial_keys = [_key_from_s3_uri(uri) for uri in changed_financial_uris]
+    changed_dividend_keys = [
+        _key_from_s3_uri(uri) for uri in changed_dividend_uris
+    ]
     print(f"[daily] changed financial files={len(changed_financial_keys)}", flush=True)
+    print(
+        f"[daily] changed dividend files={len(changed_dividend_uris)}",
+        flush=True,
+    )
     action_from = (
         datetime.strptime(day, "%Y%m%d").date()
         - timedelta(days=CORPORATE_ACTION_DISCOVERY_LOOKBACK_DAYS)
@@ -159,6 +177,7 @@ def main() -> None:
     keys += stock_keys
     keys += index_keys
     keys += changed_financial_keys
+    keys += changed_dividend_keys
     keys += changed_action_keys
 
     local_paths = _download_keys(bucket, keys, root)
@@ -169,12 +188,21 @@ def main() -> None:
             or "/financials/dart_full/year=" in p
         )
     ]
+    dividend_files = [
+        p for p in local_paths if "/dividends/dart/alot-matter/" in p
+    ]
 
-    print(f"[silver] incremental start day={day}, financial_files={len(financial_files)}", flush=True)
+    print(
+        f"[silver] incremental start day={day}, "
+        f"financial_files={len(financial_files)}, "
+        f"dividend_files={len(dividend_files)}",
+        flush=True,
+    )
     load.incremental(
         day,
         "local",
         financial_files=financial_files,
+        dividend_files=dividend_files,
         market_closed=market_closed,
     )
     print(f"[silver] incremental complete day={day}", flush=True)

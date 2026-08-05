@@ -37,6 +37,12 @@ COLUMNS = [
     "share_count_factor_comparable",
     "share_count_comparison_reason",
     "action_method",
+    "record_date",
+    "payment_date",
+    "cash_amount",
+    "adjusted_cash_amount",
+    "currency",
+    "frequency",
     "confirms_price_adjustment",
     "expects_price_adjustment",
     "confidence",
@@ -421,6 +427,85 @@ def _document_effective_date(
     return None
 
 
+def _document_texts(
+    base: str,
+    *,
+    ticker: str,
+    rcept_no: str,
+) -> list[str]:
+    paths = glob.glob(
+        f"{base}/corporate_actions/dart/documents/year=*/"
+        f"corp={ticker}/rcept={rcept_no}.zip"
+    )
+    texts: list[str] = []
+    for path in sorted(paths):
+        try:
+            with zipfile.ZipFile(path) as archive:
+                payloads = [archive.read(name) for name in archive.namelist()]
+        except (OSError, zipfile.BadZipFile):
+            continue
+        for payload in payloads:
+            decoded = None
+            for encoding in ("utf-8", "euc-kr", "cp949"):
+                try:
+                    decoded = payload.decode(encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if decoded is None:
+                decoded = payload.decode("utf-8", errors="replace")
+            visible = html.unescape(re.sub(r"<[^>]+>", " ", decoded))
+            texts.append(re.sub(r"\s+", " ", visible))
+    return texts
+
+
+def _cash_dividend_details(
+    base: str,
+    *,
+    ticker: str,
+    rcept_no: str,
+) -> dict:
+    details = {
+        "record_date": None,
+        "payment_date": None,
+        "cash_amount": None,
+        "adjusted_cash_amount": None,
+        "currency": "KRW",
+        "frequency": None,
+    }
+    for visible in _document_texts(
+        base, ticker=ticker, rcept_no=rcept_no,
+    ):
+        compact = _compact(visible)
+        amount = re.search(
+            r"1주당배당금원보통주(?:식)?([0-9,]+(?:\.[0-9]+)?)",
+            compact,
+        )
+        if amount:
+            details["cash_amount"] = _number(amount.group(1))
+        for label, field in (
+            ("배당기준일", "record_date"),
+            ("배당금지급예정일자", "payment_date"),
+        ):
+            match = re.search(
+                label + r"((?:19|20)\d{2}[년./-]?\d{1,2}[월./-]?\d{1,2}일?)",
+                compact,
+            )
+            if match:
+                details[field] = _parse_date(match.group(1))
+        if "분기배당" in compact:
+            details["frequency"] = "quarterly"
+        elif "중간배당" in compact:
+            details["frequency"] = "interim"
+        elif "결산배당" in compact:
+            details["frequency"] = "annual"
+        elif "배당구분" in compact:
+            details["frequency"] = "irregular"
+        if details["cash_amount"] is not None:
+            break
+    return details
+
+
 def _disclosure_row(base: str, path: str, row: dict) -> dict | None:
     event = _disclosure_type(row.get("report_nm"))
     if event is None:
@@ -435,6 +520,15 @@ def _disclosure_row(base: str, path: str, row: dict) -> dict | None:
         ticker=ticker,
         rcept_no=str(row.get("rcept_no") or ""),
         event_type=event_type,
+    )
+    dividend_details = (
+        _cash_dividend_details(
+            base,
+            ticker=ticker,
+            rcept_no=str(row.get("rcept_no") or ""),
+        )
+        if event_type == "cash_dividend"
+        else {}
     )
     confirms_adjustment = expects_adjustment or event_type == "ex_dividend"
     effective_date = (
@@ -462,6 +556,12 @@ def _disclosure_row(base: str, path: str, row: dict) -> dict | None:
         "share_count_factor_comparable": False,
         "share_count_comparison_reason": None,
         "action_method": None,
+        "record_date": dividend_details.get("record_date"),
+        "payment_date": dividend_details.get("payment_date"),
+        "cash_amount": dividend_details.get("cash_amount"),
+        "adjusted_cash_amount": dividend_details.get("adjusted_cash_amount"),
+        "currency": dividend_details.get("currency"),
+        "frequency": dividend_details.get("frequency"),
         "confirms_price_adjustment": confirms_adjustment,
         "expects_price_adjustment": expects_adjustment,
         "confidence": (
@@ -577,6 +677,82 @@ def prepare(
     }
 
 
+def exclude_nontradable(
+    events: pd.DataFrame,
+    stats: dict,
+    tradable_identifiers: set[str],
+    unsupported_market_identifiers: set[str] | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Keep DART actions only where the KRX price universe can use them.
+
+    DART contains disclosures for KONEX, unlisted and pre-coverage issuers.
+    They remain in Bronze; the exclusion is surfaced as an explicit Silver DQ
+    modification rather than appearing as an identifier-mapping failure.
+    """
+    allowed = {str(value) for value in tradable_identifiers}
+    unsupported = {
+        str(value) for value in (unsupported_market_identifiers or set())
+    }
+    if events.empty:
+        updated = dict(stats)
+        for key in (
+            "no_tradable_price_action", "unsupported_market_action",
+        ):
+            updated[key] = {
+                "row_count": 0, "ticker_count": 0, "samples": [],
+            }
+        return events, updated
+
+    identifiers = events["identifier"].astype(str)
+    unsupported_excluded = events[
+        ~identifiers.isin(allowed) & identifiers.isin(unsupported)
+    ].copy()
+    no_price_excluded = events[
+        ~identifiers.isin(allowed) & ~identifiers.isin(unsupported)
+    ].copy()
+    retained = events[identifiers.isin(allowed)].reset_index(drop=True)
+
+    def summarize(frame: pd.DataFrame) -> dict:
+        if frame.empty:
+            return {"row_count": 0, "ticker_count": 0, "samples": []}
+        summary = (
+            frame.assign(
+                event_date=frame["effective_date"].where(
+                    frame["effective_date"].notna(),
+                    frame["announcement_date"],
+                )
+            )
+            .groupby("identifier", as_index=False)
+            .agg(
+                row_count=("identifier", "size"),
+                first_event_date=("event_date", "min"),
+                last_event_date=("event_date", "max"),
+            )
+            .sort_values(
+                ["row_count", "identifier"], ascending=[False, True],
+            )
+        )
+        head = summary.head(20)
+        return {
+            "row_count": len(frame),
+            "ticker_count": int(frame["identifier"].nunique()),
+            "samples": (
+                head.astype(object)
+                .where(pd.notna(head), None)
+                .to_dict("records")
+            ),
+        }
+
+    updated = dict(stats)
+    updated["transformed_rows"] = len(retained)
+    updated["excluded_rows"] = int(updated.get("excluded_rows", 0)) + (
+        len(unsupported_excluded) + len(no_price_excluded)
+    )
+    updated["no_tradable_price_action"] = summarize(no_price_excluded)
+    updated["unsupported_market_action"] = summarize(unsupported_excluded)
+    return retained, updated
+
+
 def inherit_issuer_events(
     events: pd.DataFrame,
     preferred_to_common: dict[str, str],
@@ -593,6 +769,10 @@ def inherit_issuer_events(
         rows["issuer_parent_identifier"] = str(common)
         rows["issuer_event_inherited"] = True
         rows["identifier"] = str(preferred)
+        cash_events = rows["event_type"].eq("cash_dividend")
+        for column in ("cash_amount", "adjusted_cash_amount"):
+            if column in rows:
+                rows.loc[cash_events, column] = None
         inherited.append(rows)
     original = events.copy()
     original["issuer_parent_identifier"] = None
@@ -611,7 +791,8 @@ def inherit_issuer_events(
 
 PUBLISH_COLUMNS = [
     "asset_id", "source", "action_key", "action_type", "announcement_date",
-    "ex_date", "record_date", "payment_date", "cash_amount", "currency",
+    "ex_date", "record_date", "payment_date", "cash_amount",
+    "adjusted_cash_amount", "currency", "frequency",
     "ratio_numerator", "ratio_denominator", "expected_price_factor",
     "share_count_factor", "status", "confidence", "filing_id",
     "quality_run_id",
@@ -648,10 +829,14 @@ def normalize_for_publish(candidates: pd.DataFrame) -> pd.DataFrame:
             "action_type": str(row.event_type),
             "announcement_date": row.announcement_date,
             "ex_date": row.effective_date,
-            "record_date": None,
-            "payment_date": None,
-            "cash_amount": None,
-            "currency": "KRW",
+            "record_date": getattr(row, "record_date", None),
+            "payment_date": getattr(row, "payment_date", None),
+            "cash_amount": getattr(row, "cash_amount", None),
+            "adjusted_cash_amount": getattr(
+                row, "adjusted_cash_amount", None,
+            ),
+            "currency": getattr(row, "currency", None) or "KRW",
+            "frequency": getattr(row, "frequency", None),
             "ratio_numerator": None,
             "ratio_denominator": None,
             "expected_price_factor": row.expected_factor,
@@ -695,7 +880,8 @@ def publish(
         conflict=["asset_id", "source", "action_key"],
         update=[
             "action_type", "announcement_date", "ex_date", "record_date",
-            "payment_date", "cash_amount", "currency", "ratio_numerator",
+            "payment_date", "cash_amount", "adjusted_cash_amount", "currency",
+            "frequency", "ratio_numerator",
             "ratio_denominator", "expected_price_factor", "share_count_factor",
             "status", "confidence", "filing_id", "quality_run_id", "loaded_at",
         ],

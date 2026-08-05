@@ -141,6 +141,11 @@ def _price_bundle(base: str) -> CandidateBundle:
         supported,
     )
     action_df, action_stats = corporate_actions.prepare(base)
+    action_df, action_stats = corporate_actions.exclude_nontradable(
+        action_df,
+        action_stats,
+        supported,
+    )
     action_df, inheritance = corporate_actions.inherit_issuer_events(
         action_df,
         assets.preferred_share_issuer_map(asset_df),
@@ -161,13 +166,19 @@ def _price_bundle(base: str) -> CandidateBundle:
 def _price_static_bundle(base: str) -> CandidateBundle:
     """Prepare only bounded price-domain inputs shared by annual partitions."""
     asset_df, identifier_df = assets.prepare(base)
-    _, supported = _price_universes(base)
+    all_identifiers, supported = _price_universes(base)
     asset_df, identifier_df = assets.restrict_to_price_universe(
         asset_df,
         identifier_df,
         supported,
     )
     action_df, action_stats = corporate_actions.prepare(base)
+    action_df, action_stats = corporate_actions.exclude_nontradable(
+        action_df,
+        action_stats,
+        supported,
+        all_identifiers - supported,
+    )
     action_df, inheritance = corporate_actions.inherit_issuer_events(
         action_df,
         assets.preferred_share_issuer_map(asset_df),

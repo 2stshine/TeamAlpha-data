@@ -889,6 +889,8 @@ def prepare_commodities(
             })
 
     frame = pd.DataFrame(rows)
+    non_session_samples: list[dict] = []
+    non_session_count = 0
     invalid_samples: list[dict] = []
     invalid_count = 0
     duplicate_samples: list[dict] = []
@@ -896,6 +898,16 @@ def prepare_commodities(
     roll_count = 0
     roll_samples: list[dict] = []
     if not frame.empty:
+        # Commodity futures commonly open on Sunday evening, and FMP keeps
+        # those observations under the Sunday calendar date.  Saturday is the
+        # only universally closed session day; preserve such provider rows in
+        # Bronze but do not expose them as tradable Silver observations.
+        parsed_dates = pd.to_datetime(frame["trade_date"], errors="coerce")
+        non_session_mask = parsed_dates.dt.weekday.eq(5)
+        non_session = frame[non_session_mask]
+        non_session_count = len(non_session)
+        non_session_samples = non_session.head(20).to_dict("records")
+        frame = frame[~non_session_mask].copy()
         numeric = frame[["open", "high", "low", "close"]].apply(
             pd.to_numeric, errors="coerce",
         )
@@ -959,6 +971,10 @@ def prepare_commodities(
             "normalized_usx_rows": int(
                 frame.get("raw_currency", pd.Series(dtype=str)).eq("USX").sum()
             ),
+            "non_session_rows_excluded": {
+                "row_count": non_session_count,
+                "samples": non_session_samples,
+            },
             "invalid_ohlc_excluded": {
                 "row_count": invalid_count,
                 "samples": invalid_samples,

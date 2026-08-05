@@ -207,8 +207,9 @@ def check_fmp(bundle: CandidateBundle) -> list[CheckResult]:
             )
             checks.append(result(
                 "FMP_COMMODITY_WEEKDAY", "price_daily", Severity.ERROR,
-                commodities[dates.dt.weekday.ge(5).to_numpy()],
-                "commodity EOD observations are dated Monday-Friday",
+                commodities[dates.dt.weekday.eq(5).to_numpy()],
+                "commodity EOD observations may use Sunday evening through "
+                "Friday session dates, but never Saturday",
             ))
         equity_prices = prices[prices["source"].eq("FMP")]
         if not equity_prices.empty:
@@ -340,6 +341,21 @@ def check_fmp(bundle: CandidateBundle) -> list[CheckResult]:
         ))
     if commodity_enabled:
         commodity_stats = bundle.stats.get("commodity", {})
+        non_session = commodity_stats.get("non_session_rows_excluded", {})
+        non_session_count = int(non_session.get("row_count", 0))
+        checks.append(CheckResult(
+            rule_code="FMP_COMMODITY_NON_SESSION_EXCLUDED",
+            dataset="price_daily",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected=(
+                "Saturday provider rows remain in Bronze and are excluded "
+                "from Silver; Sunday evening futures sessions are retained"
+            ),
+            actual=f"affected_rows={non_session_count}",
+            failed_count=0,
+            samples=list(non_session.get("samples", []))[:20],
+        ))
         missing_provider = list(commodity_stats.get("missing_from_provider", []))
         currency_mismatches = list(
             commodity_stats.get("provider_currency_mismatches", [])

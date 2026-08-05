@@ -364,6 +364,50 @@ def test_commodities_normalize_usx_and_preserve_negative_futures_ohlc(tmp_path):
     assert not any(result.blocks_publish for result in check_fmp(bundle))
 
 
+def test_commodities_keep_sunday_sessions_and_exclude_saturday_rows(tmp_path):
+    _commodity_list(tmp_path, "2026-01-05")
+    path = (
+        tmp_path
+        / "commodities/fmp/eod/symbol=ZRUSD/"
+        "from=2021-01-01/to=2026-12-31/response.json"
+    )
+    _write(path, json.dumps([
+        {
+            "symbol": "ZRUSD", "date": "2021-11-27",
+            "open": 14.45, "high": 14.45, "low": 14.09,
+            "close": 14.29, "volume": 10,
+        },
+        {
+            "symbol": "ZRUSD", "date": "2026-01-04",
+            "open": 10.0, "high": 10.2, "low": 9.9,
+            "close": 10.1, "volume": 20,
+        },
+    ]).encode())
+    _manifest(path)
+
+    assets, identifiers, prices, stats = fmp.prepare_commodities(
+        str(tmp_path),
+    )
+
+    assert prices["trade_date"].tolist() == [date(2026, 1, 4)]
+    excluded = stats["non_session_rows_excluded"]
+    assert excluded["row_count"] == 1
+    assert excluded["samples"][0]["trade_date"] == date(2021, 11, 27)
+    bundle = fmp.CandidateBundle(
+        assets=assets,
+        identifiers=identifiers,
+        prices=prices,
+        stats={"commodity": stats, "_source_scope": "commodity"},
+    )
+    results = check_fmp(bundle)
+    assert not any(result.blocks_publish for result in results)
+    modified = next(
+        result for result in results
+        if result.rule_code == "FMP_COMMODITY_NON_SESSION_EXCLUDED"
+    )
+    assert modified.actual == "affected_rows=1"
+
+
 def test_universe_excludes_same_issuer_nasdaq_suffix_instruments(tmp_path):
     rows = []
     for symbol, name in (

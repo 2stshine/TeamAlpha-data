@@ -3,9 +3,11 @@ from datetime import date
 import pandas as pd
 
 from pipeline.silver.fmp_load import (
+    _build_daily_candidates,
     _existing_identifier_map,
     _fundamental_partitions,
 )
+from pipeline.silver_quality.models import CandidateBundle
 
 
 class _Cursor:
@@ -31,6 +33,28 @@ class _Connection:
 
     def cursor(self):
         return _Cursor(self._rows)
+
+
+class _Transaction:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __enter__(self):
+        assert self.connection.transaction_depth == 0
+        self.connection.transaction_depth += 1
+
+    def __exit__(self, *_):
+        self.connection.transaction_depth -= 1
+        self.connection.completed_transactions += 1
+
+
+class _TransactionConnection:
+    def __init__(self):
+        self.transaction_depth = 0
+        self.completed_transactions = 0
+
+    def transaction(self):
+        return _Transaction(self)
 
 
 def test_existing_identifier_map_includes_historical_ticker_episodes():
@@ -77,3 +101,33 @@ def test_fundamentals_are_partitioned_by_statement_and_fiscal_period():
         "fundamental:year=2025:statement=IS:period=Q1",
     ]
     assert [len(partition) for _, partition in partitions] == [1, 1, 1]
+
+
+def test_daily_candidate_roll_lookup_closes_transaction_before_publish(
+    monkeypatch,
+):
+    connection = _TransactionConnection()
+    expected = CandidateBundle(prices=pd.DataFrame())
+    observed = []
+
+    monkeypatch.setattr(
+        "pipeline.silver.fmp_load.fmp.build_candidates",
+        lambda base, target_date: expected,
+    )
+
+    def fake_roll_check(conn, bundle):
+        observed.append((conn.transaction_depth, bundle))
+
+    monkeypatch.setattr(
+        "pipeline.silver.fmp_load._add_previous_commodity_roll_check",
+        fake_roll_check,
+    )
+
+    actual = _build_daily_candidates(
+        connection, "/tmp/bronze", date(2026, 8, 4),
+    )
+
+    assert actual is expected
+    assert observed == [(1, expected)]
+    assert connection.transaction_depth == 0
+    assert connection.completed_transactions == 1

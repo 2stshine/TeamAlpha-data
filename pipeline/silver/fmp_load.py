@@ -209,6 +209,23 @@ def _add_previous_commodity_roll_check(conn, bundle: CandidateBundle) -> None:
     detail["samples"] = samples[:20]
 
 
+def _build_daily_candidates(
+    conn,
+    base: str,
+    target_date: date,
+) -> CandidateBundle:
+    """Build candidates and close the read transaction before publication.
+
+    Psycopg starts a transaction for the previous-close SELECT.  Keeping that
+    transaction open would make the later publish transaction a savepoint; the
+    outer transaction would then be rolled back when the connection closes.
+    """
+    bundle = fmp.build_candidates(base, target_date)
+    with conn.transaction():
+        _add_previous_commodity_roll_check(conn, bundle)
+    return bundle
+
+
 def _daily(*, src: str, day: str) -> None:
     target_date = _parse_day(day)
     base = base_uri(src)
@@ -224,8 +241,7 @@ def _daily(*, src: str, day: str) -> None:
             input_fingerprint=_fingerprint(base, target_date),
         )
         try:
-            bundle = fmp.build_candidates(base, target_date)
-            _add_previous_commodity_roll_check(conn, bundle)
+            bundle = _build_daily_candidates(conn, base, target_date)
         except Exception as exc:
             failure = CheckResult(
                 rule_code="FMP_CANDIDATE_TRANSFORMATION",

@@ -1,6 +1,6 @@
 # Silver 데이터 품질 현황
 
-> 스냅샷: **2026-08-05 22:00 KST**, 운영 RDS 조회 및 ECS/CloudWatch
+> 스냅샷: **2026-08-06 12:32 KST**, 운영 RDS 조회 및 ECS/CloudWatch
 > 운영 로그 기준
 
 이 문서는 현재 Silver 품질 상태를 운영 데이터와 `dq_run`·`dq_result`·
@@ -9,15 +9,15 @@
 
 ## 결론
 
-- 현재 배포 ruleset: **1.22.1**, ECS daily task definition **96**
+- 현재 배포 ruleset: **1.22.1**, ECS daily task definition **97**
 - FMP 원자재 28종 2015~2026 백필: **CERTIFIED**, one-off task definition **95**
-- 최신 KRX/DART 증분: **CERTIFIED**, 대상일 `2026-08-04`
-- 최신 FMP 증분: **CERTIFIED**, 대상일 `2026-08-03`
+- 최신 KRX/DART 증분: **CERTIFIED**, 대상일 `2026-08-05`
+- 최신 FMP 증분: **CERTIFIED**, 대상일 `2026-08-04`
 - 마지막 전체 역사 감사: **CERTIFIED**, 차단 Critical/Error 실패 **0**
 - 미인증 Silver 행: 모든 핵심 테이블 **0**
 - 핵심 NULL·비양수 가격·현재 식별자 중복: **0**
 - RDS Critical/Error guard 5개: 모두 **validated=true**
-- 현재 OPEN warning: **9개 검사 범위, 26건**
+- 현재 OPEN warning: **11개 검사 범위, 42건**
 
 현재 데이터는 전략 개발에 사용할 수 있는 인증 상태다. 다만 Warning은 원천값을
 보존한 검토 대상이며, 아래 항목을 해소된 데이터로 간주하면 안 된다.
@@ -50,14 +50,14 @@
 
 | 항목 | 결과 |
 |---|---|
-| 대상일 | `2026-08-04` |
-| run ID | `cf4ee001-2193-434e-abf0-e4c2b387d110` |
-| 실행 ruleset | `1.19.3` |
+| 대상일 | `2026-08-05` |
+| run ID | `f6368f67-2d97-4708-98ff-cb318536c8d4` |
+| 실행 ruleset | `1.22.1` |
 | 상태 | `CERTIFIED` |
-| Critical | PASS 13, 실패 0 |
-| Error | PASS 19, 실패 0 |
+| Critical | PASS 16, 실패 0 |
+| Error | PASS 22, 실패 0 |
 | Warning | FAIL 규칙 2, 실패 건수 16 |
-| Modified | PASS 2 |
+| Modified | PASS 3 |
 
 Warning 16건은 `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` 1건과
 `CASH_DIVIDEND_AMOUNT_COVERAGE` 15건이다. 차단 조건이 아니므로 원천값을
@@ -67,22 +67,21 @@ Warning 16건은 `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` 1건과
 
 | 항목 | 결과 |
 |---|---|
-| 대상일 | `2026-08-03` |
-| run ID | `27558df9-1d3c-418d-b7ea-f5ba5845ed8a` |
-| 실행 ruleset | `1.19.3` |
+| 대상일 | `2026-08-04` |
+| run ID | `61e85c2a-50b9-474a-af6c-5c8c2400b297` |
+| 실행 ruleset | `1.22.1` |
 | 상태 | `CERTIFIED` |
-| Critical | PASS 18, 실패 0 |
-| Error | PASS 5, 실패 0 |
+| Critical | PASS 21, 실패 0 |
+| Error | PASS 7, 실패 0 |
 | Warning | 없음 |
-| Modified | PASS 5 |
+| Modified | PASS 6 |
 
-2026-08-05 08:30 KST 최초 실행은 `ACTION_IDENTIFIER_MAPPING` 오류로 Silver
-publish 전에 중단됐다. 수정 후 같은 대상일을 재실행해 KRX/DART는 15:12 KST,
-FMP는 15:14 KST에 인증 완료했다. 오전 수집 Bronze는 재실행에서 그대로 사용됐다.
-
-현재 ruleset `1.22.1`은 이 일별 인증 실행 이후 배포됐다. `1.21.0`에서 RDS의
-단일행 Critical/Error 방어 제약을 추가했고, `1.22.1`에서 원자재 세션·단위·
-연속선물 품질 규칙을 추가했다. 따라서 다음 daily가 첫 `1.22.1` 증분 실행이다.
+2026-08-06 08:30 KST 실행의 첫 FMP publish는 이전 원자재 종가 조회가 바깥
+transaction을 남긴 상태에서 publish를 savepoint로 실행해 연결 종료 시 rollback됐다.
+코드를 수정해 task definition 97로 배포한 뒤 오전 Bronze 1,764개 객체를 재사용했다.
+12:31 KST 재실행에서 FMP 주식 6,020행, USDKRW 1행, 원자재 28행이 같은 인증
+run으로 publish됐다. 잘못 `RUNNING`으로 남았던 run
+`af1f6d36-38a4-47e3-903e-1e41a22044be`는 원인을 기록하고 `FAILED`로 마감했다.
 
 ## 현재 OPEN warning
 
@@ -91,10 +90,10 @@ FMP는 15:14 KST에 인증 완료했다. 오전 수집 Bronze는 재실행에서
 
 | 규칙 | OPEN 범위 | 실패 건수 | 대상일 범위 | 의미 |
 |---|---:|---:|---|---|
-| `CASH_DIVIDEND_AMOUNT_COVERAGE` | 1 | 15 | 2026-08-04 | DART 의사결정 문서에서 보통주 주당 현금액 미노출 |
-| `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` | 5 | 6 | 2026-07-27~2026-08-04 | 가격조정형 DART 행사 주변에 KRX 기준가 리셋 없음 |
+| `CASH_DIVIDEND_AMOUNT_COVERAGE` | 2 | 30 | 2026-08-04~2026-08-05 | DART 의사결정 문서에서 보통주 주당 현금액 미노출 |
+| `DART_ACTION_WITHOUT_KRX_ADJUSTMENT` | 6 | 7 | 2026-07-27~2026-08-05 | 가격조정형 DART 행사 주변에 KRX 기준가 리셋 없음 |
 | `PRICE_ADJUSTMENT_WITHOUT_DART_EVENT` | 3 | 5 | 2026-07-27~2026-08-03 | KRX 기준가 조정에 대응하는 DART/거래재개 근거 없음 |
-| **합계** | **9** | **26** |  |  |
+| **합계** | **11** | **42** |  |  |
 
 FMP daily의 OPEN warning은 0건이다.
 
@@ -136,12 +135,12 @@ FMP daily의 OPEN warning은 0건이다.
 
 | source | 행 수 | 자산 수 | 기간 |
 |---|---:|---:|---|
-| KRX | 6,769,289 | 3,303 | 2015-01-02~2026-08-04 |
-| FMP | 14,505,614 | 8,718 | 2015-01-02~2026-08-03 |
-| FMP_FX | 3,094 | 1 | 2015-01-01~2026-08-03 |
+| KRX | 6,772,054 | 3,303 | 2015-01-02~2026-08-05 |
+| FMP | 14,511,634 | 8,718 | 2015-01-02~2026-08-04 |
+| FMP_FX | 3,095 | 1 | 2015-01-01~2026-08-04 |
 | FMP_COMMODITY | 82,960 | 28 | 2015-01-01~2026-08-05 |
 
-### 재무·배당 지표
+### 재무·배당 지표 (2026-08-05 전수 집계)
 
 | source | statement | basis | 행 수 | 자산 수 | 기간 |
 |---|---|---|---:|---:|---|
@@ -152,7 +151,7 @@ FMP daily의 OPEN warning은 0건이다.
 | FMP | IS | STANDARDIZED | 3,291,802 | 8,457 | 2001-12-31~2026-07-15 |
 | FMP | CF | STANDARDIZED | 1,299,567 | 8,430 | 2001-12-31~2026-07-26 |
 
-### 주요 기업행사
+### 주요 기업행사 (2026-08-05 전수 집계)
 
 | source | action | 행 수 | 자산 수 |
 |---|---|---:|---:|

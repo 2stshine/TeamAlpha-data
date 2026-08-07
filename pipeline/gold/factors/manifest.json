@@ -1,0 +1,14 @@
+{
+  "paid_in_capital_ratio": {
+    "predicted_sign": -1,
+    "research_definition_hash": "8c82db0117290bcd",
+    "sql": "pipeline/gold/factors/paid_in_capital_ratio.sql",
+    "value_contract": "raw_value_direction_adjusted_rank_v1"
+  },
+  "trading_turnover_20d": {
+    "predicted_sign": -1,
+    "research_definition_hash": "c03efb8638407bd6",
+    "sql": "pipeline/gold/factors/trading_turnover_20d.sql",
+    "value_contract": "raw_value_direction_adjusted_rank_v1"
+  }
+}

@@ -25,7 +25,7 @@ KRX OpenAPI / OpenDART / marcap / FMP stable API
 - **silver**: `asset` 중심으로 가격·재무·기업행사를 정규화하고, point-in-time 및
   source-aware 품질 게이트를 통과한 데이터만 publish합니다.
 - **gold**: 팩터 정의·버전·평가와 종목별 값·순위, 팩터 간 상관관계를 저장합니다.
-  현재 12-1 모멘텀 계산 SQL이 구현되어 있으며 평가 기준은 아직 확정 전입니다.
+  레거시 12-1 모멘텀과 두 연구 후보 계산 SQL이 있으며, 임시 모멘텀 값은 제거된 상태입니다.
 - **운영 스케줄**: 화~토 오전 08:30 KST에 실행해 전날 KRX와 완료된 FMP
   세션 데이터를 적재합니다.
 - **자동 배포**: `main` 브랜치에 push하면 GitHub Actions가 ECR/ECS/Scheduler를 갱신합니다.
@@ -332,17 +332,19 @@ gold.factor
 승인된 팩터만 적재할 수 있도록 DB trigger가 강제합니다. 동일한 `factor_key`에서
 `APPROVED` 버전은 하나만 허용합니다.
 
-현재 첫 구현은 **12-1 모멘텀**입니다.
+레거시 첫 구현은 **12-1 모멘텀**이며, 연구 후보용 구현으로
+`trading_turnover_20d`와 `paid_in_capital_ratio`가 추가되어 있습니다.
 
 ```text
 value = adj_close[t-21 거래일] / adj_close[t-252 거래일] - 1
 rank  = 같은 as_of_date KOSPI·KOSDAQ 유니버스 내 내림차순 순위
 ```
 
-구현은 [`pipeline/gold/factors/momentum_12_1.sql`](pipeline/gold/factors/momentum_12_1.sql)에
-있습니다. 현재 테스트 스냅샷 적재까지 완료했으며 기준 IC·평가 구간·통과 임계값과
-자동 갱신 주기는 아직 확정하지 않았습니다. 따라서 Gold는 현재 daily task에 자동으로
-연결하지 않고 연구/평가 단계에서 명시적으로 실행합니다.
+구현은 [`pipeline/gold/factors/`](pipeline/gold/factors/)의 allowlist된 read-only SQL에
+있습니다. 연구 단계에서는 이 쿼리를 Python 정의와 대조하고, 운영 실행기는 검증된 동일 쿼리에
+공통 INSERT/UPSERT를 감쌉니다. `python -m pipeline.gold.run --factor <key>
+--as-of-month YYYY-MM`은 `--apply`가 없으면 rollback합니다. Gold는 현재 daily task에
+자동으로 연결하지 않고 봉인 OOS 통과와 사람 승인 뒤 명시적으로 실행합니다.
 
 상세 설계와 DDL은 [gold_schema.md](gold_schema.md),
 [sql/gold_schema.sql](sql/gold_schema.sql)을 참고합니다.
@@ -532,8 +534,9 @@ Gold schema 생성:
 psql "$SILVER_DB_URL" -v ON_ERROR_STOP=1 -f sql/gold_schema.sql
 ```
 
-12-1 모멘텀 SQL은 호출자가 승인된 `factor_id`를 전달하고 transaction을 소유하는
-형태입니다. 평가 기준이 확정되기 전에는 자동 배치에 연결하지 않습니다.
+Gold SQL은 호출자가 승인된 `factor_id`를 전달하고 transaction을 소유하는 형태입니다.
+연구 후보는 allowlist·SQL hash·부호 계약까지 검증하며, OOS와 사람 승인이 끝나기 전에는
+자동 배치에 연결하지 않습니다.
 
 GitHub Actions를 쓰지 못할 때 수동 이미지 배포:
 

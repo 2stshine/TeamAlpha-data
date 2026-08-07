@@ -27,11 +27,12 @@ Gold는 별도 RDS를 만들지 않고 기존 Silver RDS의 같은 PostgreSQL da
 | `factor_id` | 승인된 팩터 버전 |
 | `asset_id` | Silver `public.asset` 종목 ID |
 | `as_of_date` | 값이 투자 판단에 사용 가능한 PIT 날짜 |
-| `value` | 팩터 원값 |
-| `rank` | 그날 기본 universe 내 순위 |
+| `value` | 방향을 적용하지 않은 팩터 원값(raw value) |
+| `rank` | `score = value × predicted_sign`을 내림차순으로 매긴 signal month 단면 순위 |
 
 기본키는 `(factor_id, asset_id, as_of_date)`다. APPROVED 상태인 팩터만 값을
-적재할 수 있다.
+적재할 수 있다. `predicted_sign=-1`이어도 `value`는 부호를 뒤집지 않고, raw value가
+가장 낮은 종목을 rank 1로 저장한다.
 
 ## 3. `gold.factor_correlation` — 6개
 
@@ -74,9 +75,9 @@ Gold 계산이 Silver 운영을 방해할 정도로 커질 때만 별도 RDS 또
 검토한다. 물리적으로 분리하면 PostgreSQL FK를 사용할 수 없어 `asset` dimension
 복제와 별도 정합성 검사가 필요하다.
 
-## 첫 팩터: 12-1 모멘텀
+## 레거시 예시: 12-1 모멘텀
 
-현재 구현된 첫 Gold 팩터는 최신 KRX 거래일 기준 12-1 모멘텀이다.
+처음 만든 레거시 Gold 구현은 최신 KRX 거래일 기준 12-1 모멘텀이다.
 
 ```text
 signal_end   = as_of_date에서 21 거래일 전
@@ -88,12 +89,11 @@ rank         = 같은 날짜 KOSPI·KOSDAQ 유니버스 내 value 내림차순 �
 - 구현: [`pipeline/gold/factors/momentum_12_1.sql`](pipeline/gold/factors/momentum_12_1.sql)
 - 입력: `public.price_daily`의 KRX `adj_close`
 - 유니버스: 최신 `as_of_date`에 KOSPI 또는 KOSDAQ인 `stock`
-- 현재 단계: 계산 SQL과 테스트 스냅샷 적재 완료
+- 현재 단계: 메타데이터와 계산 SQL만 보존; 임시 2026-07 값은 제거됨
 - 미확정: IC 계산 방식, 평가 기간, 최소 관측치, 승인 임계값, 자동 갱신 주기
 
-기준 평가가 아직 없으므로 테스트 적재 결과를 운영 승인된 투자 신호로 해석하지
-않는다. 평가가 확정되면 `factor.evaluation`에 근거와 `passed`를 기록하고 상태 전이를
-통해 승인 여부를 명시한다.
+메타데이터의 기존 상태와 별개로 현재 값은 0건이다. 다시 적재하려면 정식 연구 근거와 구현
+계약을 먼저 갱신해야 하며, 레거시 SQL을 자동 실행하지 않는다.
 
 ## 적용과 검증
 
@@ -105,3 +105,25 @@ psql "$SILVER_DB_URL" -v ON_ERROR_STOP=1 -c \
 
 DDL은 idempotent하며 `gold.active_factor_catalog` view는 현재 `APPROVED`인 버전만
 노출한다. 팩터 값 계산 SQL은 호출자가 `factor_id`와 transaction을 관리한다.
+
+## 연구 팩터 구현 실행
+
+`trading_turnover_20d`와 `paid_in_capital_ratio`는
+[`pipeline/gold/factors/manifest.json`](pipeline/gold/factors/manifest.json)에 등록된
+read-only SQL로 계산한다. manifest는 연구 definition hash를 명시하며, 실행기는 APPROVED
+상태, 실제 SQL SHA-256, 게시 config와 manifest의 definition hash, `predicted_sign`,
+value/rank 계약을 모두 확인한다. 연구 parity와 운영 적재는 같은 query를 사용하고 운영
+실행기만 공통 INSERT/UPSERT를 덧붙인다.
+
+```bash
+# SQL과 계약을 검증하고 실행하되 마지막에 rollback
+uv run python -m pipeline.gold.run \
+  --factor trading_turnover_20d --as-of-month YYYY-MM
+
+# 명시적 승인 후에만 실제 적재
+uv run python -m pipeline.gold.run \
+  --factor trading_turnover_20d --as-of-month YYYY-MM --apply
+```
+
+두 SQL 모두 인증된 RDS Silver 행과 PIT 식별자·공시만 사용한다. Gold 실행은 연구의
+봉인 OOS 통과와 사람 승인 뒤 별도로 수행하며 daily task에 자동 연결하지 않는다.

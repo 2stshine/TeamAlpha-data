@@ -140,6 +140,7 @@ def incremental(
     financial_files: list[str] | None = None,
     dividend_files: list[str] | None = None,
     market_closed: bool = False,
+    has_action_change: bool = False,
 ) -> None:
     target_date = _parse_day(day)
     base = base_uri(src)
@@ -151,7 +152,12 @@ def incremental(
         context = repository.start_run(
             conn, mode="daily", target_date=target_date, status="RUNNING",
         )
-        if market_closed and not financial_files and not dividend_files:
+        if (
+            market_closed
+            and not financial_files
+            and not dividend_files
+            and not has_action_change
+        ):
             repository.finish_run(conn, context, "SKIPPED", [])
             print(
                 f"[silver-quality] skipped market holiday date={target_date}",
@@ -182,6 +188,12 @@ def incremental(
             raise
         bundle.stats["_existing_krx_identifiers"] = (
             repository.existing_krx_identifiers(conn)
+        )
+        bundle.stats["_market_closed"] = market_closed
+        bundle.stats.setdefault("price_daily", {})["coverage_baseline"] = (
+            repository.recent_market_coverage_baseline(
+                conn, "KRX", ["KOSPI", "KOSDAQ"], target_date,
+            )
         )
         candidate_krx_identifiers = set(
             bundle.identifiers.loc[

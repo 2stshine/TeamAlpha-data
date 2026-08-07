@@ -147,13 +147,16 @@ def main() -> None:
         datetime.strptime(day, "%Y%m%d").date()
         - timedelta(days=CORPORATE_ACTION_EVIDENCE_LOOKBACK_DAYS)
     ).strftime("%Y%m%d")
+    genuine_action_changes: list[str] = []
     changed_action_uris = corporate_actions.run(
         action_from,
         day,
         "s3",
         include_dependencies=True,
         dependency_fromdate=action_evidence_from,
+        changed_sink=genuine_action_changes,
     )
+    has_action_change = bool(genuine_action_changes)
     changed_action_keys = [
         _key_from_s3_uri(uri) for uri in changed_action_uris
     ]
@@ -164,7 +167,8 @@ def main() -> None:
     if action_disclosure_manifest not in changed_action_keys:
         changed_action_keys.append(action_disclosure_manifest)
     print(
-        f"[daily] changed corporate-action files={len(changed_action_keys)}",
+        f"[daily] changed corporate-action files={len(changed_action_keys)}, "
+        f"genuine changes={len(genuine_action_changes)}",
         flush=True,
     )
 
@@ -204,6 +208,7 @@ def main() -> None:
         financial_files=financial_files,
         dividend_files=dividend_files,
         market_closed=market_closed,
+        has_action_change=has_action_change,
     )
     print(f"[silver] incremental complete day={day}", flush=True)
 

@@ -11,7 +11,10 @@ from pipeline.silver_quality.rules.common import result
 from pipeline.silver_quality.rules.assets import check_assets
 from pipeline.silver_quality.rules.actions import check_actions
 from pipeline.silver_quality.rules.financials import check_financials
-from pipeline.silver_quality.rules.prices import check_prices
+from pipeline.silver_quality.rules.prices import (
+    check_market_coverage_floor,
+    check_prices,
+)
 from pipeline.silver_quality.rules.reconciliation import check_reconciliation
 
 
@@ -78,6 +81,29 @@ def run_registered_rules(
             ),
             failed_count=0,
             samples=list(unsupported_market.get("samples", []))[:20],
+            partition_key=partition_key,
+        ))
+    nonpositive_price = bundle.stats.get("price_daily", {}).get(
+        "nonpositive_price",
+        {"row_count": 0, "ticker_count": 0, "samples": []},
+    )
+    nonpositive_rows = int(nonpositive_price.get("row_count", 0))
+    if nonpositive_rows > 0:
+        results.append(CheckResult(
+            rule_code="NONPOSITIVE_PRICE_EXCLUDED",
+            dataset="price_daily",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected=(
+                "close/shares/market_cap 비양수 주식 행은 Bronze 보존, "
+                "Silver에서 제외"
+            ),
+            actual=(
+                f"excluded_rows={nonpositive_rows}, "
+                f"excluded_tickers={int(nonpositive_price.get('ticker_count', 0))}"
+            ),
+            failed_count=0,
+            samples=list(nonpositive_price.get("samples", []))[:20],
             partition_key=partition_key,
         ))
     unsupported_asset = bundle.stats.get("fundamental", {}).get(
@@ -208,6 +234,12 @@ def run_registered_rules(
             samples=list(replacement.get("samples", []))[:20],
             partition_key=partition_key,
         ))
+    results.extend(check_market_coverage_floor(
+        bundle.prices,
+        bundle.stats,
+        target_date,
+        bool(bundle.stats.get("_market_closed", False)),
+    ))
     if not bundle.prices.empty:
         results.extend(check_prices(
             bundle.prices,

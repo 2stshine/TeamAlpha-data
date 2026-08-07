@@ -119,10 +119,12 @@ def test_run_saves_json_rows_and_binary_document(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(corporate_actions.time, "sleep", lambda _seconds: None)
 
+    first_sink: list[str] = []
     changed = corporate_actions.run(
         "20260101",
         "20260131",
         "local",
+        changed_sink=first_sink,
     )
 
     disclosure_path = (
@@ -146,13 +148,19 @@ def test_run_saves_json_rows_and_binary_document(tmp_path, monkeypatch):
     assert structured_params[0]["bgn_de"] == "20150101"
     assert structured_params[0]["end_de"] == "20260131"
     assert len(changed) == 7
+    # changed_sink mirrors the genuine new/changed writes daily_full uses to
+    # decide whether a market-closed day still has corporate-action work.
+    assert sorted(set(first_sink)) == changed
 
+    second_sink: list[str] = []
     second_changed = corporate_actions.run(
         "20260101",
         "20260131",
         "local",
+        changed_sink=second_sink,
     )
     assert second_changed == []
+    assert second_sink == []
 
     dependencies = corporate_actions.run(
         "20260101",

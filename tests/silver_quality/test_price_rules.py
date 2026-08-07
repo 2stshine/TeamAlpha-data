@@ -4,6 +4,7 @@ import pandas as pd
 
 from pipeline.silver import assets
 from pipeline.silver.prices import (
+    _exclude_nonpositive_prices,
     _exclude_unsupported_markets,
     _normalize_incomplete_ohlc,
     _rescale_history_for_events,
@@ -14,6 +15,8 @@ from pipeline.silver_quality.rules.prices import (
     ADJUSTMENT_SEARCH_WINDOW_DAYS,
     _dart_actions_without_krx_adjustment,
     _distribution_drift_confirmation,
+    _expected_benchmarks,
+    _required_markets,
     check_prices,
 )
 
@@ -1139,3 +1142,150 @@ def test_post_publish_adj_close_verification_rejects_mismatch():
         assert "ADJ_CLOSE_POST_PUBLISH failed" in str(exc)
     else:
         raise AssertionError("expected post-publish verification failure")
+
+
+# --- historical coverage: date-aware market/benchmark completeness ---------
+
+def test_inception_helpers_have_correct_boundaries():
+    assert _required_markets(date(1996, 6, 30)) == {"KOSPI"}
+    assert _required_markets(date(1996, 7, 1)) == {"KOSPI", "KOSDAQ"}
+    assert _expected_benchmarks(date(2010, 1, 3)) == set()
+    assert _expected_benchmarks(date(2010, 1, 4)) == {"1028"}
+    assert _expected_benchmarks(date(2015, 7, 12)) == {"1028"}
+    assert _expected_benchmarks(date(2015, 7, 13)) == {"1028", "2203"}
+
+
+def test_market_completeness_allows_kospi_only_before_kosdaq_launch():
+    frame = pd.DataFrame([
+        _row("000010", "stock", market="KOSPI", trade_date=date(1995, 5, 2)),
+    ])
+    assert _failed(check_prices(frame), "PRICE_MARKET_COMPLETENESS") == 0
+
+
+def test_market_completeness_requires_kosdaq_after_launch():
+    frame = pd.DataFrame([
+        _row("000010", "stock", market="KOSPI", trade_date=date(2020, 5, 4)),
+    ])
+    assert _failed(check_prices(frame), "PRICE_MARKET_COMPLETENESS") == 1
+
+
+def test_benchmark_completeness_not_required_before_index_data():
+    frame = pd.DataFrame([
+        _row("000010", "stock", market="KOSPI", trade_date=date(1998, 3, 2)),
+    ])
+    assert _failed(check_prices(frame), "PRICE_BENCHMARK_COMPLETENESS") == 0
+
+
+def test_benchmark_completeness_requires_only_kospi200_before_kosdaq150():
+    day = date(2012, 3, 2)
+    frame = pd.DataFrame([
+        _row("000010", "stock", market="KOSPI", trade_date=day),
+        _row("035720", "stock", market="KOSDAQ", trade_date=day),
+        _row("1028", "index", shares=None, market=None, trade_date=day),
+    ])
+    assert _failed(check_prices(frame), "PRICE_BENCHMARK_COMPLETENESS") == 0
+
+
+def test_benchmark_completeness_fails_when_kospi200_missing_after_2010():
+    day = date(2012, 3, 2)
+    frame = pd.DataFrame([
+        _row("000010", "stock", market="KOSPI", trade_date=day),
+        _row("035720", "stock", market="KOSDAQ", trade_date=day),
+    ])
+    assert _failed(check_prices(frame), "PRICE_BENCHMARK_COMPLETENESS") == 1
+
+
+def test_benchmark_completeness_requires_both_after_kosdaq150():
+    day = date(2020, 3, 2)
+    frame = pd.DataFrame([
+        _row("000010", "stock", market="KOSPI", trade_date=day),
+        _row("035720", "stock", market="KOSDAQ", trade_date=day),
+        _row("1028", "index", shares=None, market=None, trade_date=day),
+    ])
+    assert _failed(check_prices(frame), "PRICE_BENCHMARK_COMPLETENESS") == 1
+
+
+def _drift_confirmation_frames(day, benchmark_codes):
+    drift = pd.DataFrame([{"trade_date": day, "median_return": -0.10}])
+    rows = [
+        {"identifier": ident, "asset_type": "stock", "trade_date": day,
+         "return": value}
+        for ident, value in (
+            ("000001", -0.10), ("000002", -0.08),
+            ("000003", -0.05), ("000004", 0.01),
+        )
+    ] + [
+        {"identifier": code, "asset_type": "index", "trade_date": day,
+         "return": -0.07}
+        for code in benchmark_codes
+    ]
+    return drift, pd.DataFrame(rows)
+
+
+def test_drift_consistency_single_benchmark_window_is_consistent():
+    # 2010~2015-07: only KOSPI200 exists; breadth + the one benchmark suffice.
+    day = date(2012, 3, 2)
+    drift, confirmed = _drift_confirmation_frames(day, ["1028"])
+    _, inconsistent = _distribution_drift_confirmation(confirmed, drift)
+    assert inconsistent.empty
+
+
+def test_drift_consistency_pre_index_relies_on_breadth_only():
+    # Before 2010 there is no benchmark; high breadth alone confirms the move.
+    day = date(2005, 3, 2)
+    drift, confirmed = _drift_confirmation_frames(day, [])
+    _, inconsistent = _distribution_drift_confirmation(confirmed, drift)
+    assert inconsistent.empty
+
+
+def test_drift_consistency_flags_missing_expected_benchmark():
+    # 2020: both benchmarks expected; supplying only one is inconsistent.
+    day = date(2020, 3, 2)
+    drift, confirmed = _drift_confirmation_frames(day, ["1028"])
+    _, inconsistent = _distribution_drift_confirmation(confirmed, drift)
+    assert len(inconsistent) == 1
+
+
+# --- historical coverage: exclude non-positive price rows ------------------
+
+def _stock_price_row(ticker, close, shares, market_cap, trade_date=None):
+    return {
+        "ticker": ticker,
+        "trade_date": trade_date or date(2001, 3, 2),
+        "open": close,
+        "high": close,
+        "low": close,
+        "close": close,
+        "volume": 10,
+        "trading_value": 1_000,
+        "shares": shares,
+        "market_cap": market_cap,
+        "prev_diff": 0.0,
+        "market": "KOSPI",
+        "source_file": "marcap-2001.parquet",
+    }
+
+
+def test_nonpositive_price_rows_are_excluded_with_reason():
+    frame = pd.DataFrame([
+        _stock_price_row("000010", 1000.0, 1_000, 1_000_000.0),   # valid
+        _stock_price_row("000020", 0.0, 1_000, 0.0),              # close/mcap 0
+        _stock_price_row("000030", 500.0, 0, 0.0),               # shares/mcap 0
+        _stock_price_row("000040", 500.0, 1_000, None),          # mcap NaN
+    ])
+    retained, detail = _exclude_nonpositive_prices(frame)
+    assert set(retained["ticker"]) == {"000010"}
+    assert detail["row_count"] == 3
+    assert detail["ticker_count"] == 3
+    assert len(detail["samples"]) == 3
+
+
+def test_all_valid_prices_are_not_excluded():
+    frame = pd.DataFrame([
+        _stock_price_row("000010", 1000.0, 1_000, 1_000_000.0),
+        _stock_price_row("000020", 2000.0, 2_000, 4_000_000.0),
+    ])
+    retained, detail = _exclude_nonpositive_prices(frame)
+    assert len(retained) == 2
+    assert detail["row_count"] == 0
+    assert detail["ticker_count"] == 0

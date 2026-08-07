@@ -30,6 +30,8 @@ FMP 전용 핵심 규칙은 다음과 같다.
 | `FMP_REQUIRED_UNIVERSE` | Critical | 편입 가능한 미국 주식 유니버스가 비어 있지 않음 |
 | `FMP_SILVER_UNIVERSE` | Critical | NASDAQ·NYSE·AMEX의 비 ETF/fund 주식성 자산만 편입 |
 | `FMP_PRICE_OHLC` | Error | 복원 OHLC 범위와 양수 조건 |
+| `FMP_EXPECTED_DAILY_PRICE` | Critical | 개장일에 편입 미국 주식 가격이 최소 1행 존재 |
+| `FMP_DAILY_PRICE_COVERAGE_FLOOR` | Error | 일별 편입 주식 행 수 ≥ 최근 baseline median의 50% (부분 eod-bulk 세션 차단, 개장일 한정) |
 | `FMP_*_IDENTIFIER_MAPPING` | Critical | 가격·재무·기업행사가 편입 자산에 매핑됨 |
 | `FMP_SILVER_UNIVERSE_EXCLUDED` | Modified | Bronze에 보존된 제외 행의 사유·건수 |
 | `FMP_COMMODITY_UNIVERSE_COMPLETE` | Critical | 물리·비 micro 원자재 28개가 정확히 존재 |
@@ -82,12 +84,14 @@ transaction을 즉시 rollback한다.
 | `PRICE_REQUIRED_POSITIVE` | Error | 필수 가격 필드 양수 (주식 close·adj_close·market_cap, 지수 close·adj_close) |
 | `PRICE_OHLC_LOGIC` | Error | OHLC 대소관계·부분 누락 |
 | `PRICE_SOURCE_PARTITION_DATE` | Error | S3 날짜 파티션 = 내부 거래일 |
-| `PRICE_MARKET_COMPLETENESS` | Critical | 거래일마다 KOSPI·KOSDAQ 종목 존재 |
+| `PRICE_MARKET_COMPLETENESS` | Critical | 거래일마다 시장별 개시일 이후 종목 존재 (KOSPI 상시, KOSDAQ 1996-07-01~) |
+| `PRICE_MARKET_COVERAGE_FLOOR` | Error | 일별 시장별 종목 수 ≥ 최근 baseline median의 50% (부분·절단 시장데이터 차단, 개장일 한정) |
 | `PRICE_MARKET_CAP_RECONCILIATION` | Error | `market_cap ≈ close × shares` (1%) |
-| `PRICE_BENCHMARK_COMPLETENESS` | Critical | 코스피200·코스닥150 각 1행 |
+| `PRICE_BENCHMARK_COMPLETENESS` | Critical | 거래일마다 개시일 이후 벤치마크 각 1행 (KOSPI200/1028 2010-01-04~, KOSDAQ150/2203 2015-07-13~; 지수 개시 전 거래일은 벤치마크 불요) |
 | `SOURCE_INCOMPLETE_OHLC` | Modified | 거래 있으나 O/H/L=0 → NULL 유지, close·거래량·시총은 보존 |
 | `SOURCE_NO_TRADE_OHLC` | Modified | 무거래 행의 O/H/L 누락 기록 |
 | `UNSUPPORTED_MARKET_EXCLUDED` | Modified | KONEX 가격을 유니버스에서 제외 |
+| `NONPOSITIVE_PRICE_EXCLUDED` | Modified | close/상장주식수/시가총액 비양수 주식 행을 Bronze 보존·Silver 제외 (정지·상폐 과정 과거행) |
 | `UNSUPPORTED_MARKET_ASSET_EXCLUDED` | Modified | KONEX 이력만 있는 자산의 재무 제외 |
 
 ### 수정종가 (adj_close)

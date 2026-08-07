@@ -18,6 +18,11 @@ from pipeline.silver_quality.rules.common import (
     result,
 )
 
+# A completed US session returns close to the full admitted universe. A daily
+# admitted-equity count below this fraction of the recent baseline means the
+# eod-bulk fetch was still partial, not a genuine universe change.
+FMP_COVERAGE_FLOOR_FRACTION = 0.5
+
 
 def check_fmp(bundle: CandidateBundle) -> list[CheckResult]:
     checks: list[CheckResult] = []
@@ -243,6 +248,29 @@ def check_fmp(bundle: CandidateBundle) -> list[CheckResult]:
             "at least one admitted US equity price on an open market day",
             f"date={target_date}, stock_price_rows={stock_price_count}",
         ))
+        baseline = bundle.stats.get("price_daily", {}).get("coverage_baseline")
+        if baseline:
+            baseline = int(baseline)
+            floor = FMP_COVERAGE_FLOOR_FRACTION * baseline
+            checks.append(CheckResult(
+                rule_code="FMP_DAILY_PRICE_COVERAGE_FLOOR",
+                dataset="price_daily",
+                severity=Severity.ERROR,
+                status=(
+                    CheckStatus.FAIL
+                    if stock_price_count < floor
+                    else CheckStatus.PASS
+                ),
+                expected=(
+                    f"admitted US equity rows >= {FMP_COVERAGE_FLOOR_FRACTION:.0%} "
+                    f"of recent baseline {baseline}"
+                ),
+                actual=(
+                    f"date={target_date}, stock_price_rows={stock_price_count}, "
+                    f"baseline={baseline}"
+                ),
+                failed_count=int(stock_price_count < floor),
+            ))
 
     if not fundamentals.empty:
         fundamental_key = [

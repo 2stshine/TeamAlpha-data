@@ -223,6 +223,9 @@ def _build_daily_candidates(
     bundle = fmp.build_candidates(base, target_date)
     with conn.transaction():
         _add_previous_commodity_roll_check(conn, bundle)
+        bundle.stats.setdefault("price_daily", {})["coverage_baseline"] = (
+            repository.recent_source_daily_count_baseline(conn, "FMP", target_date)
+        )
     return bundle
 
 

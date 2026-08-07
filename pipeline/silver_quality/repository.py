@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import date
+from datetime import date, timedelta
+from statistics import median
 from uuid import UUID, uuid4
 
 import pandas as pd
@@ -508,6 +509,73 @@ def recent_price_history(conn, identifiers: list[str], before_date, days: int = 
         "identifier", "trade_date", "close", "adj_close", "market", "asset_type",
         "shares", "market_cap",
     ])
+
+
+def recent_market_coverage_baseline(
+    conn,
+    source: str,
+    markets: list[str],
+    before_date: date,
+    *,
+    lookback_days: int = 45,
+    min_days: int = 5,
+) -> dict[str, int]:
+    """Median distinct-asset count per market over recent certified trade dates.
+
+    Used to detect a partial/truncated market day: the number of listed stocks
+    is very stable day to day, so a large shortfall means the source Bronze was
+    incomplete. Returns an empty dict (or omits a market) when fewer than
+    ``min_days`` observations exist so early backfill days never false-block.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT market, count(*) AS n
+            FROM price_daily
+            WHERE source=%s AND market = ANY(%s)
+              AND trade_date < %s AND trade_date >= %s
+            GROUP BY market, trade_date
+            """,
+            (source, list(markets), before_date, before_date - timedelta(days=lookback_days)),
+        )
+        rows = cur.fetchall()
+    per_market: dict[str, list[int]] = {}
+    for market, n in rows:
+        per_market.setdefault(str(market), []).append(int(n))
+    baseline: dict[str, int] = {}
+    for market, counts in per_market.items():
+        if len(counts) >= min_days:
+            baseline[market] = int(median(counts))
+    return baseline
+
+
+def recent_source_daily_count_baseline(
+    conn,
+    source: str,
+    before_date: date,
+    *,
+    lookback_days: int = 30,
+    min_days: int = 5,
+) -> int | None:
+    """Median row count per trade date for a price source over recent sessions.
+
+    Returns None when fewer than ``min_days`` sessions exist so a fresh source
+    (or early backfill) never false-blocks the coverage-floor gate.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*) AS n
+            FROM price_daily
+            WHERE source=%s AND trade_date < %s AND trade_date >= %s
+            GROUP BY trade_date
+            """,
+            (source, before_date, before_date - timedelta(days=lookback_days)),
+        )
+        counts = [int(row[0]) for row in cur.fetchall()]
+    if len(counts) < min_days:
+        return None
+    return int(median(counts))
 
 
 def existing_krx_identifiers(conn) -> set[str]:

@@ -56,6 +56,11 @@ class _TransactionConnection:
     def transaction(self):
         return _Transaction(self)
 
+    def cursor(self):
+        # The coverage-baseline read runs inside the roll-check transaction;
+        # return no prior sessions so the baseline stays None (no false block).
+        return _Cursor([])
+
 
 def test_existing_identifier_map_includes_historical_ticker_episodes():
     identifiers = pd.DataFrame([
@@ -131,3 +136,5 @@ def test_daily_candidate_roll_lookup_closes_transaction_before_publish(
     assert observed == [(1, expected)]
     assert connection.transaction_depth == 0
     assert connection.completed_transactions == 1
+    # Baseline was fetched inside the same transaction; empty history -> None.
+    assert actual.stats["price_daily"]["coverage_baseline"] is None

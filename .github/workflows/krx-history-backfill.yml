@@ -1,0 +1,170 @@
+name: Rebuild KRX Silver history
+
+# 파괴적: Silver 5개 테이블을 TRUNCATE 하고 1995~현재 전체를 재구축한다.
+# 반드시 (1) 코드가 배포된 최신 이미지에서 실행되고, (2) 실행 전에 RDS 스냅샷을
+# 수동으로 만든 뒤 그 스냅샷 ID를 입력으로 넘겨야 하며, (3) confirm 에 REBUILD 를
+# 정확히 입력해야 동작한다. 재구축은 수 시간 걸릴 수 있어 daily 스케줄과 겹치지
+# 않도록 이 워크플로는 daily 스케줄을 DISABLED 로 남긴다(완료 검증 후 수동 재개).
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type REBUILD to confirm a destructive full rebuild'
+        required: true
+        default: ''
+      snapshot_id:
+        description: 'RDS snapshot id you created BEFORE running (proof of backup)'
+        required: true
+        default: ''
+      resume:
+        description: 'Optional backfill_s3 dq_run UUID to resume (skips truncate)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: krx-history-backfill
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECS_TASK_FAMILY: ${{ vars.ECS_TASK_FAMILY }}
+  CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
+  SCHEDULE_NAME: ${{ vars.SCHEDULE_NAME }}
+  # 전기간 일괄 빌드(adj_close 전시계열)는 daily(8GB/21GB)보다 큰 자원이 필요하다.
+  REBUILD_CPU: '8192'
+  REBUILD_MEMORY: '49152'
+  REBUILD_EPHEMERAL_GIB: '120'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Guard confirmation and snapshot proof
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          SNAPSHOT_ID: ${{ inputs.snapshot_id }}
+        run: |
+          set -euo pipefail
+          if [[ "${CONFIRM}" != "REBUILD" ]]; then
+            echo "confirm must be exactly REBUILD" >&2; exit 1
+          fi
+          if [[ -z "${SNAPSHOT_ID}" ]]; then
+            echo "snapshot_id is required: create an RDS snapshot first" >&2; exit 1
+          fi
+          echo "Confirmed rebuild; recorded pre-rebuild snapshot ${SNAPSHOT_ID}"
+
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve production resources
+        run: |
+          set -euo pipefail
+          DEFAULT_FAMILY="$(basename "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')-daily-full"
+          ECS_TASK_FAMILY="${ECS_TASK_FAMILY:-${DEFAULT_FAMILY}}"
+          CONTAINER_NAME="${CONTAINER_NAME:-${ECS_TASK_FAMILY}}"
+          SCHEDULE_NAME="${SCHEDULE_NAME:-${ECS_TASK_FAMILY}-tue-sat-0830-kst}"
+          {
+            echo "ECS_TASK_FAMILY=${ECS_TASK_FAMILY}"
+            echo "CONTAINER_NAME=${CONTAINER_NAME}"
+            echo "SCHEDULE_NAME=${SCHEDULE_NAME}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Register one-off rebuild task definition
+        id: task
+        env:
+          RESUME: ${{ inputs.resume }}
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition \
+            --task-definition "${ECS_TASK_FAMILY}" \
+            --query taskDefinition --output json > current.json
+          # 명령: 파괴적 재구축을 --confirm REBUILD 로만 수행. resume 이 있으면 이어감.
+          if [[ -n "${RESUME}" ]]; then
+            CMD="[\"--confirm\",\"REBUILD\",\"--resume\",\"${RESUME}\"]"
+          else
+            CMD='["--confirm","REBUILD"]'
+          fi
+          jq \
+            --arg container "${CONTAINER_NAME}" \
+            --arg cpu "${REBUILD_CPU}" \
+            --arg memory "${REBUILD_MEMORY}" \
+            --argjson ephemeral "${REBUILD_EPHEMERAL_GIB}" \
+            --argjson cmd "${CMD}" \
+            '
+            {
+              family, taskRoleArn, executionRoleArn, networkMode,
+              containerDefinitions, volumes, placementConstraints,
+              requiresCompatibilities, runtimePlatform, ipcMode, pidMode,
+              proxyConfiguration, inferenceAccelerators
+            }
+            | with_entries(select(.value != null and .value != [] and .value != {}))
+            | .cpu = $cpu
+            | .memory = $memory
+            | .ephemeralStorage = {"sizeInGiB": $ephemeral}
+            | .containerDefinitions |= map(
+                if .name == $container then
+                  .entryPoint = ["uv","run","python","-m","pipeline.krx_history_backfill_ecs"]
+                  | .command = $cmd
+                else . end
+              )
+            ' current.json > one-off.json
+          TASK_DEFINITION_ARN="$(
+            aws ecs register-task-definition \
+              --cli-input-json file://one-off.json \
+              --query taskDefinition.taskDefinitionArn --output text
+          )"
+          echo "task_definition_arn=${TASK_DEFINITION_ARN}" >> "${GITHUB_OUTPUT}"
+
+      - name: Submit rebuild via scheduler and leave daily DISABLED
+        env:
+          TASK_DEFINITION_ARN: ${{ steps.task.outputs.task_definition_arn }}
+        run: |
+          set -euo pipefail
+          aws scheduler get-schedule \
+            --name "${SCHEDULE_NAME}" --output json > schedule.json
+          jq '.Target' schedule.json > target.json
+          SCHEDULE_GROUP="$(jq -r '.GroupName // "default"' schedule.json)"
+          ORIGINAL_EXPRESSION="$(jq -r '.ScheduleExpression' schedule.json)"
+          ORIGINAL_TIMEZONE="$(jq -r '.ScheduleExpressionTimezone // "UTC"' schedule.json)"
+
+          # 재구축은 수 시간 걸릴 수 있으므로, 원 cron 을 복원하되 State=DISABLED 로
+          # 남겨 다음 daily 가 재구축 도중에 발화하지 않게 한다.
+          leave_disabled() {
+            aws scheduler update-schedule \
+              --name "${SCHEDULE_NAME}" \
+              --group-name "${SCHEDULE_GROUP}" \
+              --schedule-expression "${ORIGINAL_EXPRESSION}" \
+              --schedule-expression-timezone "${ORIGINAL_TIMEZONE}" \
+              --flexible-time-window '{"Mode":"OFF"}' \
+              --target file://target.json \
+              --state DISABLED > /dev/null
+            echo "::warning::daily schedule ${SCHEDULE_NAME} left DISABLED. Re-enable it after verifying the rebuild is CERTIFIED."
+          }
+          trap leave_disabled EXIT
+
+          jq \
+            --arg task_definition "${TASK_DEFINITION_ARN}" \
+            '.EcsParameters.TaskDefinitionArn = $task_definition' \
+            target.json > one-off-target.json
+          RUN_AT="$(date -u -d '+90 seconds' '+%Y-%m-%dT%H:%M:%S')"
+          aws scheduler update-schedule \
+            --name "${SCHEDULE_NAME}" \
+            --group-name "${SCHEDULE_GROUP}" \
+            --schedule-expression "at(${RUN_AT})" \
+            --schedule-expression-timezone UTC \
+            --flexible-time-window '{"Mode":"OFF"}' \
+            --target file://one-off-target.json \
+            --state ENABLED > /dev/null
+          echo "Scheduled one-off KRX rebuild at ${RUN_AT} UTC"
+          sleep 150
+          leave_disabled
+          echo "Rebuild submitted. Watch the ECS task, its DQ run (CERTIFIED) and the SNS notification, then re-enable the daily schedule."

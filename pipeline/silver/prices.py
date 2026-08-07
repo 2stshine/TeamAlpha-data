@@ -92,6 +92,49 @@ def _exclude_unsupported_markets(
     }
 
 
+def _exclude_nonpositive_prices(
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict]:
+    """close/상장주식수/시가총액이 비양수인 주식 행을 명시적으로 제외한다.
+
+    정지·상장폐지 과정의 과거 marcap 행은 close/Stocks/Marcap가 0 또는 결측이라
+    유효한 가격 시계열이 될 수 없고 DB CHECK(close>0, shares>0, market_cap>0)에
+    걸린다. Bronze에는 원천 그대로 보존하고 Silver에서만 제외하며 사유·건수를
+    기록한다. adj_close 누적계수가 오염되지 않도록 반드시 _with_adj_close 이전에
+    적용한다. (현재 2015+ 구간에는 해당 행이 없어 기존 인증에 무영향.)
+    """
+    empty_detail = {"row_count": 0, "ticker_count": 0, "samples": []}
+    if frame.empty:
+        return frame, empty_detail
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    shares = pd.to_numeric(frame["shares"], errors="coerce")
+    market_cap = pd.to_numeric(frame["market_cap"], errors="coerce")
+    invalid = ~((close > 0) & (shares > 0) & (market_cap > 0))
+    if not invalid.any():
+        return frame.reset_index(drop=True), empty_detail
+    bad = frame[invalid]
+    retained = frame[~invalid].reset_index(drop=True)
+    summary = (
+        bad.groupby("ticker", as_index=False)
+        .agg(
+            row_count=("ticker", "size"),
+            first_trade_date=("trade_date", "min"),
+            last_trade_date=("trade_date", "max"),
+        )
+        .sort_values(["row_count", "ticker"], ascending=[False, True])
+    )
+    return retained, {
+        "row_count": int(invalid.sum()),
+        "ticker_count": int(bad["ticker"].nunique()),
+        "samples": (
+            summary.head(20)
+            .astype(object)
+            .where(pd.notna(summary.head(20)), None)
+            .to_dict("records")
+        ),
+    }
+
+
 def _paths_in_period(
     pattern: str,
     start_date: date | None,
@@ -485,7 +528,9 @@ def prepare(
         ignore_index=True,
     )
     stock_input_rows = len(stock)
+    nonpositive_price = {"row_count": 0, "ticker_count": 0, "samples": []}
     if not stock.empty:
+        stock, nonpositive_price = _exclude_nonpositive_prices(stock)
         stock = _normalize_incomplete_ohlc(stock)
         stock = _with_adj_close(stock)
         if target_date is not None:
@@ -533,6 +578,7 @@ def prepare(
         "rejected_rows": 0,
         "source_file_count": len(source_files),
         "unsupported_market": unsupported_market,
+        "nonpositive_price": nonpositive_price,
     }
     return both, stats
 

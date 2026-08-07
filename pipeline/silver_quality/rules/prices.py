@@ -23,6 +23,32 @@ NUMERIC = [
     "open", "high", "low", "close", "adj_close", "volume",
     "trading_value", "shares", "market_cap",
 ]
+
+# 시장·벤치마크는 각자의 개시일부터만 존재한다. 완전성 규칙은 히스토리
+# 백필(예: 1995~)에서도 성립해야 하므로 아래 시점 이후 날짜에만 해당 시장/
+# 벤치마크를 요구한다. KRX OpenAPI 지수는 2010-01-04부터 제공되어 그 이전
+# 거래일에는 벤치마크(1028/2203)가 아예 존재하지 않는다.
+KOSDAQ_MARKET_START = date(1996, 7, 1)   # KOSDAQ 개장
+INDEX_DATA_START = date(2010, 1, 4)      # KRX OpenAPI 지수 최소 제공일 → 1028 기대 시작
+KOSDAQ150_START = date(2015, 7, 13)      # KOSDAQ150(2203) 출시
+
+
+def _required_markets(trade_date) -> set[str]:
+    """거래일에 반드시 존재해야 하는 주식 시장 집합(개시일 기준)."""
+    required = {"KOSPI"}
+    if trade_date >= KOSDAQ_MARKET_START:
+        required.add("KOSDAQ")
+    return required
+
+
+def _expected_benchmarks(trade_date) -> set[str]:
+    """거래일에 반드시 존재해야 하는 벤치마크 지수 코드 집합(개시일 기준)."""
+    expected: set[str] = set()
+    if trade_date >= INDEX_DATA_START:
+        expected.add("1028")
+    if trade_date >= KOSDAQ150_START:
+        expected.add("2203")
+    return expected
 # DART가 기록한 효력일(신주배정기준일·감자 효력일 등)은 KRX가 실제로
 # 기준가를 조정하는 권리락일과 며칠 어긋날 수 있다. 이 창 안에 실제 KRX
 # 기준가 리셋이 있으면 그 행사가 반영된 것으로 보고 "조정 누락"으로 보지 않는다.
@@ -658,13 +684,79 @@ def _distribution_drift_confirmation(
             benchmark_summary["matching_benchmarks"]
         ).fillna(0)
     )
-    inconsistent = confirmation[
+    # 그 날짜에 기대되는 벤치마크 수(개시일 기준). 2010 이전은 0개라 벤치마크
+    # 확인이 불가능하므로 종목폭(breadth)만으로 판정한다.
+    expected_count = confirmation["trade_date"].map(
+        lambda trade_date: len(_expected_benchmarks(trade_date))
+    )
+    breadth_inconsistent = (
         confirmation["same_direction_breadth"].isna()
         | confirmation["same_direction_breadth"].lt(0.60)
-        | confirmation["benchmark_count"].ne(2)
-        | confirmation["matching_benchmarks"].ne(2)
-    ]
+    )
+    benchmark_inconsistent = expected_count.gt(0) & (
+        confirmation["benchmark_count"].ne(expected_count)
+        | confirmation["matching_benchmarks"].ne(expected_count)
+    )
+    inconsistent = confirmation[breadth_inconsistent | benchmark_inconsistent]
     return confirmation, inconsistent
+
+
+# A real trading day retains almost all of the previous day's listed stocks, so
+# a per-market count below this fraction of the recent baseline means the source
+# Bronze was truncated or partially fetched, not a genuine market change.
+COVERAGE_FLOOR_FRACTION = 0.5
+
+
+def check_market_coverage_floor(
+    prices: pd.DataFrame | None,
+    stats: dict,
+    target_date,
+    market_closed: bool,
+) -> list[CheckResult]:
+    """Block a partial/empty KRX market day from replacing a certified day.
+
+    Runs only on the daily incremental path (``target_date`` set), only on open
+    days, and only once a per-market baseline exists. Compares today's distinct
+    stock count per market against ``COVERAGE_FLOOR_FRACTION`` of the recent
+    baseline median. Also catches the case where stock rows are entirely missing
+    while index rows are present (the vacuous-pass hole in PRICE_MARKET_COMPLETENESS).
+    """
+    baseline = (stats.get("price_daily", {}) or {}).get("coverage_baseline") or {}
+    if target_date is None or market_closed or not baseline:
+        return []
+    if prices is None or prices.empty:
+        current: dict[str, int] = {}
+    else:
+        stock = prices[
+            prices["asset_type"].eq("stock")
+            & prices["trade_date"].eq(target_date)
+        ]
+        current = stock.groupby("market")["identifier"].nunique().to_dict()
+    shortfalls = []
+    for market, base in baseline.items():
+        base = int(base or 0)
+        if base <= 0:
+            continue
+        have = int(current.get(market, 0))
+        if have < COVERAGE_FLOOR_FRACTION * base:
+            shortfalls.append(
+                f"{market}={have} (< {COVERAGE_FLOOR_FRACTION:.0%} of baseline {base})"
+            )
+    return [CheckResult(
+        rule_code="PRICE_MARKET_COVERAGE_FLOOR",
+        dataset="price_daily",
+        severity=Severity.ERROR,
+        status=CheckStatus.FAIL if shortfalls else CheckStatus.PASS,
+        expected=(
+            f"each market retains >= {COVERAGE_FLOOR_FRACTION:.0%} of its recent "
+            "baseline stock count"
+        ),
+        actual=(
+            "; ".join(shortfalls) if shortfalls
+            else f"coverage within floor (baseline={baseline})"
+        ),
+        failed_count=len(shortfalls),
+    )]
 
 
 def check_prices(
@@ -827,14 +919,17 @@ def check_prices(
         .groupby("trade_date")["market"]
         .agg(lambda values: set(values.dropna()))
     )
-    missing_market_dates = stock_markets[
-        ~stock_markets.apply(lambda values: {"KOSPI", "KOSDAQ"}.issubset(values))
+    missing_market_dates = [
+        trade_date
+        for trade_date, values in stock_markets.items()
+        if not _required_markets(trade_date).issubset(values)
     ]
     checks.append(result(
         "PRICE_MARKET_COMPLETENESS", "price_daily", Severity.CRITICAL,
         len(missing_market_dates),
-        "every trade_date includes KOSPI and KOSDAQ stocks",
-        actual=f"bad_dates={list(missing_market_dates.index[:20])}",
+        "every trade_date includes each market listed by its start date "
+        "(KOSPI always, KOSDAQ from 1996-07-01)",
+        actual=f"bad_dates={sorted(missing_market_dates)[:20]}",
         partition_key=partition_key,
     ))
 
@@ -847,22 +942,24 @@ def check_prices(
         partition_key=partition_key,
     ))
 
-    expected_benchmarks = {"1028", "2203"}
     benchmark_rows = prices[index].copy()
     benchmark_rows["identifier"] = benchmark_rows["identifier"].astype(str)
-    benchmark_bad_dates: list = []
-    for trade_date, group in benchmark_rows.groupby("trade_date"):
-        identifiers = group["identifier"]
-        if set(identifiers) != expected_benchmarks or identifiers.duplicated().any():
-            benchmark_bad_dates.append(trade_date)
+    present_by_date = benchmark_rows.groupby("trade_date")["identifier"].agg(list)
     all_dates = set(prices["trade_date"])
-    seen_dates = set(benchmark_rows["trade_date"])
-    benchmark_bad_dates.extend(sorted(all_dates - seen_dates))
+    benchmark_bad_dates = []
+    for trade_date in all_dates:
+        expected = _expected_benchmarks(trade_date)
+        present = list(present_by_date.get(trade_date, []))
+        # 개시일 이전(기대 공집합)이고 지수도 없으면 정상. 그 외에는 그 날짜에
+        # 기대되는 벤치마크가 정확히 하나씩 있어야 한다.
+        if set(present) != expected or len(present) != len(set(present)):
+            benchmark_bad_dates.append(trade_date)
     checks.append(result(
         "PRICE_BENCHMARK_COMPLETENESS", "price_daily", Severity.CRITICAL,
-        len(set(benchmark_bad_dates)),
-        "every trade_date has exactly one KOSPI200(1028) and KOSDAQ150(2203)",
-        actual=f"bad_dates={sorted(set(benchmark_bad_dates))[:20]}",
+        len(benchmark_bad_dates),
+        "every trade_date has exactly its expected benchmarks "
+        "(KOSPI200/1028 from 2010-01-04, KOSDAQ150/2203 from 2015-07-13)",
+        actual=f"bad_dates={sorted(benchmark_bad_dates)[:20]}",
         partition_key=partition_key,
     ))
 

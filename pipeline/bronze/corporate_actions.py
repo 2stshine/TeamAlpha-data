@@ -521,12 +521,17 @@ def run(
     dependency_fromdate: str | None = None,
     document_shard_index: int | None = None,
     document_shard_count: int | None = None,
+    changed_sink: list[str] | None = None,
 ) -> list[str]:
     """기간 내 기업행사 원본을 수집하고 Silver 입력 URI를 반환한다.
 
     기본값은 새로 쓰인 Bronze URI만 반환한다. 일일 ECS처럼 빈 로컬
     디스크에서 시작하는 호출자는 ``include_dependencies=True``로 이미 S3에
     존재하는 구조화 공시와 원문 ZIP도 함께 받아야 한다.
+
+    ``changed_sink`` 리스트를 넘기면 이번 실행에서 실제로 새로 쓰이거나
+    변경된 경로만(의존성 재다운로드 제외) 채워 준다. 호출자는 이를 이용해
+    "이번 기간에 진짜 기업행사 변경이 있었는지"를 판정할 수 있다.
     """
     api_key = os.environ.get("DART_API_KEY")
     if not api_key:
@@ -843,6 +848,8 @@ def run(
         f"changed={len(changed_paths)}",
         flush=True,
     )
+    if changed_sink is not None:
+        changed_sink.extend(sorted(set(changed_paths)))
     return sorted(set(changed_paths) | dependency_paths)
 
 

@@ -12,7 +12,7 @@ from .models import (
     Severity,
 )
 
-QUALITY_RULESET_VERSION = "1.24.0"
+QUALITY_RULESET_VERSION = "1.25.0"
 
 __all__ = [
     "BatchContext",

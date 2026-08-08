@@ -45,6 +45,19 @@ def _normalize_incomplete_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     for column in ("open", "high", "low"):
         numeric = pd.to_numeric(df[column], errors="coerce")
         df.loc[numeric.eq(0), column] = np.nan
+    # 원천 OHLC 대소가 모순인 행(오래된 marcap 소수)은 O/H/L을 신뢰할 수 없어
+    # 셋 다 결측 처리하고 close는 보존한다. quality gate는 이를 전부-결측
+    # 형태로 보아 SOURCE_INCOMPLETE_OHLC로 기록한다(부분결측=차단은 유지).
+    o = pd.to_numeric(df["open"], errors="coerce")
+    h = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    c = pd.to_numeric(df["close"], errors="coerce")
+    complete = o.notna() & h.notna() & low.notna()
+    hi_ref = pd.concat([o, low, c], axis=1).max(axis=1)
+    lo_ref = pd.concat([o, h, c], axis=1).min(axis=1)
+    inconsistent = complete & (h.lt(hi_ref) | low.gt(lo_ref))
+    for column in ("open", "high", "low"):
+        df.loc[inconsistent, column] = np.nan
     return df
 
 

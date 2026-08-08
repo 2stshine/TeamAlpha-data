@@ -29,8 +29,11 @@ NUMERIC = [
 # 벤치마크를 요구한다. KRX OpenAPI 지수는 2010-01-04부터 제공되어 그 이전
 # 거래일에는 벤치마크(1028/2203)가 아예 존재하지 않는다.
 KOSDAQ_MARKET_START = date(1996, 7, 1)   # KOSDAQ 개장
-INDEX_DATA_START = date(2010, 1, 4)      # KRX OpenAPI 지수 최소 제공일 → 1028 기대 시작
-KOSDAQ150_START = date(2015, 7, 13)      # KOSDAQ150(2203) 출시
+# KOSPI200(1028)·KOSDAQ150(2203) 모두 KRX OpenAPI가 2010-01-04까지 값을
+# 제공한다. KOSDAQ150은 공식 출시가 2015-07-13이지만 KRX가 기준일
+# 2010-01-04(기준지수 1000)까지 소급 산출한 값을 함께 내려주므로, 벤치마크
+# 완전성은 두 지수를 모두 2010-01-04부터 요구한다.
+INDEX_DATA_START = date(2010, 1, 4)      # KRX OpenAPI 지수 최소 제공일 (1028·2203)
 
 
 def _required_markets(trade_date) -> set[str]:
@@ -42,13 +45,14 @@ def _required_markets(trade_date) -> set[str]:
 
 
 def _expected_benchmarks(trade_date) -> set[str]:
-    """거래일에 반드시 존재해야 하는 벤치마크 지수 코드 집합(개시일 기준)."""
-    expected: set[str] = set()
+    """거래일에 반드시 존재해야 하는 벤치마크 지수 코드 집합(개시일 기준).
+
+    2010-01-04부터 KOSPI200(1028)·KOSDAQ150(2203) 둘 다 제공되며 그 이전은
+    지수 자체가 없다.
+    """
     if trade_date >= INDEX_DATA_START:
-        expected.add("1028")
-    if trade_date >= KOSDAQ150_START:
-        expected.add("2203")
-    return expected
+        return {"1028", "2203"}
+    return set()
 # DART가 기록한 효력일(신주배정기준일·감자 효력일 등)은 KRX가 실제로
 # 기준가를 조정하는 권리락일과 며칠 어긋날 수 있다. 이 창 안에 실제 KRX
 # 기준가 리셋이 있으면 그 행사가 반영된 것으로 보고 "조정 누락"으로 보지 않는다.
@@ -958,34 +962,55 @@ def check_prices(
         "PRICE_BENCHMARK_COMPLETENESS", "price_daily", Severity.CRITICAL,
         len(benchmark_bad_dates),
         "every trade_date has exactly its expected benchmarks "
-        "(KOSPI200/1028 from 2010-01-04, KOSDAQ150/2203 from 2015-07-13)",
+        "(KOSPI200/1028 and KOSDAQ150/2203 from 2010-01-04)",
         actual=f"bad_dates={sorted(benchmark_bad_dates)[:20]}",
         partition_key=partition_key,
     ))
 
     if {"prev_diff", "fluc_rate"}.issubset(prices.columns):
-        adjustment_source_bad = prices[
-            prices["prev_diff"].isna() | prices["fluc_rate"].isna()
-        ]
+        # 전일종가 = 당일종가 - 전일대비. 이 값이 0 이하이면 직전 유효 종가가
+        # 없는 행(신규상장 첫날·거래재개 등)이라 등락률이 정의되지 않는다.
+        # 이런 행은 adj_close 계산에서도 계수 1로 처리되므로(직전값 없음),
+        # 등락률·산술 정합 검사 대상에서 제외하고 건수만 MODIFIED로 남긴다.
+        previous = prices["close"] - prices["prev_diff"]
+        # 유효한 직전 종가가 있는 행만 등락률·산술 정합을 검사한다. 전일대비가
+        # 결측이거나 직전 종가가 0 이하인 행(신규상장 첫날·거래재개 등)은
+        # adj_close 계산에서 계수 1로 처리되므로 검사 대상에서 제외한다.
+        has_baseline = previous.gt(0)
+        adjustment_source_bad = prices[has_baseline & prices["fluc_rate"].isna()]
         checks.append(result(
             "ADJ_CLOSE_SOURCE_FIELDS",
             "price_daily",
             Severity.ERROR,
             adjustment_source_bad,
-            "prev_diff and fluc_rate are present for adjusted-close validation",
+            "fluc_rate present where a prior close exists",
             partition_key=partition_key,
         ))
-        previous = prices["close"] - prices["prev_diff"]
         calculated = prices["prev_diff"] / previous.replace(0, np.nan) * 100
         arithmetic_bad = prices[
-            previous.le(0)
-            | (calculated - prices["fluc_rate"]).abs().gt(0.05)
+            has_baseline & (calculated - prices["fluc_rate"]).abs().gt(0.05)
         ]
         checks.append(result(
             "PRICE_KRX_ARITHMETIC", "price_daily", Severity.ERROR, arithmetic_bad,
-            "KRX close/prev_diff/fluc_rate agree within 0.05%p",
+            "KRX close/prev_diff/fluc_rate agree within 0.05%p where a prior "
+            "close exists",
             partition_key=partition_key,
         ))
+        no_baseline_count = int((~has_baseline).sum())
+        if no_baseline_count > 0:
+            checks.append(CheckResult(
+                rule_code="PRICE_NO_ADJUSTMENT_BASELINE",
+                dataset="price_daily",
+                severity=Severity.MODIFIED,
+                status=CheckStatus.PASS,
+                expected=(
+                    "rows without a positive prior close (new listing / "
+                    "resumption) carry adj_close=close and skip change-field checks"
+                ),
+                actual=f"no_baseline_rows={no_baseline_count}",
+                failed_count=0,
+                partition_key=partition_key,
+            ))
     else:
         checks.append(result(
             "ADJ_CLOSE_SOURCE_FIELDS",

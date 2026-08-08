@@ -95,16 +95,52 @@ def _confirmed(confirm: str | None) -> bool:
     return token == CONFIRM_TOKEN
 
 
-def run(*, confirm: str | None = None, resume: str | None = None) -> None:
-    if not _confirmed(confirm):
+def _dry_run() -> None:
+    """후보 빌드 + 품질 게이트만 실행(트런케이트·publish·RDS 쓰기 없음).
+
+    파괴적 재구축 전에 전체 실데이터로 게이트 통과 여부를 안전하게 확인한다.
+    차단(Critical/Error FAIL)이 있으면 종료코드 1로 알린다.
+    """
+    from pipeline.common.paths import base_uri
+    from pipeline.silver_quality import backfill as sq_backfill
+    from pipeline.silver_quality.runner import evaluate, print_summary
+
+    bundle = sq_backfill._candidate_bundle(base_uri("local"))
+    results = evaluate(bundle) + sq_backfill._required_backfill_results(bundle)
+    print_summary(results)
+    print(
+        "[krx-rebuild] DRY-RUN candidates: "
+        f"assets={len(bundle.assets)} prices={len(bundle.prices)} "
+        f"fundamentals={len(bundle.fundamentals)} actions={len(bundle.actions)}",
+        flush=True,
+    )
+    blocking = [
+        (r.rule_code, r.failed_count) for r in results if r.blocks_publish
+    ]
+    print(
+        f"[krx-rebuild] DRY-RUN blocking={len(blocking)}: {blocking}",
+        flush=True,
+    )
+    if blocking:
+        raise SystemExit(1)
+    print("[krx-rebuild] DRY-RUN clean: gate passes, safe to rebuild", flush=True)
+
+
+def run(
+    *,
+    confirm: str | None = None,
+    resume: str | None = None,
+    dry_run: bool = False,
+) -> None:
+    bucket = os.environ.get("S3_BRONZE_BUCKET")
+    if not bucket:
+        raise SystemExit("S3_BRONZE_BUCKET is required")
+    if not dry_run and not _confirmed(confirm):
         raise SystemExit(
             "refusing destructive rebuild without confirmation: pass "
             f"--confirm {CONFIRM_TOKEN} (or env KRX_HISTORY_REBUILD_CONFIRM="
             f"{CONFIRM_TOKEN}). Create an RDS snapshot first."
         )
-    bucket = os.environ.get("S3_BRONZE_BUCKET")
-    if not bucket:
-        raise SystemExit("S3_BRONZE_BUCKET is required")
     root = Path("/app/data")
 
     # 1) Bronze 전체를 먼저 확보한다. 다운로드가 실패하면 truncate 하지 않는다.
@@ -112,6 +148,11 @@ def run(*, confirm: str | None = None, resume: str | None = None) -> None:
     if count == 0:
         raise RuntimeError("no KRX/DART Bronze objects downloaded")
     print(f"[krx-rebuild] bronze download complete objects={count}", flush=True)
+
+    # dry-run 은 게이트만 검증하고 종료(비파괴).
+    if dry_run:
+        _dry_run()
+        return
 
     # resume 은 이미 truncate 된 상태에서 중단분을 이어가는 경로다.
     if not resume:
@@ -132,12 +173,17 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         help="기존 backfill_s3 dq_run UUID (truncate 를 건너뛰고 이어서 진행)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="후보 빌드 + 품질 게이트만 실행(트런케이트·publish 없음)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    run(confirm=args.confirm, resume=args.resume)
+    run(confirm=args.confirm, resume=args.resume, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

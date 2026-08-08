@@ -296,15 +296,30 @@ def test_corrupted_adj_close_blocks_full_series():
     assert result.failed_count == 1
 
 
-def test_missing_adjustment_source_fields_blocks():
+def test_missing_fluc_rate_with_baseline_blocks():
+    # A row that HAS a valid prior close (previous>0) but lacks fluc_rate is a
+    # genuine gap and must block.
     frame = _valid_prices()
-    frame.loc[frame["identifier"].eq("005930"), "prev_diff"] = None
+    frame.loc[frame["identifier"].eq("005930"), "fluc_rate"] = None
     result = next(
         r for r in check_prices(frame)
         if r.rule_code == "ADJ_CLOSE_SOURCE_FIELDS"
     )
     assert result.blocks_publish
     assert result.failed_count == 1
+
+
+def test_missing_prev_diff_is_tolerated_as_no_baseline():
+    # No prev_diff -> no usable prior close -> adj_close uses factor 1; treat as
+    # no-baseline (MODIFIED), not a blocking error.
+    frame = _valid_prices()
+    frame.loc[frame["identifier"].eq("005930"), "prev_diff"] = None
+    results = check_prices(frame)
+    assert _failed(results, "ADJ_CLOSE_SOURCE_FIELDS") == 0
+    baseline = next(
+        r for r in results if r.rule_code == "PRICE_NO_ADJUSTMENT_BASELINE"
+    )
+    assert baseline.severity.value == "MODIFIED"
 
 
 def test_price_spike_is_warning_only():
@@ -1149,9 +1164,10 @@ def test_post_publish_adj_close_verification_rejects_mismatch():
 def test_inception_helpers_have_correct_boundaries():
     assert _required_markets(date(1996, 6, 30)) == {"KOSPI"}
     assert _required_markets(date(1996, 7, 1)) == {"KOSPI", "KOSDAQ"}
+    # KRX backfills both KOSPI200(1028) and KOSDAQ150(2203) to the index base
+    # date 2010-01-04; before that no benchmark exists.
     assert _expected_benchmarks(date(2010, 1, 3)) == set()
-    assert _expected_benchmarks(date(2010, 1, 4)) == {"1028"}
-    assert _expected_benchmarks(date(2015, 7, 12)) == {"1028"}
+    assert _expected_benchmarks(date(2010, 1, 4)) == {"1028", "2203"}
     assert _expected_benchmarks(date(2015, 7, 13)) == {"1028", "2203"}
 
 
@@ -1176,17 +1192,23 @@ def test_benchmark_completeness_not_required_before_index_data():
     assert _failed(check_prices(frame), "PRICE_BENCHMARK_COMPLETENESS") == 0
 
 
-def test_benchmark_completeness_requires_only_kospi200_before_kosdaq150():
+def test_benchmark_completeness_requires_both_from_2010():
+    # KRX provides KOSDAQ150(2203) from 2010; only KOSPI200 is incomplete.
     day = date(2012, 3, 2)
-    frame = pd.DataFrame([
+    only_kospi = pd.DataFrame([
         _row("000010", "stock", market="KOSPI", trade_date=day),
         _row("035720", "stock", market="KOSDAQ", trade_date=day),
         _row("1028", "index", shares=None, market=None, trade_date=day),
     ])
-    assert _failed(check_prices(frame), "PRICE_BENCHMARK_COMPLETENESS") == 0
+    assert _failed(check_prices(only_kospi), "PRICE_BENCHMARK_COMPLETENESS") == 1
+    both = pd.concat([
+        only_kospi,
+        pd.DataFrame([_row("2203", "index", shares=None, market=None, trade_date=day)]),
+    ], ignore_index=True)
+    assert _failed(check_prices(both), "PRICE_BENCHMARK_COMPLETENESS") == 0
 
 
-def test_benchmark_completeness_fails_when_kospi200_missing_after_2010():
+def test_benchmark_completeness_fails_when_benchmark_missing_after_2010():
     day = date(2012, 3, 2)
     frame = pd.DataFrame([
         _row("000010", "stock", market="KOSPI", trade_date=day),
@@ -1222,10 +1244,10 @@ def _drift_confirmation_frames(day, benchmark_codes):
     return drift, pd.DataFrame(rows)
 
 
-def test_drift_consistency_single_benchmark_window_is_consistent():
-    # 2010~2015-07: only KOSPI200 exists; breadth + the one benchmark suffice.
+def test_drift_consistency_both_benchmarks_from_2010_is_consistent():
+    # 2010+: both KOSPI200 and KOSDAQ150 exist and confirm the move.
     day = date(2012, 3, 2)
-    drift, confirmed = _drift_confirmation_frames(day, ["1028"])
+    drift, confirmed = _drift_confirmation_frames(day, ["1028", "2203"])
     _, inconsistent = _distribution_drift_confirmation(confirmed, drift)
     assert inconsistent.empty
 
@@ -1289,3 +1311,34 @@ def test_all_valid_prices_are_not_excluded():
     assert len(retained) == 2
     assert detail["row_count"] == 0
     assert detail["ticker_count"] == 0
+
+
+def test_no_prior_close_row_is_tolerated_not_flagged():
+    # New-listing/resumption style row: 전일대비 == 종가 -> implied prior close 0.
+    # adj_close uses factor=1 for such rows, so change-field checks must skip them.
+    day = date(2012, 3, 2)
+    frame = pd.DataFrame([
+        _row("000010", "stock", market="KOSPI", trade_date=day,
+             open=1000.0, high=1000.0, low=1000.0, close=1000.0,
+             adj_close=1000.0, prev_diff=1000.0, fluc_rate=float("nan"),
+             shares=1000, market_cap=1_000_000.0),
+        _row("035720", "stock", market="KOSDAQ", trade_date=day),
+        _row("1028", "index", shares=None, market=None, trade_date=day),
+        _row("2203", "index", shares=None, market=None, trade_date=day),
+    ])
+    results = check_prices(frame)
+    assert _failed(results, "ADJ_CLOSE_SOURCE_FIELDS") == 0
+    assert _failed(results, "PRICE_KRX_ARITHMETIC") == 0
+    baseline = _result(results, "PRICE_NO_ADJUSTMENT_BASELINE")
+    assert baseline.severity.value == "MODIFIED"
+    assert "no_baseline_rows=1" in baseline.actual
+
+
+def test_normalize_nulls_logically_inconsistent_ohlc():
+    frame = pd.DataFrame([{
+        "open": 100.0, "high": 90.0, "low": 80.0, "close": 105.0,
+        "volume": 10, "trading_value": 1000, "market_cap": 1000,
+    }])  # high(90) < close(105): inconsistent
+    out = _normalize_incomplete_ohlc(frame.copy())
+    assert out[["open", "high", "low"]].isna().all(axis=None)
+    assert out.loc[0, "close"] == 105.0

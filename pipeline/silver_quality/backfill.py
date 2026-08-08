@@ -81,6 +81,15 @@ def _candidate_bundle(base: str) -> CandidateBundle:
         assets.preferred_share_issuer_map(asset_df),
     )
     action_stats["issuer_inheritance"] = inherited_action_stats
+    # Mirror the daily path: DART actions for issuers outside the tradable KRX
+    # price universe (KONEX-only, delisted, pre-coverage) are surfaced as an
+    # explicit Silver exclusion rather than an identifier-mapping failure.
+    action_df, action_stats = corporate_actions.exclude_nontradable(
+        action_df,
+        action_stats,
+        supported_price_identifiers,
+        all_price_identifiers - supported_price_identifiers,
+    )
     return CandidateBundle(
         assets=asset_df,
         identifiers=identifier_df,

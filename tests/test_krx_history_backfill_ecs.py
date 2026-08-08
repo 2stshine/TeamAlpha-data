@@ -26,3 +26,15 @@ def test_confirm_accepts_token_from_env(monkeypatch):
     monkeypatch.setenv("KRX_HISTORY_REBUILD_CONFIRM", "nope")
     assert rebuild._confirmed(None) is False
     assert rebuild._confirmed("REBUILD") is True
+
+
+def test_dry_run_skips_confirm_and_truncate(monkeypatch):
+    monkeypatch.delenv("KRX_HISTORY_REBUILD_CONFIRM", raising=False)
+    monkeypatch.setenv("S3_BRONZE_BUCKET", "b")
+    calls = []
+    monkeypatch.setattr(rebuild, "_download_prefixes", lambda *a, **k: 5)
+    monkeypatch.setattr(rebuild, "_truncate_silver", lambda: calls.append("truncate"))
+    monkeypatch.setattr(rebuild, "_dry_run", lambda: calls.append("dry_run"))
+    # no confirm needed for dry-run; must not truncate
+    rebuild.run(confirm=None, dry_run=True)
+    assert calls == ["dry_run"]

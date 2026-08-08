@@ -87,7 +87,7 @@ transaction을 즉시 rollback한다.
 | `PRICE_MARKET_COMPLETENESS` | Critical | 거래일마다 시장별 개시일 이후 종목 존재 (KOSPI 상시, KOSDAQ 1996-07-01~) |
 | `PRICE_MARKET_COVERAGE_FLOOR` | Error | 일별 시장별 종목 수 ≥ 최근 baseline median의 50% (부분·절단 시장데이터 차단, 개장일 한정) |
 | `PRICE_MARKET_CAP_RECONCILIATION` | Error | `market_cap ≈ close × shares` (1%) |
-| `PRICE_BENCHMARK_COMPLETENESS` | Critical | 거래일마다 개시일 이후 벤치마크 각 1행 (KOSPI200/1028 2010-01-04~, KOSDAQ150/2203 2015-07-13~; 지수 개시 전 거래일은 벤치마크 불요) |
+| `PRICE_BENCHMARK_COMPLETENESS` | Critical | 거래일마다 벤치마크 각 1행 (KOSPI200/1028·KOSDAQ150/2203 모두 2010-01-04~; KRX가 KOSDAQ150을 기준일 2010-01-04까지 소급 제공. 지수 개시 전 거래일은 벤치마크 불요) |
 | `SOURCE_INCOMPLETE_OHLC` | Modified | 거래 있으나 O/H/L=0 → NULL 유지, close·거래량·시총은 보존 |
 | `SOURCE_NO_TRADE_OHLC` | Modified | 무거래 행의 O/H/L 누락 기록 |
 | `UNSUPPORTED_MARKET_EXCLUDED` | Modified | KONEX 가격을 유니버스에서 제외 |
@@ -98,7 +98,8 @@ transaction을 즉시 rollback한다.
 
 | 규칙 | 등급 | 검사 |
 |---|---|---|
-| `ADJ_CLOSE_SOURCE_FIELDS` | Error | 수정종가 검증용 전일대비·등락률 존재 |
+| `ADJ_CLOSE_SOURCE_FIELDS` | Error | 직전 종가가 있는 행은 등락률 존재 (직전 종가 없는 행은 아래 no-baseline로 처리) |
+| `PRICE_NO_ADJUSTMENT_BASELINE` | Modified | 직전 유효 종가가 없는 행(신규상장 첫날·거래재개, 전일대비 결측/함의 전일종가≤0) — adj_close=close(계수1)로 두고 등락률·산술 검사 제외 |
 | `ADJ_CLOSE_RECONCILIATION` | Error | 전체 시계열 수정종가 독립 재계산 대사 |
 | `ADJ_CLOSE_RETURN_CONTINUITY` | Error | 기업행사 전후 수정주가 수익률 = KRX 기준가 수익률 |
 | `ADJ_CLOSE_FULL_SERIES_STREAMING_RECONCILIATION` | Error | 전 기간 누적 KRX 계수 독립 재계산·대사 |

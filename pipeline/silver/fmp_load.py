@@ -501,6 +501,10 @@ def _backfill(
                             stats={
                                 "asset": universe_stats,
                                 "fundamental": stats,
+                                # commodity assets ride in `assets`, so the
+                                # commodity provider-list check runs here; give
+                                # it the commodity stats or it fails on empty.
+                                "commodity": commodity_stats,
                                 "_source": "FMP",
                             },
                         ),
@@ -523,6 +527,9 @@ def _backfill(
                             stats={
                                 "asset": universe_stats,
                                 "corporate_action": stats,
+                                # see fundamental partition: commodity assets are
+                                # in `assets`, so supply commodity stats too.
+                                "commodity": commodity_stats,
                                 "_source": "FMP",
                             },
                         ),

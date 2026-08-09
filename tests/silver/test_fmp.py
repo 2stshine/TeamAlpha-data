@@ -731,3 +731,28 @@ def test_usdkrw_excludes_invalid_ohlc_rows(tmp_path):
     assert identifiers.empty
     assert prices.empty
     assert stats["invalid_ohlc_excluded"]["row_count"] == 1
+
+
+def test_delisted_union_across_snapshots_not_shadowed_by_partial(tmp_path):
+    # A partial recent delisted snapshot (1 page) must not hide an earlier
+    # complete one (many pages). _all_snapshot_files unions across snapshots;
+    # _latest_snapshot_files would return only the latest (partial) snapshot.
+    root = tmp_path / "stock" / "fmp" / "universe" / "delisted"
+    full = root / "snapshot_date=2026-08-04"
+    for page in range(3):
+        d = full / f"page={page}"
+        d.mkdir(parents=True)
+        (d / "response.json").write_text("[]", encoding="utf-8")
+    partial = root / "snapshot_date=2026-08-05" / "page=0"
+    partial.mkdir(parents=True)
+    (partial / "response.json").write_text("[]", encoding="utf-8")
+
+    pattern = str(root / "snapshot_date=*/page=*/response.*")
+    union = fmp._all_snapshot_files(pattern, None)
+    latest = fmp._latest_snapshot_files(pattern, None)
+    assert len(union) == 4      # 3 full pages + 1 partial page
+    assert len(latest) == 1     # old behavior: only the partial latest snapshot
+    # target_date filtering still applies
+    assert fmp._all_snapshot_files(pattern, date(2026, 8, 4)) == sorted(
+        str(full / f"page={p}" / "response.json") for p in range(3)
+    )

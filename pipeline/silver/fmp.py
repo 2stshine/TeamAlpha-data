@@ -243,6 +243,25 @@ def _latest_snapshot_files(pattern: str, target_date: date | None) -> list[str]:
     return by_snapshot[max(by_snapshot)]
 
 
+def _all_snapshot_files(pattern: str, target_date: date | None) -> list[str]:
+    """Return files from ALL snapshots (<= target_date), not just the latest.
+
+    For monotonic cumulative sets like delisted companies: a partial recent
+    snapshot (e.g. a daily run that fetched only page 0) must not shadow an
+    earlier complete snapshot. A delisted company never un-delists, so unioning
+    every snapshot's pages (deduped downstream by symbol) is complete and safe.
+    """
+    selected: list[str] = []
+    for path in sorted(glob.glob(pattern)):
+        match = re.search(r"snapshot_date=(\d{4}-\d{2}-\d{2})", path)
+        if not match:
+            continue
+        snapshot = date.fromisoformat(match.group(1))
+        if target_date is None or snapshot <= target_date:
+            selected.append(path)
+    return selected
+
+
 def _universe_files(base: str, target_date: date | None) -> tuple[list[str], list[str], list[str]]:
     screener = _latest_snapshot_files(
         f"{base}/stock/fmp/universe/company-screener/snapshot_date=*/response.*",
@@ -256,7 +275,9 @@ def _universe_files(base: str, target_date: date | None) -> tuple[list[str], lis
         f"{base}/stock/fmp/universe/profile-bulk/snapshot_date=*/part=*/response.*",
         target_date,
     )
-    delisted = _latest_snapshot_files(
+    # delisted is cumulative: union across ALL snapshots so a partial recent
+    # daily snapshot doesn't hide the full backfill snapshot (survivorship).
+    delisted = _all_snapshot_files(
         f"{base}/stock/fmp/universe/delisted/snapshot_date=*/page=*/response.*",
         target_date,
     )

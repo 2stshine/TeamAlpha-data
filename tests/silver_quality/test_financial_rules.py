@@ -6,7 +6,10 @@ import pandas as pd
 from pipeline.silver import financials
 from pipeline.silver_quality.models import CandidateBundle
 from pipeline.silver_quality.registry import run_registered_rules
-from pipeline.silver_quality.rules.financials import check_financials
+from pipeline.silver_quality.rules.financials import (
+    FUNDAMENTAL_KEYS,
+    check_financials,
+)
 from pipeline.silver_quality.rules.reconciliation import check_reconciliation
 
 
@@ -538,3 +541,24 @@ def test_full_statement_is_cis_net_income_duplicate_prefers_is(tmp_path):
     )
     assert result.status.value == "PASS"
     assert "duplicate_groups=1" in result.actual
+
+
+def test_operating_income_presentation_conflict_keeps_first_line(tmp_path):
+    # One filing presents operating income twice with different values via dual
+    # income-statement formats (general vs financial-industry). Keep the
+    # first-presented (min ord) line, drop the other; no blocking duplicate.
+    primary = _dart_row(ord_value="25", account_nm="영업이익")
+    primary["thstrm_amount"] = "1000"
+    secondary = _dart_row(ord_value="59", account_nm="영업이익(손실)")
+    secondary["thstrm_amount"] = "400"
+    path = _write_dart_file(tmp_path, [primary, secondary])
+
+    frame, stats = financials.prepare(str(tmp_path), files=[str(path)])
+
+    op = frame[frame["metric"] == "operating_income"]
+    assert len(op) == 1
+    assert float(op.iloc[0]["value"]) == 1000.0
+    conflict = stats["presentation_conflict_resolved"]
+    assert conflict["row_count"] == 1
+    assert conflict["group_count"] == 1
+    assert not frame.duplicated(subset=FUNDAMENTAL_KEYS).any()

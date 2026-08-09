@@ -210,6 +210,30 @@ def run_registered_rules(
             failed_count=0,
             partition_key=partition_key,
         ))
+    presentation_conflict = bundle.stats.get("fundamental", {}).get(
+        "presentation_conflict_resolved",
+        {"row_count": 0, "group_count": 0, "samples": []},
+    )
+    presentation_conflict_rows = int(presentation_conflict.get("row_count", 0))
+    if presentation_conflict_rows > 0:
+        results.append(CheckResult(
+            rule_code="DART_PRESENTATION_CONFLICT_RESOLVED",
+            dataset="fundamental",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected=(
+                "when one filing presents a metric twice with different values "
+                "(dual income-statement formats), keep the first-presented "
+                "(min ord) line and drop the rest"
+            ),
+            actual=(
+                f"resolved_rows={presentation_conflict_rows}, "
+                f"groups={int(presentation_conflict.get('group_count', 0))}"
+            ),
+            failed_count=0,
+            samples=list(presentation_conflict.get("samples", []))[:20],
+            partition_key=partition_key,
+        ))
     replacement = bundle.stats.get("fundamental", {}).get(
         "accounting_equation_supplement_replacement",
         {"row_count": 0, "scope_count": 0, "samples": []},

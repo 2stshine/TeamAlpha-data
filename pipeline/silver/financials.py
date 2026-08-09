@@ -139,6 +139,14 @@ def _ord_sort_key(value) -> tuple[int, int, str]:
         return 1, 0, rendered
 
 
+def _ord_int(value) -> int:
+    """DART 표시순서를 정렬 가능한 정수로. 비숫자는 뒤로 밀어 결정적으로 처리."""
+    try:
+        return int(str(value or "").strip())
+    except ValueError:
+        return 1_000_000_000
+
+
 def _accounting_relative_error(rows: pd.DataFrame) -> float | None:
     """한 filing scope의 자산=부채+자본 상대오차를 계산한다."""
     selected = rows[rows["metric"].isin(ACCOUNTING_METRICS)]
@@ -406,7 +414,7 @@ def prepare(
                 ticker, "DART", period_end, fp, row_fs_type,
                 rcept or None, filed, available, metric, val,
                 (r.get("currency") or "").strip().upper(), revision_key, f,
-                supplemental,
+                supplemental, _ord_int(r.get("ord")),
             )
             exact_key = (
                 ticker, "DART", period_end, fp, row_fs_type,
@@ -564,7 +572,7 @@ def prepare(
         "identifier", "source", "period_end", "fiscal_period", "fs_type",
         "filing_id", "filed", "available_date", "metric", "value",
         "currency", "revision_key", "source_file",
-        "_supplemental",
+        "_supplemental", "_ord",
     ]
     df = pd.DataFrame(recs, columns=candidate_cols)
     business_key = [
@@ -619,6 +627,46 @@ def prepare(
     df["accepted_at"] = pd.NaT
     df["available_at"] = pd.to_datetime(df["available_date"], utc=True)
     df["unit_type"] = "currency"
+
+    # 표시형식 중복 해소: 한 공시가 손익계산서를 두 형식(일반/금융업 등)으로
+    # 병기해 같은 business key에 값이 다른 영업이익 등이 잡히면, 먼저 표시된
+    # (min _ord = 대표/일반형식) 행을 채택하고 나머지는 제외한다. 값이 동일한
+    # 중복은 그대로 두어 COMMON_DUPLICATE_KEY가 검토를 위해 계속 차단한다.
+    presentation_conflict_rows = 0
+    presentation_conflict_groups = 0
+    presentation_conflict_samples: list[dict] = []
+    if "_ord" in df.columns and not df.empty:
+        conflict_mask = df.duplicated(subset=business_key, keep=False)
+        if conflict_mask.any():
+            drop_index: list = []
+            for _, group in df[conflict_mask].groupby(business_key, sort=False):
+                if group["value"].nunique(dropna=False) <= 1:
+                    continue
+                keep_index = group["_ord"].idxmin()
+                dropped = [idx for idx in group.index if idx != keep_index]
+                drop_index.extend(dropped)
+                presentation_conflict_rows += len(dropped)
+                presentation_conflict_groups += 1
+                if len(presentation_conflict_samples) < 20:
+                    kept = group.loc[keep_index]
+                    presentation_conflict_samples.append({
+                        "identifier": kept["identifier"],
+                        "period_end": kept["period_end"],
+                        "fiscal_period": kept["fiscal_period"],
+                        "fs_type": kept["fs_type"],
+                        "revision_key": kept["revision_key"],
+                        "metric": kept["metric"],
+                        "kept_value": kept["value"],
+                        "kept_ord": int(kept["_ord"]),
+                        "dropped_values": [
+                            v for v in group.loc[dropped, "value"].tolist()
+                        ],
+                    })
+            if drop_index:
+                df = df.drop(index=drop_index).reset_index(drop=True)
+                excluded_rows += presentation_conflict_rows
+    df = df.drop(columns="_ord", errors="ignore")
+
     return df, {
         "input_rows": input_rows,
         "transformed_rows": len(df),
@@ -638,6 +686,11 @@ def prepare(
             "row_count": unexpected_duplicate_rows,
             "group_count": unexpected_duplicate_groups,
             "samples": unexpected_duplicate_samples,
+        },
+        "presentation_conflict_resolved": {
+            "row_count": presentation_conflict_rows,
+            "group_count": presentation_conflict_groups,
+            "samples": presentation_conflict_samples,
         },
         "source_file_count": len(selected_files),
         "full_statement_supplement": {

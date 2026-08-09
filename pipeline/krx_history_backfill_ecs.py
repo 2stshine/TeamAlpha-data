@@ -16,12 +16,15 @@ from __future__ import annotations
 
 import argparse
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import boto3
 
 from pipeline.common import db
 from pipeline.silver_quality import s3_backfill
+
+_DOWNLOAD_WORKERS = 32
 
 CONFIRM_TOKEN = "REBUILD"
 
@@ -47,28 +50,44 @@ SILVER_TABLES = (
 
 
 def _download_prefixes(bucket: str, root: Path, prefixes: tuple[str, ...]) -> int:
+    # Bronze는 수십만 개의 작은 객체(DART JSON)라 순차 다운로드는 매우 느리다.
+    # 키를 먼저 나열한 뒤 스레드풀로 병렬 다운로드한다(boto3 client는 스레드 안전).
     s3 = boto3.client("s3")
-    downloaded = 0
+    keys: list[str] = []
     for prefix in prefixes:
-        prefix_count = 0
+        before = len(keys)
         for page in s3.get_paginator("list_objects_v2").paginate(
             Bucket=bucket, Prefix=prefix,
         ):
             for item in page.get("Contents", []):
                 key = item["Key"]
-                if key.endswith("/"):
-                    continue
-                destination = root / key
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                s3.download_file(bucket, key, str(destination))
-                downloaded += 1
-                prefix_count += 1
-                if downloaded % 500 == 0:
-                    print(f"[krx-rebuild] downloaded={downloaded}", flush=True)
+                if not key.endswith("/"):
+                    keys.append(key)
         print(
-            f"[krx-rebuild] prefix={prefix} objects={prefix_count}",
+            f"[krx-rebuild] listed prefix={prefix} objects={len(keys) - before}",
             flush=True,
         )
+    total = len(keys)
+    print(f"[krx-rebuild] downloading {total} objects "
+          f"with {_DOWNLOAD_WORKERS} workers", flush=True)
+
+    def _download(key: str) -> None:
+        destination = root / key
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        s3.download_file(bucket, key, str(destination))
+
+    downloaded = 0
+    with ThreadPoolExecutor(max_workers=_DOWNLOAD_WORKERS) as executor:
+        for future in as_completed(
+            executor.submit(_download, key) for key in keys
+        ):
+            future.result()
+            downloaded += 1
+            if downloaded % 10000 == 0:
+                print(
+                    f"[krx-rebuild] downloaded={downloaded}/{total}",
+                    flush=True,
+                )
     return downloaded
 
 

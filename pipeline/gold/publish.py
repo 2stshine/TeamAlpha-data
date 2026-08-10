@@ -410,7 +410,8 @@ def _replace_values(
         SELECT min(observations)::integer,
                max(observations)::integer,
                bool_and(observations = assets),
-               bool_and(signal_dates = 1),
+               min(signal_dates)::integer,
+               max(signal_dates)::integer,
                bool_and(min_rank = 1)
         FROM monthly
         """,
@@ -418,7 +419,8 @@ def _replace_values(
     )
     (
         min_month_observations, max_month_observations,
-        unique_asset_months, one_signal_date_per_month, monthly_rank_one,
+        unique_asset_months, min_month_signal_dates,
+        max_month_signal_dates, monthly_rank_one,
     ) = cur.fetchone()
     if min_month_observations < MIN_MONTHLY_OBSERVATIONS:
         raise ValueError(
@@ -427,10 +429,28 @@ def _replace_values(
         )
     if not unique_asset_months:
         raise ValueError(f"Gold asset-month 중복이 있습니다: {factor_key}")
-    if not one_signal_date_per_month:
-        raise ValueError(f"Gold 월별 signal date가 하나가 아닙니다: {factor_key}")
     if not monthly_rank_one:
         raise ValueError(f"Gold 일부 월에 rank 1이 없습니다: {factor_key}")
+    cur.execute(
+        """
+        SELECT count(*)::bigint
+        FROM gold.factor_value v
+        JOIN gold_publish_investable_universe u
+          ON u.asset_id = v.asset_id
+         AND u.signal_month = date_trunc('month', v.as_of_date)::date
+        WHERE v.factor_id = %s
+          AND v.as_of_date >= %s
+          AND v.as_of_date < (%s::date + interval '1 month')
+          AND v.as_of_date <> u.signal_date
+        """,
+        (factor_id, start_date, end_date),
+    )
+    signal_date_mismatches = int(cur.fetchone()[0])
+    if signal_date_mismatches:
+        raise ValueError(
+            f"Gold/Silver 종목별 signal date 불일치: "
+            f"{factor_key} {signal_date_mismatches}"
+        )
     return {
         "factor": factor_key,
         "factor_id": factor_id,
@@ -440,6 +460,9 @@ def _replace_values(
         "signal_months": int(months),
         "min_month_observations": int(min_month_observations),
         "max_month_observations": int(max_month_observations),
+        "min_month_distinct_signal_dates": int(min_month_signal_dates),
+        "max_month_distinct_signal_dates": int(max_month_signal_dates),
+        "silver_signal_date_mismatches": signal_date_mismatches,
         "min_date": str(min_date),
         "max_date": str(max_date),
     }
@@ -522,7 +545,8 @@ def _build_investable_universe(
             FROM certified
         )
         SELECT asset_id,
-               date_trunc('month', trade_date)::date AS signal_month
+               date_trunc('month', trade_date)::date AS signal_month,
+               trade_date AS signal_date
         FROM monthly
         WHERE month_rank = 1
           AND trade_date >= %s::date

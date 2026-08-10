@@ -86,6 +86,8 @@ INSERT INTO gold.factor_value (
 )
 SELECT %(factor_id)s, asset_id, as_of_date, value, rank
 FROM factor_values
+WHERE as_of_date >= %(start_month)s::date
+  AND as_of_date < (%(end_month)s::date + interval '1 month')
 ON CONFLICT (factor_id, asset_id, as_of_date)
 DO UPDATE SET value = EXCLUDED.value, rank = EXCLUDED.rank
 """

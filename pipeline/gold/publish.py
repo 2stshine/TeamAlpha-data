@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from datetime import date
 from itertools import combinations
@@ -28,6 +29,16 @@ DEFAULT_APPROVAL_PATH = (
     / "promoted_20260810_nonduplicate.json"
 )
 MONTH_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+GIT_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+CAMPAIGN_PATTERN = re.compile(r"^campaign-\d{8}-\d{3}$")
+SUPPORTED_RULESET = "fr-3.10.1"
+MIN_DISCOVERY_IC = 0.03
+MIN_OOS_IC = 0.02
+MIN_OOS_RETENTION = 0.50
+MAX_FDR_Q = 0.10
+MIN_CORRELATION_MONTHS = 36
+MIN_MONTHLY_OBSERVATIONS = 30
 
 
 def _month_start(value: str) -> date:
@@ -49,7 +60,8 @@ def load_approval(path: Path = DEFAULT_APPROVAL_PATH) -> dict:
     document = json.loads(path.read_text(encoding="utf-8"))
     required = {
         "approval_id", "approval_source", "ruleset_version",
-        "backfill_start_month", "backfill_end_month", "selection", "factors",
+        "research_source", "backfill_start_month", "backfill_end_month",
+        "selection", "factors",
     }
     missing = sorted(required - set(document))
     if missing:
@@ -63,9 +75,93 @@ def load_approval(path: Path = DEFAULT_APPROVAL_PATH) -> dict:
     return document
 
 
+def _finite_number(value: object, *, field: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"유효한 숫자가 아닙니다: {field}={value!r}") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"유한한 숫자여야 합니다: {field}={value!r}")
+    return number
+
+
+def _validate_evaluation(factor_key: str, evaluation: dict) -> None:
+    if evaluation.get("passed") is not True:
+        raise ValueError(f"통과하지 않은 팩터는 승인할 수 없습니다: {factor_key}")
+    if evaluation.get("verdict") != "PROMOTE":
+        raise ValueError(f"PROMOTE가 아닌 팩터입니다: {factor_key}")
+
+    discovery_ic = _finite_number(
+        evaluation.get("discovery_investable_rank_ic"),
+        field=f"{factor_key}.discovery_investable_rank_ic",
+    )
+    oos_ic = _finite_number(
+        evaluation.get("oos_rank_ic"), field=f"{factor_key}.oos_rank_ic",
+    )
+    required_ic = _finite_number(
+        evaluation.get("oos_required_rank_ic"),
+        field=f"{factor_key}.oos_required_rank_ic",
+    )
+    retention = _finite_number(
+        evaluation.get("oos_rank_ic_retention"),
+        field=f"{factor_key}.oos_rank_ic_retention",
+    )
+    qvalue = _finite_number(
+        evaluation.get("oos_by_qvalue"),
+        field=f"{factor_key}.oos_by_qvalue",
+    )
+    months = int(evaluation.get("oos_signal_months", 0))
+    start = evaluation.get("oos_start")
+    end = evaluation.get("oos_end")
+    if discovery_ic < MIN_DISCOVERY_IC:
+        raise ValueError(f"Discovery IC 기준 미달: {factor_key} {discovery_ic}")
+    expected_required = max(MIN_OOS_IC, MIN_OOS_RETENTION * discovery_ic)
+    if not math.isclose(required_ic, expected_required, rel_tol=1e-10, abs_tol=1e-12):
+        raise ValueError(
+            f"OOS 필요 IC 계산 불일치: {factor_key}, "
+            f"expected={expected_required}, observed={required_ic}"
+        )
+    if oos_ic < required_ic:
+        raise ValueError(f"OOS IC 기준 미달: {factor_key} {oos_ic}<{required_ic}")
+    if retention < MIN_OOS_RETENTION or not math.isclose(
+        retention, oos_ic / discovery_ic, rel_tol=1e-10, abs_tol=1e-12,
+    ):
+        raise ValueError(f"OOS IC 유지율 불일치 또는 기준 미달: {factor_key}")
+    if not 0.0 <= qvalue <= MAX_FDR_Q:
+        raise ValueError(f"OOS BY q 기준 미달: {factor_key} {qvalue}")
+    if months != MIN_CORRELATION_MONTHS:
+        raise ValueError(f"OOS 36개월 계약 불일치: {factor_key}")
+    if not isinstance(start, str) or not isinstance(end, str):
+        raise ValueError(f"OOS 시작·종료월이 없습니다: {factor_key}")
+    if _month_count(start, end) != months:
+        raise ValueError(f"OOS 월 범위가 연속 36개월이 아닙니다: {factor_key}")
+    if evaluation.get("oos_evidence_class") != "HISTORICAL_REUSED_WINDOW":
+        raise ValueError(f"OOS evidence class가 명시되지 않았습니다: {factor_key}")
+
+
 def validate_approval(document: dict, manifest: dict | None = None) -> dict:
     manifest = manifest or load_manifest()
     validated: dict[str, dict] = {}
+    if document["ruleset_version"] != SUPPORTED_RULESET:
+        raise ValueError(
+            f"지원하지 않는 연구 ruleset입니다: {document['ruleset_version']}"
+        )
+    research_source = document["research_source"]
+    if not isinstance(research_source, dict):
+        raise ValueError("research_source는 객체여야 합니다")
+    if not str(research_source.get("repository", "")).startswith("https://github.com/"):
+        raise ValueError("research_source.repository가 GitHub 저장소가 아닙니다")
+    if not GIT_COMMIT_PATTERN.fullmatch(str(research_source.get("commit", ""))):
+        raise ValueError("research_source.commit은 고정된 40자리 Git SHA여야 합니다")
+
+    threshold = _finite_number(
+        document["selection"].get(
+            "maximum_allowed_median_absolute_correlation"
+        ),
+        field="selection.maximum_allowed_median_absolute_correlation",
+    )
+    if not 0.0 <= threshold < 1.0:
+        raise ValueError(f"Gold 중복 상관 임계값 범위 오류: {threshold}")
     duplicate = document["selection"]["excluded_duplicate"]["factor"]
     if duplicate in document["factors"]:
         raise ValueError(f"중복 제외 팩터가 승인 목록에 있습니다: {duplicate}")
@@ -78,20 +174,19 @@ def validate_approval(document: dict, manifest: dict | None = None) -> dict:
         validate_query_sql(sql_path.read_text(encoding="utf-8"))
         observed_hash = implementation_hash(sql_path)
         expected_hash = approval["implementation_sha256"]
+        if not SHA256_PATTERN.fullmatch(str(expected_hash)):
+            raise ValueError(f"SQL SHA-256 형식 오류: {factor_key}")
         if observed_hash != expected_hash:
             raise ValueError(
                 f"{factor_key} SQL SHA-256 불일치: "
                 f"expected={expected_hash}, observed={observed_hash}"
             )
+        if int(approval.get("version", 0)) <= 0:
+            raise ValueError(f"Gold factor version 형식 오류: {factor_key}")
+        if not CAMPAIGN_PATTERN.fullmatch(str(approval.get("campaign_id", ""))):
+            raise ValueError(f"campaign_id 형식 오류: {factor_key}")
         evaluation = approval["evaluation"]
-        if evaluation.get("passed") is not True:
-            raise ValueError(f"통과하지 않은 팩터는 승인할 수 없습니다: {factor_key}")
-        if evaluation.get("verdict") != "PROMOTE":
-            raise ValueError(f"PROMOTE가 아닌 팩터입니다: {factor_key}")
-        if int(evaluation.get("oos_signal_months", 0)) != 36:
-            raise ValueError(f"OOS 36개월 계약 불일치: {factor_key}")
-        if evaluation.get("oos_evidence_class") != "HISTORICAL_REUSED_WINDOW":
-            raise ValueError(f"OOS evidence class가 명시되지 않았습니다: {factor_key}")
+        _validate_evaluation(factor_key, evaluation)
         validated[factor_key] = {
             "approval": approval,
             "manifest": spec,
@@ -111,6 +206,7 @@ def _desired_metadata(
     config = {
         "approval_id": document["approval_id"],
         "approval_source": document["approval_source"],
+        "research_source": document["research_source"],
         "backfill_window": {
             "start_month": document["backfill_start_month"],
             "end_month": document["backfill_end_month"],
@@ -139,7 +235,7 @@ def _register_metadata(cur, document: dict, factor_key: str, item: dict) -> int:
 
     cur.execute(
         """
-        SELECT factor_id, version, status, implementation_uri,
+        SELECT factor_id, version, status, description, implementation_uri,
                implementation_hash, config, evaluation
         FROM gold.factor
         WHERE factor_key = %s
@@ -173,36 +269,35 @@ def _register_metadata(cur, document: dict, factor_key: str, item: dict) -> int:
         )
         return int(cur.fetchone()[0])
 
-    factor_id, _, status, old_uri, old_hash, old_config, _ = target
+    (
+        factor_id, _, status, old_description, old_uri, old_hash,
+        old_config, old_evaluation,
+    ) = target
     if status in {"REJECTED", "RETIRED"}:
-        raise ValueError(f"종료된 Gold 버전을 덮어쓸 수 없습니다: {factor_key} {status}")
-    if status == "APPROVED":
-        core_matches = (
-            old_uri == uri
-            and old_hash == item["implementation_hash"]
-            and old_config.get("predicted_sign") == config["predicted_sign"]
-            and old_config.get("research_definition_hash")
-            == config["research_definition_hash"]
+        raise ValueError(
+            f"종료된 Gold 버전을 덮어쓸 수 없습니다: {factor_key} {status}"
         )
-        if not core_matches:
-            raise ValueError(f"기존 APPROVED 계약과 불일치합니다: {factor_key}")
+    exact_matches = (
+        old_description == approval["description"]
+        and old_uri == uri
+        and old_hash == item["implementation_hash"]
+        and old_config == config
+        and old_evaluation == evaluation
+    )
+    if not exact_matches:
+        raise ValueError(
+            f"기존 {status} v{version}의 감사 메타데이터와 다릅니다. "
+            f"새 버전이 필요합니다: {factor_key}"
+        )
+    if status == "APPROVED":
+        return int(factor_id)
     cur.execute(
         """
         UPDATE gold.factor
-        SET description = %s,
-            implementation_uri = %s,
-            implementation_hash = %s,
-            config = %s::jsonb,
-            evaluation = %s::jsonb,
-            status = 'APPROVED'
+        SET status = 'APPROVED'
         WHERE factor_id = %s
         """,
-        (
-            approval["description"], uri, item["implementation_hash"],
-            json.dumps(config, ensure_ascii=False),
-            json.dumps(evaluation, ensure_ascii=False),
-            factor_id,
-        ),
+        (factor_id,),
     )
     return int(factor_id)
 
@@ -263,6 +358,44 @@ def _replace_values(
         raise ValueError(f"Gold rank 1이 없습니다: {factor_key}")
     if nonfinite:
         raise ValueError(f"Gold 비유한 값이 있습니다: {factor_key} {nonfinite}")
+    cur.execute(
+        """
+        WITH monthly AS (
+            SELECT date_trunc('month', as_of_date)::date AS signal_month,
+                   count(*)::integer AS observations,
+                   count(DISTINCT asset_id)::integer AS assets,
+                   count(DISTINCT as_of_date)::integer AS signal_dates,
+                   min(rank)::integer AS min_rank
+            FROM gold.factor_value
+            WHERE factor_id = %s
+              AND as_of_date >= %s
+              AND as_of_date < (%s::date + interval '1 month')
+            GROUP BY date_trunc('month', as_of_date)
+        )
+        SELECT min(observations)::integer,
+               max(observations)::integer,
+               bool_and(observations = assets),
+               bool_and(signal_dates = 1),
+               bool_and(min_rank = 1)
+        FROM monthly
+        """,
+        (factor_id, start_date, end_date),
+    )
+    (
+        min_month_observations, max_month_observations,
+        unique_asset_months, one_signal_date_per_month, monthly_rank_one,
+    ) = cur.fetchone()
+    if min_month_observations < MIN_MONTHLY_OBSERVATIONS:
+        raise ValueError(
+            f"Gold 월별 표본 부족: {factor_key}, "
+            f"minimum={min_month_observations}"
+        )
+    if not unique_asset_months:
+        raise ValueError(f"Gold asset-month 중복이 있습니다: {factor_key}")
+    if not one_signal_date_per_month:
+        raise ValueError(f"Gold 월별 signal date가 하나가 아닙니다: {factor_key}")
+    if not monthly_rank_one:
+        raise ValueError(f"Gold 일부 월에 rank 1이 없습니다: {factor_key}")
     return {
         "factor": factor_key,
         "factor_id": factor_id,
@@ -270,8 +403,131 @@ def _replace_values(
         "inserted_rows": inserted,
         "stored_rows": int(rows),
         "signal_months": int(months),
+        "min_month_observations": int(min_month_observations),
+        "max_month_observations": int(max_month_observations),
         "min_date": str(min_date),
         "max_date": str(max_date),
+    }
+
+
+def _build_investable_universe(
+    cur,
+    *,
+    start_month: str,
+    end_month: str,
+    expected_months: int,
+) -> dict:
+    """Materialize the exact research investable universe in this snapshot."""
+    cur.execute(
+        """
+        SELECT count(*)::integer
+        FROM public.price_return_contract
+        WHERE source = 'KRX'
+          AND asset_type = 'stock'
+          AND field_name = 'total_return_close'
+          AND methodology_version = 'krx_gross_dividend_reinvested_v1'
+          AND status = 'CERTIFIED'
+          AND certified_at IS NOT NULL
+        """
+    )
+    if int(cur.fetchone()[0]) != 1:
+        raise ValueError("인증된 KRX 총수익률 계약이 정확히 하나가 아닙니다")
+
+    cur.execute(
+        """
+        CREATE TEMP TABLE gold_publish_investable_universe
+        ON COMMIT DROP AS
+        WITH certified AS (
+            SELECT p.asset_id,
+                   p.trade_date,
+                   p.total_return_close,
+                   p.trading_value,
+                   p.market_cap,
+                   p.market,
+                   a.name,
+                   a.instrument_type,
+                   avg(p.trading_value) OVER (
+                       PARTITION BY p.asset_id ORDER BY p.trade_date
+                       ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                   ) AS adv20,
+                   row_number() OVER (
+                       PARTITION BY p.asset_id ORDER BY p.trade_date
+                   ) AS age_days,
+                   min(p.trade_date) OVER (
+                       PARTITION BY p.asset_id
+                   ) AS first_seen,
+                   min(p.trade_date) OVER () AS dataset_start
+            FROM public.price_daily p
+            JOIN public.asset a ON a.asset_id = p.asset_id
+            JOIN public.dq_run q
+              ON q.run_id = p.quality_run_id
+             AND q.status = 'CERTIFIED'
+            WHERE p.source = 'KRX'
+              AND a.exchange = 'KRX'
+              AND a.asset_type = 'stock'
+              AND p.market IN ('KOSPI', 'KOSDAQ')
+              AND p.trade_date < (%s::date + interval '1 month')
+        ), monthly AS (
+            SELECT certified.*,
+                   row_number() OVER (
+                       PARTITION BY asset_id, date_trunc('month', trade_date)
+                       ORDER BY trade_date DESC
+                   ) AS month_rank
+            FROM certified
+        )
+        SELECT asset_id,
+               date_trunc('month', trade_date)::date AS signal_month
+        FROM monthly
+        WHERE month_rank = 1
+          AND trade_date >= %s::date
+          AND trade_date < (%s::date + interval '1 month')
+          AND instrument_type = 'common_stock'
+          AND coalesce(name, '') !~* '(스팩|SPAC)'
+          AND coalesce(name, '') !~ '리츠'
+          AND (age_days >= 250 OR first_seen = dataset_start)
+          AND market_cap > 0
+          AND total_return_close > 0
+          AND adv20 > 0
+        """,
+        (
+            _month_start(end_month),
+            _month_start(start_month),
+            _month_start(end_month),
+        ),
+    )
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX ON gold_publish_investable_universe
+            (signal_month, asset_id)
+        """
+    )
+    cur.execute(
+        """
+        SELECT count(*)::bigint,
+               count(DISTINCT signal_month)::integer,
+               min(monthly_observations)::integer,
+               max(monthly_observations)::integer
+        FROM (
+            SELECT signal_month, count(*)::integer AS monthly_observations
+            FROM gold_publish_investable_universe
+            GROUP BY signal_month
+        ) monthly
+        """
+    )
+    rows, months, min_observations, max_observations = cur.fetchone()
+    if months != expected_months:
+        raise ValueError(
+            f"투자가능 유니버스 월 누락: expected={expected_months}, "
+            f"observed={months}"
+        )
+    if min_observations < MIN_MONTHLY_OBSERVATIONS:
+        raise ValueError(f"투자가능 유니버스 월별 표본 부족: {min_observations}")
+    return {
+        "rows": int(rows),
+        "signal_months": int(months),
+        "min_month_observations": int(min_observations),
+        "max_month_observations": int(max_observations),
+        "rule": "research_panel_universe_and_adv20_gt_0",
     }
 
 
@@ -287,35 +543,94 @@ def _pairwise_correlation(
 ) -> dict:
     cur.execute(
         """
-        WITH monthly AS (
-            SELECT date_trunc('month', l.as_of_date)::date AS signal_month,
-                   corr(l.rank::double precision, r.rank::double precision) AS rho,
+        WITH left_values AS (
+            SELECT date_trunc('month', as_of_date)::date AS signal_month,
+                   asset_id,
+                   min(rank)::double precision AS stored_rank,
+                   count(*)::integer AS rows_per_asset_month
+            FROM gold.factor_value
+            WHERE factor_id = %s
+              AND as_of_date >= %s::date
+              AND as_of_date < (%s::date + interval '1 month')
+            GROUP BY date_trunc('month', as_of_date), asset_id
+        ), right_values AS (
+            SELECT date_trunc('month', as_of_date)::date AS signal_month,
+                   asset_id,
+                   min(rank)::double precision AS stored_rank,
+                   count(*)::integer AS rows_per_asset_month
+            FROM gold.factor_value
+            WHERE factor_id = %s
+              AND as_of_date >= %s::date
+              AND as_of_date < (%s::date + interval '1 month')
+            GROUP BY date_trunc('month', as_of_date), asset_id
+        ), aligned AS (
+            SELECT u.signal_month,
+                   u.asset_id,
+                   l.stored_rank AS left_rank,
+                   r.stored_rank AS right_rank,
+                   l.rows_per_asset_month AS left_rows,
+                   r.rows_per_asset_month AS right_rows
+            FROM gold_publish_investable_universe u
+            JOIN left_values l
+              ON l.signal_month = u.signal_month
+             AND l.asset_id = u.asset_id
+            JOIN right_values r
+              ON r.signal_month = u.signal_month
+             AND r.asset_id = u.asset_id
+        ), tied AS (
+            SELECT aligned.*,
+                   rank() OVER (
+                       PARTITION BY signal_month ORDER BY left_rank
+                   )::double precision AS left_min_rank,
+                   count(*) OVER (
+                       PARTITION BY signal_month, left_rank
+                   )::double precision AS left_ties,
+                   rank() OVER (
+                       PARTITION BY signal_month ORDER BY right_rank
+                   )::double precision AS right_min_rank,
+                   count(*) OVER (
+                       PARTITION BY signal_month, right_rank
+                   )::double precision AS right_ties
+            FROM aligned
+        ), average_ranked AS (
+            SELECT signal_month,
+                   left_min_rank + (left_ties - 1.0) / 2.0 AS left_rank,
+                   right_min_rank + (right_ties - 1.0) / 2.0 AS right_rank,
+                   left_rows,
+                   right_rows
+            FROM tied
+        ), monthly AS (
+            SELECT signal_month,
+                   corr(left_rank, right_rank) AS rho,
                    count(*)::integer AS observations
-            FROM gold.factor_value l
-            JOIN gold.factor_value r
-              ON r.asset_id = l.asset_id
-             AND date_trunc('month', r.as_of_date)
-                 = date_trunc('month', l.as_of_date)
-            WHERE l.factor_id = %s
-              AND r.factor_id = %s
-              AND l.as_of_date >= %s::date
-              AND l.as_of_date < (%s::date + interval '1 month')
-            GROUP BY date_trunc('month', l.as_of_date)
+                   , max(left_rows)::integer AS max_left_rows
+                   , max(right_rows)::integer AS max_right_rows
+            FROM average_ranked
+            GROUP BY signal_month
             HAVING count(*) >= 30
         )
         SELECT count(*)::integer,
                percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(rho)),
                max(abs(rho)),
-               min(observations)
+               min(observations),
+               max(max_left_rows),
+               max(max_right_rows)
         FROM monthly
         WHERE rho IS NOT NULL
         """,
         (
-            left_id, right_id,
-            _month_start(start_month), _month_start(end_month),
+            left_id, _month_start(start_month), _month_start(end_month),
+            right_id, _month_start(start_month), _month_start(end_month),
         ),
     )
-    months, median_abs, max_abs, min_observations = cur.fetchone()
+    (
+        months, median_abs, max_abs, min_observations,
+        max_left_rows, max_right_rows,
+    ) = cur.fetchone()
+    if max_left_rows and max_left_rows > 1:
+        raise ValueError(f"Gold asset-month 중복이 있습니다: {left_key}")
+    if max_right_rows and max_right_rows > 1:
+        raise ValueError(f"Gold asset-month 중복이 있습니다: {right_key}")
     return {
         "left": left_key,
         "right": right_key,
@@ -349,14 +664,36 @@ def publish(
     factor_ids: dict[str, int] = {}
     value_summaries: list[dict] = []
     correlations: list[dict] = []
+    investable_universe: dict = {}
 
     try:
         with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             cur.execute("SET LOCAL lock_timeout = '10s'")
             cur.execute("SET LOCAL statement_timeout = '45min'")
             cur.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 ("teamalpha_gold_publish",),
+            )
+            cur.execute(
+                """
+                SELECT factor_id, factor_key
+                FROM gold.factor
+                WHERE status = 'APPROVED'
+                  AND NOT (factor_key = ANY(%s))
+                ORDER BY factor_key
+                """,
+                (list(validated),),
+            )
+            existing_approved = {
+                str(factor_key): int(factor_id)
+                for factor_id, factor_key in cur.fetchall()
+            }
+            investable_universe = _build_investable_universe(
+                cur,
+                start_month=start_month,
+                end_month=end_month,
+                expected_months=expected_months,
             )
             for factor_key, item in validated.items():
                 factor_ids[factor_key] = _register_metadata(
@@ -372,17 +709,24 @@ def publish(
                     end_month=end_month,
                     expected_months=expected_months,
                 ))
-            for left_key, right_key in combinations(validated, 2):
+            comparisons = list(combinations(validated, 2))
+            comparisons.extend(
+                (new_key, existing_key)
+                for new_key in validated
+                for existing_key in existing_approved
+            )
+            comparison_ids = {**existing_approved, **factor_ids}
+            for left_key, right_key in comparisons:
                 comparison = _pairwise_correlation(
                     cur,
                     left_key=left_key,
-                    left_id=factor_ids[left_key],
+                    left_id=comparison_ids[left_key],
                     right_key=right_key,
-                    right_id=factor_ids[right_key],
+                    right_id=comparison_ids[right_key],
                     start_month=start_month,
                     end_month=end_month,
                 )
-                if comparison["months"] < 36:
+                if comparison["months"] < MIN_CORRELATION_MONTHS:
                     raise ValueError(
                         f"Gold 중복 비교월 부족: {left_key}/{right_key} "
                         f"{comparison['months']}"
@@ -405,6 +749,7 @@ def publish(
         "mode": "APPLY" if apply else "DRY_RUN_ROLLBACK",
         "backfill_start_month": start_month,
         "backfill_end_month": end_month,
+        "investable_universe": investable_universe,
         "factors": value_summaries,
         "pairwise_correlations": correlations,
     }

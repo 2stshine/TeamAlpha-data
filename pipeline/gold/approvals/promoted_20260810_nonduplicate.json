@@ -2,6 +2,10 @@
   "approval_id": "promoted-20260810-nonduplicate-v1",
   "approval_source": "explicit_user_request_in_codex_thread",
   "ruleset_version": "fr-3.10.1",
+  "research_source": {
+    "repository": "https://github.com/2stshine/factor-research.git",
+    "commit": "2dbbb4b4cc1aa01af37da80622704fad7b66af35"
+  },
   "backfill_start_month": "2018-03",
   "backfill_end_month": "2026-06",
   "selection": {

@@ -17,9 +17,11 @@ ALLOWED_SILVER_RELATIONS = frozenset({
     "public.asset",
     "public.asset_identifier",
     "public.corporate_action",
+    "public.dividend_event_resolution",
     "public.dq_run",
     "public.fundamental",
     "public.price_daily",
+    "public.price_return_contract",
 })
 
 
@@ -97,6 +99,7 @@ def _load_factor(conn, factor_key: str) -> dict:
                    implementation_uri, implementation_hash, config
             FROM gold.factor
             WHERE factor_key = %s
+              AND status = 'APPROVED'
             ORDER BY version DESC
             LIMIT 1
             """,
@@ -104,7 +107,9 @@ def _load_factor(conn, factor_key: str) -> dict:
         )
         row = cur.fetchone()
         if row is None:
-            raise ValueError(f"Gold factor metadata가 없습니다: {factor_key}")
+            raise ValueError(
+                f"APPROVED Gold factor metadata가 없습니다: {factor_key}"
+            )
         columns = [column.name for column in cur.description]
     return dict(zip(columns, row, strict=True))
 

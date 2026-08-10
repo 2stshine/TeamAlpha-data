@@ -108,9 +108,12 @@ DDL은 idempotent하며 `gold.active_factor_catalog` view는 현재 `APPROVED`�
 
 ## 연구 팩터 구현 실행
 
-`trading_turnover_20d`와 `paid_in_capital_ratio`는
+연구를 통과해 구현된 팩터는
 [`pipeline/gold/factors/manifest.json`](pipeline/gold/factors/manifest.json)에 등록된
-read-only SQL로 계산한다. manifest는 연구 definition hash를 명시하며, 실행기는 APPROVED
+팩터별 read-only SQL로 계산한다. 현재 manifest에는 거래회전율·납입자본비중과 함께
+Amihud 비유동성, 배당수익률, 배당 실시 빈도, 월중 최대 일수익률, 가격조정 순주식발행,
+총부채 대비 영업이익, 252거래일 실현변동성 구현이 들어 있다. manifest는 연구 definition
+hash를 명시하며, 실행기는 APPROVED
 상태, 실제 SQL SHA-256, 게시 config와 manifest의 definition hash, `predicted_sign`,
 value/rank 계약을 모두 확인한다. 연구 parity와 운영 적재는 같은 query를 사용하고 운영
 실행기만 공통 INSERT/UPSERT를 덧붙인다.
@@ -125,5 +128,33 @@ uv run python -m pipeline.gold.run \
   --factor trading_turnover_20d --as-of-month YYYY-MM --apply
 ```
 
-두 SQL 모두 인증된 RDS Silver 행과 PIT 식별자·공시만 사용한다. Gold 실행은 연구의
+각 SQL은 인증된 RDS Silver 행과 PIT 식별자·공시만 사용한다. Gold 실행은 연구의
 봉인 OOS 통과와 사람 승인 뒤 별도로 수행하며 daily task에 자동 연결하지 않는다.
+
+## 비중복 PROMOTE 팩터 수동 게시
+
+`promoted-20260810-nonduplicate-v1` 승인은 latest campaign에서 OOS `PROMOTE`된
+후보 중 서로의 월별 rank 상관이 `0.70` 이하인 다음 다섯 팩터만 대상으로 한다.
+
+- `dividend_yield_ttm`
+- `max_daily_return_1m`
+- `net_equity_issuance_price_adjusted_12m`
+- `realized_volatility_252d`
+- `operating_income_to_liabilities`
+
+`dividend_event_frequency_ttm`은 `dividend_yield_ttm`과 Discovery·OOS 상관이 각각
+약 `0.917`, `0.923`이라 대표 목록에서 제외한다. 승인 입력은
+[`pipeline/gold/approvals/promoted_20260810_nonduplicate.json`](pipeline/gold/approvals/promoted_20260810_nonduplicate.json)에
+정의·SQL hash·OOS 결과·재사용 OOS evidence class를 고정한다.
+
+게시기는 승인 메타데이터 등록, `2018-03~2026-06` 전체 backfill, 유한값·100개월
+커버리지·선택 팩터 간 상관 검사를 하나의 DB transaction에서 수행한다. 기본값은
+끝에서 전체 rollback하는 preflight이며 `--apply`가 있을 때만 commit한다.
+
+```bash
+# 승인·backfill·중복 검사를 실제로 수행한 뒤 전체 rollback
+uv run python -m pipeline.gold.publish
+
+# 동일 transaction을 명시적으로 commit
+uv run python -m pipeline.gold.publish --apply
+```

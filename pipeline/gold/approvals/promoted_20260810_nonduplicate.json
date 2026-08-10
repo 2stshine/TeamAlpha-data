@@ -1,0 +1,115 @@
+{
+  "approval_id": "promoted-20260810-nonduplicate-v1",
+  "approval_source": "explicit_user_request_in_codex_thread",
+  "ruleset_version": "fr-3.10.1",
+  "backfill_start_month": "2018-03",
+  "backfill_end_month": "2026-06",
+  "selection": {
+    "maximum_allowed_median_absolute_correlation": 0.7,
+    "selected_pair_max_discovery": 0.518064,
+    "selected_pair_max_oos": 0.541765,
+    "excluded_duplicate": {
+      "factor": "dividend_event_frequency_ttm",
+      "representative": "dividend_yield_ttm",
+      "discovery_median_absolute_correlation": 0.917466,
+      "oos_median_absolute_correlation": 0.923154
+    }
+  },
+  "factors": {
+    "dividend_yield_ttm": {
+      "version": 1,
+      "description": "최근 12개월 PIT 현금배당 합계를 월말 분할조정 주가로 나눈 배당수익률. 값이 높을수록 선호 순위가 높다.",
+      "campaign_id": "campaign-20260808-001",
+      "implementation_sha256": "5f94163be461e32a9771e7e7e7424de911a3700cef685a2599be75c96ced063c",
+      "evaluation": {
+        "passed": true,
+        "verdict": "PROMOTE",
+        "discovery_investable_rank_ic": 0.06696557008836772,
+        "oos_rank_ic": 0.12526611532256016,
+        "oos_required_rank_ic": 0.03348278504418386,
+        "oos_rank_ic_retention": 1.8706047773095797,
+        "oos_by_qvalue": 3.1012790425012384e-11,
+        "oos_signal_months": 36,
+        "oos_start": "2023-06",
+        "oos_end": "2026-05",
+        "oos_evidence_class": "HISTORICAL_REUSED_WINDOW"
+      }
+    },
+    "max_daily_return_1m": {
+      "version": 1,
+      "description": "최근 한 달의 최대 일별 총수익률. 복권형 급등이 작을수록 선호 순위가 높다.",
+      "campaign_id": "campaign-20260808-001",
+      "implementation_sha256": "12144fa10c82b4ad902950c3341a7c999609793eefe746f05351e4ee24072596",
+      "evaluation": {
+        "passed": true,
+        "verdict": "PROMOTE",
+        "discovery_investable_rank_ic": 0.10036212328718574,
+        "oos_rank_ic": 0.1196100427329258,
+        "oos_required_rank_ic": 0.05018106164359287,
+        "oos_rank_ic_retention": 1.1917846974068318,
+        "oos_by_qvalue": 3.841385044865753e-10,
+        "oos_signal_months": 36,
+        "oos_start": "2023-06",
+        "oos_end": "2026-05",
+        "oos_evidence_class": "HISTORICAL_REUSED_WINDOW"
+      }
+    },
+    "net_equity_issuance_price_adjusted_12m": {
+      "version": 1,
+      "description": "가격효과를 제거한 최근 12개월 순주식발행 증가율. 발행이 적을수록 선호 순위가 높다.",
+      "campaign_id": "campaign-20260808-001",
+      "implementation_sha256": "e00dcb5c7331f54a04379e7d59dfdc28ca795f498acba7ea92986e2cd94b7e53",
+      "evaluation": {
+        "passed": true,
+        "verdict": "PROMOTE",
+        "discovery_investable_rank_ic": 0.052449891048064454,
+        "oos_rank_ic": 0.07699672670386257,
+        "oos_required_rank_ic": 0.026224945524032227,
+        "oos_rank_ic_retention": 1.4680054651267758,
+        "oos_by_qvalue": 3.2424469476106456e-11,
+        "oos_signal_months": 36,
+        "oos_start": "2023-06",
+        "oos_end": "2026-05",
+        "oos_evidence_class": "HISTORICAL_REUSED_WINDOW"
+      }
+    },
+    "realized_volatility_252d": {
+      "version": 1,
+      "description": "최근 252거래 관측의 일별 총수익률 실현변동성. 변동성이 낮을수록 선호 순위가 높다.",
+      "campaign_id": "campaign-20260808-001",
+      "implementation_sha256": "2aae7ccb884a962b95b002f836782b3ea134e816241d75738a6ce11878be22be",
+      "evaluation": {
+        "passed": true,
+        "verdict": "PROMOTE",
+        "discovery_investable_rank_ic": 0.10939565284808546,
+        "oos_rank_ic": 0.15014686644488195,
+        "oos_required_rank_ic": 0.05469782642404273,
+        "oos_rank_ic_retention": 1.372512184313087,
+        "oos_by_qvalue": 3.280712201236215e-10,
+        "oos_signal_months": 36,
+        "oos_start": "2023-06",
+        "oos_end": "2026-05",
+        "oos_evidence_class": "HISTORICAL_REUSED_WINDOW"
+      }
+    },
+    "operating_income_to_liabilities": {
+      "version": 1,
+      "description": "신호시점 PIT 최근 12개월 영업이익을 총부채로 나눈 영업 의무상환 여력. 값이 높을수록 선호 순위가 높다.",
+      "campaign_id": "campaign-20260809-001",
+      "implementation_sha256": "499b87f103eaf13a89c0d1bae7bb1a58f2b1f903eb156ad9c6ef48aca068fe83",
+      "evaluation": {
+        "passed": true,
+        "verdict": "PROMOTE",
+        "discovery_investable_rank_ic": 0.050723931543203295,
+        "oos_rank_ic": 0.0959587515032368,
+        "oos_required_rank_ic": 0.025361965771601647,
+        "oos_rank_ic_retention": 1.8917845794643395,
+        "oos_by_qvalue": 4.100513022393466e-12,
+        "oos_signal_months": 36,
+        "oos_start": "2023-06",
+        "oos_end": "2026-05",
+        "oos_evidence_class": "HISTORICAL_REUSED_WINDOW"
+      }
+    }
+  }
+}

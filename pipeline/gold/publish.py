@@ -91,6 +91,13 @@ def _release_publish_lock(conn) -> None:
         raise RuntimeError("Gold publisher session advisory lock이 없습니다")
 
 
+def _emit_progress(stage: str, **fields: object) -> None:
+    print(json.dumps(
+        {"gold_publish_progress": stage, **fields},
+        ensure_ascii=False,
+    ), flush=True)
+
+
 def load_approval(path: Path = DEFAULT_APPROVAL_PATH) -> dict:
     document = json.loads(path.read_text(encoding="utf-8"))
     required = {
@@ -571,6 +578,7 @@ def _build_investable_universe(
             (signal_month, asset_id)
         """
     )
+    cur.execute("ANALYZE gold_publish_investable_universe")
     cur.execute(
         """
         SELECT count(*)::bigint,
@@ -601,6 +609,79 @@ def _build_investable_universe(
     }
 
 
+def _build_correlation_values(
+    cur,
+    *,
+    factor_ids: dict[str, int],
+    start_month: str,
+    end_month: str,
+) -> dict:
+    """Aggregate investable factor values once for every pairwise check."""
+    cur.execute(
+        """
+        CREATE TEMP TABLE gold_publish_correlation_values
+        ON COMMIT DROP AS
+        SELECT v.factor_id,
+               u.signal_month,
+               u.asset_id,
+               min(v.rank)::double precision AS stored_rank,
+               count(*)::integer AS rows_per_asset_month
+        FROM gold_publish_investable_universe u
+        JOIN gold.factor_value v
+          ON v.asset_id = u.asset_id
+         AND v.as_of_date >= u.signal_month
+         AND v.as_of_date < (u.signal_month + interval '1 month')
+        WHERE v.factor_id = ANY(%s)
+          AND v.as_of_date >= %s::date
+          AND v.as_of_date < (%s::date + interval '1 month')
+        GROUP BY v.factor_id, u.signal_month, u.asset_id
+        """,
+        (
+            list(factor_ids.values()),
+            _month_start(start_month),
+            _month_start(end_month),
+        ),
+    )
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX ON gold_publish_correlation_values
+            (factor_id, signal_month, asset_id)
+        """
+    )
+    cur.execute("ANALYZE gold_publish_correlation_values")
+    cur.execute(
+        """
+        SELECT factor_id,
+               count(*)::bigint,
+               count(DISTINCT signal_month)::integer,
+               max(rows_per_asset_month)::integer
+        FROM gold_publish_correlation_values
+        GROUP BY factor_id
+        """
+    )
+    observed = {
+        int(factor_id): {
+            "rows": int(rows),
+            "signal_months": int(months),
+            "max_rows_per_asset_month": int(max_rows),
+        }
+        for factor_id, rows, months, max_rows in cur.fetchall()
+    }
+    for factor_key, factor_id in factor_ids.items():
+        summary = observed.get(factor_id)
+        if summary is None:
+            raise ValueError(f"Gold 중복 비교 값이 없습니다: {factor_key}")
+        if summary["max_rows_per_asset_month"] > 1:
+            raise ValueError(f"Gold asset-month 중복이 있습니다: {factor_key}")
+    return {
+        "rows": sum(item["rows"] for item in observed.values()),
+        "factors": {
+            factor_key: observed[factor_id]
+            for factor_key, factor_id in factor_ids.items()
+        },
+    }
+
+
 def _pairwise_correlation(
     cur,
     *,
@@ -608,45 +689,20 @@ def _pairwise_correlation(
     left_id: int,
     right_key: str,
     right_id: int,
-    start_month: str,
-    end_month: str,
 ) -> dict:
     cur.execute(
         """
-        WITH left_values AS (
-            SELECT date_trunc('month', as_of_date)::date AS signal_month,
-                   asset_id,
-                   min(rank)::double precision AS stored_rank,
-                   count(*)::integer AS rows_per_asset_month
-            FROM gold.factor_value
-            WHERE factor_id = %s
-              AND as_of_date >= %s::date
-              AND as_of_date < (%s::date + interval '1 month')
-            GROUP BY date_trunc('month', as_of_date), asset_id
-        ), right_values AS (
-            SELECT date_trunc('month', as_of_date)::date AS signal_month,
-                   asset_id,
-                   min(rank)::double precision AS stored_rank,
-                   count(*)::integer AS rows_per_asset_month
-            FROM gold.factor_value
-            WHERE factor_id = %s
-              AND as_of_date >= %s::date
-              AND as_of_date < (%s::date + interval '1 month')
-            GROUP BY date_trunc('month', as_of_date), asset_id
-        ), aligned AS (
-            SELECT u.signal_month,
-                   u.asset_id,
+        WITH aligned AS (
+            SELECT l.signal_month,
+                   l.asset_id,
                    l.stored_rank AS left_rank,
-                   r.stored_rank AS right_rank,
-                   l.rows_per_asset_month AS left_rows,
-                   r.rows_per_asset_month AS right_rows
-            FROM gold_publish_investable_universe u
-            JOIN left_values l
-              ON l.signal_month = u.signal_month
-             AND l.asset_id = u.asset_id
-            JOIN right_values r
-              ON r.signal_month = u.signal_month
-             AND r.asset_id = u.asset_id
+                   r.stored_rank AS right_rank
+            FROM gold_publish_correlation_values l
+            JOIN gold_publish_correlation_values r
+              ON r.signal_month = l.signal_month
+             AND r.asset_id = l.asset_id
+            WHERE l.factor_id = %s
+              AND r.factor_id = %s
         ), tied AS (
             SELECT aligned.*,
                    rank() OVER (
@@ -665,16 +721,12 @@ def _pairwise_correlation(
         ), average_ranked AS (
             SELECT signal_month,
                    left_min_rank + (left_ties - 1.0) / 2.0 AS left_rank,
-                   right_min_rank + (right_ties - 1.0) / 2.0 AS right_rank,
-                   left_rows,
-                   right_rows
+                   right_min_rank + (right_ties - 1.0) / 2.0 AS right_rank
             FROM tied
         ), monthly AS (
             SELECT signal_month,
                    corr(left_rank, right_rank) AS rho,
                    count(*)::integer AS observations
-                   , max(left_rows)::integer AS max_left_rows
-                   , max(right_rows)::integer AS max_right_rows
             FROM average_ranked
             GROUP BY signal_month
             HAVING count(*) >= 30
@@ -682,25 +734,15 @@ def _pairwise_correlation(
         SELECT count(*)::integer,
                percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(rho)),
                max(abs(rho)),
-               min(observations),
-               max(max_left_rows),
-               max(max_right_rows)
+               min(observations)
         FROM monthly
         WHERE rho IS NOT NULL
         """,
         (
-            left_id, _month_start(start_month), _month_start(end_month),
-            right_id, _month_start(start_month), _month_start(end_month),
+            left_id, right_id,
         ),
     )
-    (
-        months, median_abs, max_abs, min_observations,
-        max_left_rows, max_right_rows,
-    ) = cur.fetchone()
-    if max_left_rows and max_left_rows > 1:
-        raise ValueError(f"Gold asset-month 중복이 있습니다: {left_key}")
-    if max_right_rows and max_right_rows > 1:
-        raise ValueError(f"Gold asset-month 중복이 있습니다: {right_key}")
+    months, median_abs, max_abs, min_observations = cur.fetchone()
     return {
         "left": left_key,
         "right": right_key,
@@ -735,6 +777,7 @@ def publish(
     value_summaries: list[dict] = []
     correlations: list[dict] = []
     investable_universe: dict = {}
+    correlation_values: dict = {}
 
     _acquire_publish_lock(conn)
     try:
@@ -762,12 +805,13 @@ def publish(
                     end_month=end_month,
                     expected_months=expected_months,
                 )
+                _emit_progress("investable_universe", **investable_universe)
                 for factor_key, item in validated.items():
                     factor_ids[factor_key] = _register_metadata(
                         cur, document, factor_key, item,
                     )
                 for factor_key, item in validated.items():
-                    value_summaries.append(_replace_values(
+                    summary = _replace_values(
                         cur,
                         factor_id=factor_ids[factor_key],
                         factor_key=factor_key,
@@ -775,7 +819,9 @@ def publish(
                         start_month=start_month,
                         end_month=end_month,
                         expected_months=expected_months,
-                    ))
+                    )
+                    value_summaries.append(summary)
+                    _emit_progress("factor_values", **summary)
                 comparisons = list(combinations(validated, 2))
                 comparisons.extend(
                     (new_key, existing_key)
@@ -783,6 +829,17 @@ def publish(
                     for existing_key in existing_approved
                 )
                 comparison_ids = {**existing_approved, **factor_ids}
+                correlation_values = _build_correlation_values(
+                    cur,
+                    factor_ids=comparison_ids,
+                    start_month=start_month,
+                    end_month=end_month,
+                )
+                _emit_progress(
+                    "correlation_values",
+                    rows=correlation_values["rows"],
+                    factors=len(correlation_values["factors"]),
+                )
                 for left_key, right_key in comparisons:
                     comparison = _pairwise_correlation(
                         cur,
@@ -790,8 +847,6 @@ def publish(
                         left_id=comparison_ids[left_key],
                         right_key=right_key,
                         right_id=comparison_ids[right_key],
-                        start_month=start_month,
-                        end_month=end_month,
                     )
                     if comparison["months"] < MIN_CORRELATION_MONTHS:
                         raise ValueError(
@@ -804,6 +859,7 @@ def publish(
                             f"{comparison['median_abs_spearman']:.6f}>{threshold}"
                         )
                     correlations.append(comparison)
+                    _emit_progress("pairwise_correlation", **comparison)
             if apply:
                 conn.commit()
             else:
@@ -819,6 +875,7 @@ def publish(
         "backfill_start_month": start_month,
         "backfill_end_month": end_month,
         "investable_universe": investable_universe,
+        "correlation_values": correlation_values,
         "factors": value_summaries,
         "pairwise_correlations": correlations,
     }

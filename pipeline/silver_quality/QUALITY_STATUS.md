@@ -148,24 +148,33 @@ FMP daily의 OPEN warning은 0건이다.
 > 으로 검사한다. 전체 재구축이 Silver 5테이블을 truncate하므로 FMP는 같은 창에서
 > `fmp_backfill_ecs` 로 재적재했다(run `e44c65d3`). 무결성 미인증/NULL 0.
 
-### 재무·배당 지표 (2026-08-05 전수 집계)
+### 재무·배당 지표 (2026-08-10 전수 집계)
 
 | source | statement | basis | 행 수 | 자산 수 | 기간 |
 |---|---|---|---:|---:|---|
-| DART | BS | STANDARDIZED | 1,479,913 | 3,038 | 2015-03-31~2026-06-30 |
-| DART | IS | STANDARDIZED | 715,559 | 3,038 | 2015-03-31~2026-06-30 |
-| DART | DIVIDEND | REPORTED | 96,763 | 1,888 | 2013-09-30~2026-04-30 |
-| FMP | BS | STANDARDIZED | 2,602,497 | 8,462 | 2003-09-30~2026-07-15 |
-| FMP | IS | STANDARDIZED | 3,291,802 | 8,457 | 2001-12-31~2026-07-15 |
-| FMP | CF | STANDARDIZED | 1,299,567 | 8,430 | 2001-12-31~2026-07-26 |
+| DART | BS | STANDARDIZED | 1,485,159 | 3,071 | 2015-03-31~2026-06-30 |
+| DART | IS | STANDARDIZED | 718,543 | 3,071 | 2015-03-31~2026-06-30 |
+| DART | DIVIDEND | REPORTED | 97,003 | 1,903 | 2013-09-30~2026-04-30 |
+| FMP | BS | STANDARDIZED | 2,603,924 | 8,494 | 2015-01-02~2026-07-15 |
+| FMP | IS | STANDARDIZED | 3,294,172 | 8,489 | 2015-01-02~2026-07-15 |
+| FMP | CF | STANDARDIZED | 1,300,371 | 8,461 | 2015-01-02~2026-07-26 |
 
-### 주요 기업행사 (2026-08-05 전수 집계)
+> DART DIVIDEND(정기보고서 배당, `run_dart_extras`)은 전체 재구축 truncate 로 함께
+> 지워져 2026-08-10 `dart_dividend_action_backfill` 로 재적재·인증했다(dividends
+> 97,003 / actions 41,295, run `8270d84f`). 재구축 진입점(`krx_history_backfill_ecs`)
+> 도 이후 FMP 와 함께 dart-extras 를 자동 재적재하도록 수정해 재발을 막았다.
+> FMP 재무는 재적재가 2015+ 창(`FMP_SILVER_FROM_YEAR=2015`)이라 최소 period_end
+> 가 2015 로 정렬됐다(이전 희소 2001–2014 미국 재무 제외). FMP 주가가 2015+ 이므로
+> 백테스트 커버리지 손실은 없다.
+
+### 주요 기업행사 (2026-08-10 전수 집계, 상위 유형)
 
 | source | action | 행 수 | 자산 수 |
 |---|---|---:|---:|
-| DART_DISCLOSURE | cash_dividend | 18,476 | 1,813 |
-| FMP_DIVIDEND | cash_dividend | 113,172 | 3,633 |
-| FMP_SPLIT | stock_split | 1,104 | 854 |
+| DART_DISCLOSURE | cash_dividend | 19,861 | 1,875 |
+| DART_STRUCTURED | paid_increase | 5,679 | 1,380 |
+| FMP_DIVIDEND | cash_dividend | 112,039 | 3,640 |
+| FMP_SPLIT | stock_split | 1,091 | 847 |
 
 ## DB 무결성 방어
 

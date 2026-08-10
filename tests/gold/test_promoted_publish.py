@@ -7,8 +7,10 @@ import pytest
 from pipeline.gold.run import build_upsert_sql
 from pipeline.gold.publish import (
     DEFAULT_APPROVAL_PATH,
+    _acquire_publish_lock,
     _desired_metadata,
     _month_count,
+    _release_publish_lock,
     load_approval,
     validate_approval,
 )
@@ -124,3 +126,45 @@ def test_upsert_wrapper_cannot_write_outside_approved_month_range():
     )
     assert "as_of_date >= %(start_month)s::date" in sql
     assert "as_of_date < (%(end_month)s::date + interval '1 month')" in sql
+
+
+def test_publisher_lock_is_session_scoped_and_committed_before_snapshot():
+    class FakeCursor:
+        def __init__(self, statements):
+            self.statements = statements
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def execute(self, statement, params=None):
+            self.statements.append((statement, params))
+
+        def fetchone(self):
+            return (True,)
+
+    class FakeConnection:
+        def __init__(self):
+            self.statements = []
+            self.commits = 0
+            self.rollbacks = 0
+
+        def cursor(self):
+            return FakeCursor(self.statements)
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    conn = FakeConnection()
+    _acquire_publish_lock(conn)
+    assert "pg_advisory_lock" in conn.statements[1][0]
+    assert "pg_advisory_xact_lock" not in conn.statements[1][0]
+    assert conn.commits == 1
+    _release_publish_lock(conn)
+    assert "pg_advisory_unlock" in conn.statements[-1][0]
+    assert conn.commits == 2

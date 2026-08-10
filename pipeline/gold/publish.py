@@ -39,6 +39,7 @@ MIN_OOS_RETENTION = 0.50
 MAX_FDR_Q = 0.10
 MIN_CORRELATION_MONTHS = 36
 MIN_MONTHLY_OBSERVATIONS = 30
+PUBLISH_LOCK_KEY = "teamalpha_gold_publish"
 
 
 def _month_start(value: str) -> date:
@@ -54,6 +55,40 @@ def _month_count(start_month: str, end_month: str) -> int:
     if count <= 0:
         raise ValueError("backfill 종료월은 시작월보다 빠를 수 없습니다")
     return count
+
+
+def _acquire_publish_lock(conn) -> None:
+    """Serialize publishers before opening the repeatable-read snapshot."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET lock_timeout = '10s'")
+            cur.execute(
+                "SELECT pg_advisory_lock(hashtext(%s))",
+                (PUBLISH_LOCK_KEY,),
+            )
+        # Session advisory locks survive commit.  Ending this short transaction
+        # ensures the publication transaction receives a snapshot newer than
+        # every publisher that previously held the lock.
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _release_publish_lock(conn) -> None:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_unlock(hashtext(%s))",
+                (PUBLISH_LOCK_KEY,),
+            )
+            unlocked = bool(cur.fetchone()[0])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    if not unlocked:
+        raise RuntimeError("Gold publisher session advisory lock이 없습니다")
 
 
 def load_approval(path: Path = DEFAULT_APPROVAL_PATH) -> dict:
@@ -462,6 +497,17 @@ def _build_investable_universe(
             JOIN public.dq_run q
               ON q.run_id = p.quality_run_id
              AND q.status = 'CERTIFIED'
+            JOIN LATERAL (
+                SELECT 1
+                FROM public.asset_identifier ai
+                WHERE ai.asset_id = p.asset_id
+                  AND ai.source = 'KRX'
+                  AND ai.identifier_type = 'ticker'
+                  AND ai.valid_from <= p.trade_date
+                  AND (ai.valid_to IS NULL OR ai.valid_to >= p.trade_date)
+                ORDER BY ai.valid_from DESC
+                LIMIT 1
+            ) identifier ON true
             WHERE p.source = 'KRX'
               AND a.exchange = 'KRX'
               AND a.asset_type = 'stock'
@@ -666,84 +712,83 @@ def publish(
     correlations: list[dict] = []
     investable_universe: dict = {}
 
+    _acquire_publish_lock(conn)
     try:
-        with conn.cursor() as cur:
-            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-            cur.execute("SET LOCAL lock_timeout = '10s'")
-            cur.execute("SET LOCAL statement_timeout = '45min'")
-            cur.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                ("teamalpha_gold_publish",),
-            )
-            cur.execute(
-                """
-                SELECT factor_id, factor_key
-                FROM gold.factor
-                WHERE status = 'APPROVED'
-                  AND NOT (factor_key = ANY(%s))
-                ORDER BY factor_key
-                """,
-                (list(validated),),
-            )
-            existing_approved = {
-                str(factor_key): int(factor_id)
-                for factor_id, factor_key in cur.fetchall()
-            }
-            investable_universe = _build_investable_universe(
-                cur,
-                start_month=start_month,
-                end_month=end_month,
-                expected_months=expected_months,
-            )
-            for factor_key, item in validated.items():
-                factor_ids[factor_key] = _register_metadata(
-                    cur, document, factor_key, item,
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                cur.execute("SET LOCAL statement_timeout = '45min'")
+                cur.execute(
+                    """
+                    SELECT factor_id, factor_key
+                    FROM gold.factor
+                    WHERE status = 'APPROVED'
+                      AND NOT (factor_key = ANY(%s))
+                    ORDER BY factor_key
+                    """,
+                    (list(validated),),
                 )
-            for factor_key, item in validated.items():
-                value_summaries.append(_replace_values(
+                existing_approved = {
+                    str(factor_key): int(factor_id)
+                    for factor_id, factor_key in cur.fetchall()
+                }
+                investable_universe = _build_investable_universe(
                     cur,
-                    factor_id=factor_ids[factor_key],
-                    factor_key=factor_key,
-                    item=item,
                     start_month=start_month,
                     end_month=end_month,
                     expected_months=expected_months,
-                ))
-            comparisons = list(combinations(validated, 2))
-            comparisons.extend(
-                (new_key, existing_key)
-                for new_key in validated
-                for existing_key in existing_approved
-            )
-            comparison_ids = {**existing_approved, **factor_ids}
-            for left_key, right_key in comparisons:
-                comparison = _pairwise_correlation(
-                    cur,
-                    left_key=left_key,
-                    left_id=comparison_ids[left_key],
-                    right_key=right_key,
-                    right_id=comparison_ids[right_key],
-                    start_month=start_month,
-                    end_month=end_month,
                 )
-                if comparison["months"] < MIN_CORRELATION_MONTHS:
-                    raise ValueError(
-                        f"Gold 중복 비교월 부족: {left_key}/{right_key} "
-                        f"{comparison['months']}"
+                for factor_key, item in validated.items():
+                    factor_ids[factor_key] = _register_metadata(
+                        cur, document, factor_key, item,
                     )
-                if comparison["median_abs_spearman"] > threshold:
-                    raise ValueError(
-                        f"Gold 중복 기준 초과: {left_key}/{right_key} "
-                        f"{comparison['median_abs_spearman']:.6f}>{threshold}"
+                for factor_key, item in validated.items():
+                    value_summaries.append(_replace_values(
+                        cur,
+                        factor_id=factor_ids[factor_key],
+                        factor_key=factor_key,
+                        item=item,
+                        start_month=start_month,
+                        end_month=end_month,
+                        expected_months=expected_months,
+                    ))
+                comparisons = list(combinations(validated, 2))
+                comparisons.extend(
+                    (new_key, existing_key)
+                    for new_key in validated
+                    for existing_key in existing_approved
+                )
+                comparison_ids = {**existing_approved, **factor_ids}
+                for left_key, right_key in comparisons:
+                    comparison = _pairwise_correlation(
+                        cur,
+                        left_key=left_key,
+                        left_id=comparison_ids[left_key],
+                        right_key=right_key,
+                        right_id=comparison_ids[right_key],
+                        start_month=start_month,
+                        end_month=end_month,
                     )
-                correlations.append(comparison)
-        if apply:
-            conn.commit()
-        else:
+                    if comparison["months"] < MIN_CORRELATION_MONTHS:
+                        raise ValueError(
+                            f"Gold 중복 비교월 부족: {left_key}/{right_key} "
+                            f"{comparison['months']}"
+                        )
+                    if comparison["median_abs_spearman"] > threshold:
+                        raise ValueError(
+                            f"Gold 중복 기준 초과: {left_key}/{right_key} "
+                            f"{comparison['median_abs_spearman']:.6f}>{threshold}"
+                        )
+                    correlations.append(comparison)
+            if apply:
+                conn.commit()
+            else:
+                conn.rollback()
+        except Exception:
             conn.rollback()
-    except Exception:
-        conn.rollback()
-        raise
+            raise
+    finally:
+        _release_publish_lock(conn)
     return {
         "approval_id": document["approval_id"],
         "mode": "APPLY" if apply else "DRY_RUN_ROLLBACK",

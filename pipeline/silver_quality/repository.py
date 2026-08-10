@@ -18,7 +18,29 @@ from pipeline.silver_quality.models import (
 )
 
 
-INCREMENTAL_WARNING_MODES = frozenset({"daily", "fmp_daily"})
+# Modes whose CERTIFIED warnings are projected into the dq_warning_state
+# worklist. Every mode that *loads* data into silver is tracked so the reviewer
+# has one durable list covering the entire loaded range (daily increments plus
+# every backfill/rebuild pass), and can acknowledge each item over time.
+#
+# Read-only re-check modes ("audit", "published_adj_close_streaming_audit") are
+# deliberately excluded: they re-scan already-published data and would duplicate
+# the load-time worklist rather than describe newly loaded data.
+WARNING_TRACKED_MODES = frozenset({
+    "daily",
+    "fmp_daily",
+    "backfill",
+    "backfill_candidate",
+    "backfill_partition",
+    "dart_dividend_action_backfill",
+    "fmp_backfill",
+    "fmp_backfill_partition",
+    "fmp_commodity_backfill",
+    "krx_total_return_rebuild",
+    "maintenance_konex_exclusion",
+})
+# Backwards-compatible alias (older imports referenced this name).
+INCREMENTAL_WARNING_MODES = WARNING_TRACKED_MODES
 
 
 def _json_safe(value):
@@ -125,7 +147,11 @@ def _warning_scope_key(
         return f"partition={partition_key}", partition_key
     if context.target_date:
         return f"date={context.target_date.isoformat()}", None
-    return f"run={context.run_id}", None
+    # Whole-dataset checks on a full-range backfill carry neither a partition nor
+    # a target date. Scope them to the dataset (stable) rather than the run id
+    # (unique per run) so re-running the backfill updates the same worklist row
+    # instead of accumulating a fresh one every time.
+    return f"dataset={result.dataset}", None
 
 
 def _incremental_warning_entries(
@@ -203,7 +229,16 @@ def sync_incremental_warning_state(
                     )
                     ON CONFLICT (mode, scope_key, dataset_name, rule_code)
                     DO UPDATE SET
-                        status='OPEN',
+                        -- A reviewer-acknowledged row stays down as long as the
+                        -- observed value is unchanged; a changed value reopens it
+                        -- so a materially different failure is never suppressed.
+                        status=CASE
+                            WHEN dq_warning_state.status='ACKNOWLEDGED'
+                                 AND dq_warning_state.acknowledged_fingerprint
+                                     IS NOT DISTINCT FROM EXCLUDED.actual_value
+                            THEN 'ACKNOWLEDGED'
+                            ELSE 'OPEN'
+                        END,
                         last_failed_run_id=EXCLUDED.last_failed_run_id,
                         last_evaluated_run_id=EXCLUDED.last_evaluated_run_id,
                         resolved_run_id=NULL,
@@ -212,7 +247,33 @@ def sync_incremental_warning_state(
                         resolved_at=NULL,
                         observation_count=dq_warning_state.observation_count + 1,
                         reopen_count=dq_warning_state.reopen_count +
-                            CASE WHEN dq_warning_state.status='RESOLVED' THEN 1 ELSE 0 END,
+                            CASE WHEN dq_warning_state.status='RESOLVED'
+                                  OR (dq_warning_state.status='ACKNOWLEDGED'
+                                      AND dq_warning_state.acknowledged_fingerprint
+                                          IS DISTINCT FROM EXCLUDED.actual_value)
+                                 THEN 1 ELSE 0 END,
+                        -- Clear the acknowledgement when the row reopens.
+                        acknowledged_at=CASE
+                            WHEN dq_warning_state.status='ACKNOWLEDGED'
+                                 AND dq_warning_state.acknowledged_fingerprint
+                                     IS NOT DISTINCT FROM EXCLUDED.actual_value
+                            THEN dq_warning_state.acknowledged_at ELSE NULL END,
+                        acknowledged_by=CASE
+                            WHEN dq_warning_state.status='ACKNOWLEDGED'
+                                 AND dq_warning_state.acknowledged_fingerprint
+                                     IS NOT DISTINCT FROM EXCLUDED.actual_value
+                            THEN dq_warning_state.acknowledged_by ELSE NULL END,
+                        review_note=CASE
+                            WHEN dq_warning_state.status='ACKNOWLEDGED'
+                                 AND dq_warning_state.acknowledged_fingerprint
+                                     IS NOT DISTINCT FROM EXCLUDED.actual_value
+                            THEN dq_warning_state.review_note ELSE NULL END,
+                        acknowledged_fingerprint=CASE
+                            WHEN dq_warning_state.status='ACKNOWLEDGED'
+                                 AND dq_warning_state.acknowledged_fingerprint
+                                     IS NOT DISTINCT FROM EXCLUDED.actual_value
+                            THEN dq_warning_state.acknowledged_fingerprint
+                            ELSE NULL END,
                         latest_failed_count=EXCLUDED.latest_failed_count,
                         expected_value=EXCLUDED.expected_value,
                         actual_value=EXCLUDED.actual_value,
@@ -254,7 +315,7 @@ def sync_incremental_warning_state(
                         sample_records=%s::jsonb
                     WHERE mode=%s AND scope_key=%s
                       AND dataset_name=%s AND rule_code=%s
-                      AND status='OPEN'
+                      AND status IN ('OPEN', 'ACKNOWLEDGED')
                     """,
                     (
                         context.run_id,
@@ -285,6 +346,137 @@ def open_warning_counts(conn, mode: str | None = None) -> tuple[int, int]:
         )
         row = cur.fetchone()
     return int(row[0]), int(row[1])
+
+
+def acknowledge_warning(
+    conn,
+    warning_state_id: int,
+    *,
+    note: str | None = None,
+    by: str | None = None,
+) -> bool:
+    """Mark one OPEN worklist row as reviewed & accepted (ACKNOWLEDGED).
+
+    Records the current actual_value as the acknowledgement fingerprint so the
+    row stays down across re-runs while the observed value is unchanged, and
+    reopens automatically if a later run reports a different value. Returns True
+    if a row was updated, False if the id was not OPEN (already acked/resolved
+    or unknown). The caller owns the transaction.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE dq_warning_state
+            SET status='ACKNOWLEDGED',
+                acknowledged_at=now(),
+                acknowledged_by=%s,
+                review_note=%s,
+                acknowledged_fingerprint=actual_value
+            WHERE warning_state_id=%s AND status='OPEN'
+            """,
+            (by, note, warning_state_id),
+        )
+        return cur.rowcount > 0
+
+
+def project_result_history_to_warning_state(
+    conn,
+    *,
+    since=None,
+    modes=None,
+) -> int:
+    """Retroactively seed the worklist from the immutable dq_result log.
+
+    For every WARNING that FAILED on a tracked, CERTIFIED run, take the most
+    recent observation per (mode, scope, dataset, rule) and upsert it into
+    dq_warning_state as OPEN — so warnings already recorded for the whole loaded
+    silver range (before per-run tracking was enabled) show up in the worklist.
+
+    scope_key mirrors the live logic: partition (result or run) -> target_date
+    -> dataset. Rows already ACKNOWLEDGED with an unchanged value are preserved.
+    Returns the number of worklist rows inserted or updated. Idempotent.
+    """
+    tracked = tuple(sorted(modes or WARNING_TRACKED_MODES))
+    params: list = [list(tracked)]
+    since_clause = ""
+    if since is not None:
+        since_clause = "AND r.started_at >= %s"
+        params.append(since)
+    # One row per (mode, scope, dataset, rule): the newest failing observation.
+    # scope_key is computed identically to _warning_scope_key so projected rows
+    # collide with (and update) the ones the live path would create.
+    sql = f"""
+        WITH observation AS (
+            SELECT
+                r.mode,
+                r.run_id,
+                r.started_at,
+                r.target_date,
+                COALESCE(dr.partition_key, r.partition_key) AS eff_partition,
+                dr.dataset_name,
+                dr.rule_code,
+                dr.status,
+                dr.failed_count,
+                dr.expected_value,
+                dr.actual_value,
+                dr.sample_records,
+                CASE
+                    WHEN COALESCE(dr.partition_key, r.partition_key) IS NOT NULL
+                        THEN 'partition=' || COALESCE(dr.partition_key, r.partition_key)
+                    WHEN r.target_date IS NOT NULL
+                        THEN 'date=' || r.target_date::text
+                    ELSE 'dataset=' || dr.dataset_name
+                END AS scope_key
+            FROM dq_result dr
+            JOIN dq_run r ON dr.run_id = r.run_id
+            WHERE dr.severity = 'WARNING'
+              AND r.status = 'CERTIFIED'
+              AND r.mode = ANY(%s)
+              {since_clause}
+        ),
+        ranked AS (
+            -- Rank PASS and FAIL together so a scope cleared by a later PASS is
+            -- not reopened from a stale FAIL: only seed scopes whose most recent
+            -- observation is still a FAIL.
+            SELECT *, row_number() OVER (
+                PARTITION BY mode, scope_key, dataset_name, rule_code
+                ORDER BY started_at DESC, run_id
+            ) AS rn
+            FROM observation
+        )
+        INSERT INTO dq_warning_state (
+            mode, scope_key, target_date, partition_key, dataset_name, rule_code,
+            status, first_seen_run_id, last_failed_run_id, last_evaluated_run_id,
+            observation_count, latest_failed_count, expected_value, actual_value,
+            sample_records
+        )
+        SELECT
+            mode, scope_key, target_date,
+            CASE WHEN eff_partition IS NOT NULL THEN eff_partition END,
+            dataset_name, rule_code, 'OPEN',
+            run_id, run_id, run_id, 1, failed_count, expected_value, actual_value,
+            COALESCE(sample_records, '[]'::jsonb)
+        FROM ranked WHERE rn = 1 AND status = 'FAIL'
+        ON CONFLICT (mode, scope_key, dataset_name, rule_code) DO UPDATE SET
+            status=CASE
+                WHEN dq_warning_state.status='ACKNOWLEDGED'
+                     AND dq_warning_state.acknowledged_fingerprint
+                         IS NOT DISTINCT FROM EXCLUDED.actual_value
+                THEN 'ACKNOWLEDGED' ELSE 'OPEN' END,
+            last_failed_run_id=EXCLUDED.last_failed_run_id,
+            last_evaluated_run_id=EXCLUDED.last_evaluated_run_id,
+            last_failed_at=now(),
+            last_evaluated_at=now(),
+            resolved_run_id=NULL,
+            resolved_at=NULL,
+            latest_failed_count=EXCLUDED.latest_failed_count,
+            expected_value=EXCLUDED.expected_value,
+            actual_value=EXCLUDED.actual_value,
+            sample_records=EXCLUDED.sample_records
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.rowcount
 
 
 def save_metrics(conn, run_id: UUID, bundle) -> None:

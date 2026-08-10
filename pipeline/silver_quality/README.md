@@ -6,11 +6,31 @@ Silver는 이 폴더의 규칙을 통과한 데이터만 담는다. 모든 적�
 `MODIFIED`로 기록한다. FMP는 별도의 source-aware gate를 거치며 ETF/fund·비주식
 상품 제외 건수도 `MODIFIED`에 남긴다. 제외된 원문 행은 Bronze에서 삭제하지 않는다.
 
-인증된 일별 증분의 warning은 `dq_warning_state`에 누적된다. 동일한 실행 모드·
-대상일(또는 명시적 파티션)·데이터셋·규칙을 다시 검사해 PASS가 나올 때만
-`RESOLVED`가 되며, 현재 미해결 항목은 `dq_open_warning`에서 조회한다. 실패하여
-Silver에 publish되지 않은 실행과 전체 감사는 이 상태를 변경하지 않는다.
-최초 마이그레이션은 기존 인증된 증분 이력도 같은 기준으로 초기화한다.
+인증된 warning은 `dq_warning_state` 워크리스트에 누적된다. 일별 증분뿐 아니라
+**Silver에 적재하는 모든 backfill·재구축 모드**(`backfill_candidate`,
+`fmp_backfill_partition`, `dart_dividend_action_backfill` 등)를 추적하므로
+적재된 전 구간의 warning이 한 목록에 모인다(읽기전용 재검사인 `audit` 계열은
+중복을 피하려 제외). 스코프 키는 파티션 → 대상일 → 데이터셋 순으로 안정적으로
+정해져(전 구간 체크는 데이터셋 단위) 재구축을 다시 돌려도 같은 행을 갱신한다.
+동일 스코프·규칙을 다시 검사해 PASS가 나오면 `RESOLVED`가 되고, 현재 미해결
+항목은 `dq_open_warning`에서 조회한다. 실패하여 publish되지 않은 실행과 전체
+감사는 상태를 변경하지 않는다.
+
+대부분의 backfill warning은 구조적·정상(예: DART 미커버 pre-2015 KRX 리셋)이라,
+검토를 마치면 `ACKNOWLEDGED`로 내려 워크리스트에서 제외한다. 확인 시점의
+관측값(fingerprint)이 유지되는 한 재실행돼도 다시 뜨지 않고, 값이 바뀌면 자동
+재오픈된다. 검토 도구:
+
+```bash
+python -m pipeline.silver_quality.review list                 # 미해결 목록
+python -m pipeline.silver_quality.review show --id <n>        # 상세 + 표본
+python -m pipeline.silver_quality.review ack  --id <n> --note "사유" --by <이름>
+python -m pipeline.silver_quality.review project [--since YYYY-MM-DD]  # 이력 소급 시딩(멱등)
+```
+
+`project`는 불변 로그 `dq_result`에서 각 스코프의 **최신 관측이 FAIL인 것만**
+워크리스트로 시딩하므로(이후 PASS로 해소된 스코프는 제외) 안전하게 반복 실행할
+수 있다. migration 008이 ACK 컬럼과 상태를 도입한다.
 
 FMP 편입 범위는 NASDAQ·NYSE·AMEX의 common stock, preferred stock, ADR,
 REIT이다. ETF, fund, ETN, warrant, unit, listed note, 분류가 모호한 행은 제외하고

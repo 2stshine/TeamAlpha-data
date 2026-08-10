@@ -40,6 +40,10 @@ MAX_FDR_Q = 0.10
 MIN_CORRELATION_MONTHS = 36
 MIN_MONTHLY_OBSERVATIONS = 30
 PUBLISH_LOCK_KEY = "teamalpha_gold_publish"
+DIVIDEND_LINEAGE_FACTORS = frozenset({
+    "dividend_event_frequency_ttm",
+    "dividend_yield_ttm",
+})
 
 
 def _month_start(value: str) -> date:
@@ -96,6 +100,67 @@ def _emit_progress(stage: str, **fields: object) -> None:
         {"gold_publish_progress": stage, **fields},
         ensure_ascii=False,
     ), flush=True)
+
+
+def _validate_dividend_lineage(cur) -> dict:
+    """Fail closed when the certified return contract lost its PIT inputs."""
+    cur.execute(
+        """
+        WITH current_contract AS (
+            SELECT quality_run_id,
+                   metadata->>'resolution_version' AS resolution_version,
+                   (metadata->>'action_snapshot_run_id')::uuid
+                       AS action_snapshot_run_id
+            FROM public.price_return_contract
+            WHERE source = 'KRX'
+              AND asset_type = 'stock'
+              AND field_name = 'total_return_close'
+              AND methodology_version = 'krx_gross_dividend_reinvested_v1'
+              AND status = 'CERTIFIED'
+              AND certified_at IS NOT NULL
+        )
+        SELECT
+            (SELECT count(*)
+               FROM current_contract c
+               JOIN public.dividend_event_resolution r
+                 ON r.quality_run_id = c.quality_run_id
+                AND r.resolution_version = c.resolution_version),
+            (SELECT count(*)
+               FROM current_contract c
+               JOIN public.corporate_action ca
+                 ON ca.quality_run_id = c.action_snapshot_run_id),
+            (SELECT count(*)
+               FROM current_contract c
+               JOIN public.dividend_event_resolution r
+                 ON r.quality_run_id = c.quality_run_id
+                AND r.resolution_version = c.resolution_version
+               JOIN public.corporate_action ca
+                 ON ca.asset_id = r.asset_id
+                AND ca.source = r.source
+                AND ca.action_key = r.action_key
+                AND ca.quality_run_id = c.action_snapshot_run_id
+              WHERE r.is_canonical IS TRUE
+                AND r.excluded_reason IS NULL
+                AND r.applied_trade_date IS NOT NULL
+                AND r.adjusted_cash_amount > 0
+                AND ca.announcement_date IS NOT NULL
+                AND ca.source = 'DART_DISCLOSURE'
+                AND ca.action_type = 'cash_dividend'
+                AND ca.action_scope = 'ISSUER')
+        """
+    )
+    resolution_rows, action_rows, canonical_rows = map(int, cur.fetchone())
+    if min(resolution_rows, action_rows, canonical_rows) <= 0:
+        raise ValueError(
+            "인증 배당 Silver lineage가 비어 있습니다: "
+            f"resolution={resolution_rows}, action_snapshot={action_rows}, "
+            f"canonical_join={canonical_rows}"
+        )
+    return {
+        "resolution_rows": resolution_rows,
+        "action_snapshot_rows": action_rows,
+        "canonical_join_rows": canonical_rows,
+    }
 
 
 def load_approval(path: Path = DEFAULT_APPROVAL_PATH) -> dict:
@@ -407,7 +472,8 @@ def _replace_values(
                    count(*)::integer AS observations,
                    count(DISTINCT asset_id)::integer AS assets,
                    count(DISTINCT as_of_date)::integer AS signal_dates,
-                   min(rank)::integer AS min_rank
+                   min(rank)::integer AS min_rank,
+                   count(DISTINCT rank)::integer AS distinct_ranks
             FROM gold.factor_value
             WHERE factor_id = %s
               AND as_of_date >= %s
@@ -419,7 +485,9 @@ def _replace_values(
                bool_and(observations = assets),
                min(signal_dates)::integer,
                max(signal_dates)::integer,
-               bool_and(min_rank = 1)
+               bool_and(min_rank = 1),
+               min(distinct_ranks)::integer,
+               max(distinct_ranks)::integer
         FROM monthly
         """,
         (factor_id, start_date, end_date),
@@ -428,6 +496,7 @@ def _replace_values(
         min_month_observations, max_month_observations,
         unique_asset_months, min_month_signal_dates,
         max_month_signal_dates, monthly_rank_one,
+        min_month_distinct_ranks, max_month_distinct_ranks,
     ) = cur.fetchone()
     if min_month_observations < MIN_MONTHLY_OBSERVATIONS:
         raise ValueError(
@@ -438,6 +507,11 @@ def _replace_values(
         raise ValueError(f"Gold asset-month 중복이 있습니다: {factor_key}")
     if not monthly_rank_one:
         raise ValueError(f"Gold 일부 월에 rank 1이 없습니다: {factor_key}")
+    if min_month_distinct_ranks < 2:
+        raise ValueError(
+            f"Gold 월별 rank가 상수로 퇴화했습니다: {factor_key}, "
+            f"minimum_distinct_ranks={min_month_distinct_ranks}"
+        )
     cur.execute(
         """
         SELECT count(*)::bigint
@@ -469,6 +543,8 @@ def _replace_values(
         "max_month_observations": int(max_month_observations),
         "min_month_distinct_signal_dates": int(min_month_signal_dates),
         "max_month_distinct_signal_dates": int(max_month_signal_dates),
+        "min_month_distinct_ranks": int(min_month_distinct_ranks),
+        "max_month_distinct_ranks": int(max_month_distinct_ranks),
         "silver_signal_date_mismatches": signal_date_mismatches,
         "min_date": str(min_date),
         "max_date": str(max_date),
@@ -777,6 +853,7 @@ def publish(
     correlations: list[dict] = []
     investable_universe: dict = {}
     correlation_values: dict = {}
+    source_preflights: dict = {}
 
     _acquire_publish_lock(conn)
     try:
@@ -805,6 +882,14 @@ def publish(
                     expected_months=expected_months,
                 )
                 _emit_progress("investable_universe", **investable_universe)
+                if DIVIDEND_LINEAGE_FACTORS.intersection(validated):
+                    source_preflights["dividend_lineage"] = (
+                        _validate_dividend_lineage(cur)
+                    )
+                    _emit_progress(
+                        "dividend_lineage",
+                        **source_preflights["dividend_lineage"],
+                    )
                 for factor_key, item in validated.items():
                     factor_ids[factor_key] = _register_metadata(
                         cur, document, factor_key, item,
@@ -874,6 +959,7 @@ def publish(
         "backfill_start_month": start_month,
         "backfill_end_month": end_month,
         "investable_universe": investable_universe,
+        "source_preflights": source_preflights,
         "correlation_values": correlation_values,
         "factors": value_summaries,
         "pairwise_correlations": correlations,

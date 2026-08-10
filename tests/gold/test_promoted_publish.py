@@ -13,13 +13,14 @@ from pipeline.gold.publish import (
     _desired_metadata,
     _month_count,
     _release_publish_lock,
+    _replace_values,
+    _validate_dividend_lineage,
     load_approval,
     validate_approval,
 )
 
 
 SELECTED = {
-    "dividend_yield_ttm",
     "max_daily_return_1m",
     "net_equity_issuance_price_adjusted_12m",
     "realized_volatility_252d",
@@ -31,6 +32,10 @@ def test_approval_selects_only_nonduplicate_promoted_factors():
     document = load_approval()
     assert set(document["factors"]) == SELECTED
     assert "dividend_event_frequency_ttm" not in document["factors"]
+    assert "dividend_yield_ttm" not in document["factors"]
+    assert document["selection"]["excluded_unpublishable"]["factor"] == (
+        "dividend_yield_ttm"
+    )
     assert document["selection"]["selected_pair_max_oos"] < 0.70
 
 
@@ -79,7 +84,7 @@ def test_gold_metadata_keeps_raw_value_and_directional_rank_contract():
 
 def test_approval_document_is_plain_json_for_auditability():
     raw = DEFAULT_APPROVAL_PATH.read_text(encoding="utf-8")
-    assert json.loads(raw)["approval_id"] == "promoted-20260810-nonduplicate-v1"
+    assert json.loads(raw)["approval_id"] == "promoted-20260810-nonduplicate-v2"
     assert Path(DEFAULT_APPROVAL_PATH).suffix == ".json"
 
 
@@ -103,7 +108,7 @@ def test_approval_is_bound_to_an_immutable_research_commit():
 )
 def test_tampered_confirmation_metrics_are_rejected(field, value):
     document = deepcopy(load_approval())
-    evaluation = document["factors"]["dividend_yield_ttm"]["evaluation"]
+    evaluation = document["factors"]["max_daily_return_1m"]["evaluation"]
     evaluation[field] = value
     with pytest.raises(ValueError):
         validate_approval(document)
@@ -162,6 +167,68 @@ def test_correlation_cache_uses_an_equivalent_month_equality_join():
         "signal_months": 1,
         "max_rows_per_asset_month": 1,
     }
+
+
+def test_dividend_lineage_preflight_fails_closed_on_missing_snapshots():
+    class FakeCursor:
+        def execute(self, *_):
+            return None
+
+        def fetchone(self):
+            return (0, 0, 0)
+
+    with pytest.raises(ValueError, match="배당 Silver lineage"):
+        _validate_dividend_lineage(FakeCursor())
+
+
+def test_dividend_lineage_preflight_reports_live_rows():
+    class FakeCursor:
+        def execute(self, *_):
+            return None
+
+        def fetchone(self):
+            return (14560, 16259, 13594)
+
+    assert _validate_dividend_lineage(FakeCursor()) == {
+        "resolution_rows": 14560,
+        "action_snapshot_rows": 16259,
+        "canonical_join_rows": 13594,
+    }
+
+
+def test_constant_monthly_ranks_are_rejected_before_correlation():
+    class FakeCursor:
+        def __init__(self):
+            self.execute_count = 0
+            self.rowcount = -1
+            self.responses = iter([
+                (60, 1, date(2026, 6, 30), date(2026, 6, 30), 1, 0),
+                (60, 60, True, 1, 1, True, 1, 1),
+            ])
+
+        def execute(self, *_):
+            self.execute_count += 1
+            if self.execute_count == 1:
+                self.rowcount = 0
+            elif self.execute_count == 2:
+                self.rowcount = 60
+            else:
+                self.rowcount = -1
+
+        def fetchone(self):
+            return next(self.responses)
+
+    item = validate_approval(load_approval())["max_daily_return_1m"]
+    with pytest.raises(ValueError, match="rank가 상수로 퇴화"):
+        _replace_values(
+            FakeCursor(),
+            factor_id=99,
+            factor_key="max_daily_return_1m",
+            item=item,
+            start_month="2026-06",
+            end_month="2026-06",
+            expected_months=1,
+        )
 
 
 def test_publisher_lock_is_session_scoped_and_committed_before_snapshot():

@@ -1,5 +1,5 @@
 {
-  "approval_id": "promoted-20260810-nonduplicate-v1",
+  "approval_id": "promoted-20260810-nonduplicate-v2",
   "approval_source": "explicit_user_request_in_codex_thread",
   "ruleset_version": "fr-3.10.1",
   "research_source": {
@@ -15,30 +15,19 @@
     "excluded_duplicate": {
       "factor": "dividend_event_frequency_ttm",
       "representative": "dividend_yield_ttm",
+      "representative_publication_status": "EXCLUDED_BROKEN_SILVER_LINEAGE",
       "discovery_median_absolute_correlation": 0.917466,
       "oos_median_absolute_correlation": 0.923154
+    },
+    "excluded_unpublishable": {
+      "factor": "dividend_yield_ttm",
+      "reason": "인증 총수익률 계약이 참조하는 dividend_event_resolution 및 corporate_action snapshot이 live Silver에 존재하지 않아 전 종목 값이 0으로 퇴화함",
+      "observed_at": "2026-08-10",
+      "observed_resolution_rows": 0,
+      "observed_action_snapshot_rows": 0
     }
   },
   "factors": {
-    "dividend_yield_ttm": {
-      "version": 1,
-      "description": "최근 12개월 PIT 현금배당 합계를 월말 분할조정 주가로 나눈 배당수익률. 값이 높을수록 선호 순위가 높다.",
-      "campaign_id": "campaign-20260808-001",
-      "implementation_sha256": "5f94163be461e32a9771e7e7e7424de911a3700cef685a2599be75c96ced063c",
-      "evaluation": {
-        "passed": true,
-        "verdict": "PROMOTE",
-        "discovery_investable_rank_ic": 0.06696557008836772,
-        "oos_rank_ic": 0.12526611532256016,
-        "oos_required_rank_ic": 0.03348278504418386,
-        "oos_rank_ic_retention": 1.8706047773095797,
-        "oos_by_qvalue": 3.1012790425012384e-11,
-        "oos_signal_months": 36,
-        "oos_start": "2023-06",
-        "oos_end": "2026-05",
-        "oos_evidence_class": "HISTORICAL_REUSED_WINDOW"
-      }
-    },
     "max_daily_return_1m": {
       "version": 1,
       "description": "최근 한 달의 최대 일별 총수익률. 복권형 급등이 작을수록 선호 순위가 높다.",

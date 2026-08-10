@@ -10,7 +10,12 @@
 
 ## 결론
 
-- 현재 배포 ruleset: **1.25.0**, ECS daily task definition **111**
+- 현재 배포 ruleset: **1.25.0**, ECS daily task definition **122** (image `f1602f5`)
+- **warning 워크리스트 확장**: 이제 daily뿐 아니라 모든 backfill·재구축 모드의
+  warning을 `dq_warning_state`로 추적하고, 검토 후 `ACKNOWLEDGED`로 내릴 수 있다
+  (migration **008**, `pipeline.silver_quality.review`). 적재 전 구간 이력을 소급
+  시딩: **OPEN 2,267 scope / 252,602행** (최다 `SOURCE_INCOMPLETE_OHLC` 168,972행
+  = pre-2015 marcap 불완전 OHLC, 구조적)
 - **KRX 히스토리 1995-05-02~2026-08-06 확장 완료** (15,149,757행 / 6,677자산, 전체 재구축 `fc97e8e9`, 무결성 0)
 - FMP 재적재 완료 (14,530,164행 / 8,720자산, `e44c65d3`)
 - FMP 원자재 28종 2015~2026 백필: **CERTIFIED**, one-off task definition **95**
@@ -20,7 +25,8 @@
 - 미인증 Silver 행: 모든 핵심 테이블 **0**
 - 핵심 NULL·비양수 가격·현재 식별자 중복: **0**
 - RDS Critical/Error guard 5개: 모두 **validated=true**
-- 현재 OPEN warning: **11개 검사 범위, 42건**
+- 현재 OPEN warning: **2,267개 검사 범위** (backfill 소급 포함; 이전 daily-only
+  집계는 11범위·42건이었음 — 측정 대상 확장)
 
 현재 데이터는 전략 개발에 사용할 수 있는 인증 상태다. 다만 Warning은 원천값을
 보존한 검토 대상이며, 아래 항목을 해소된 데이터로 간주하면 안 된다.

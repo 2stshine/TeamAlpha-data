@@ -7,9 +7,10 @@ RDS가 사설망이라 로컬에서 직접 적재할 수 없으므로 VPC 내부
   1. marcap/krxapi/index/DART Bronze 전체를 /app/data로 내려받고
   2. (다운로드 성공 후) Silver 5개 테이블을 TRUNCATE 하고
   3. s3_backfill.run() 으로 1995~현재 KRX/DART 전체를 재구축·인증하고
-  4. TRUNCATE 로 함께 지워진 FMP(미국주식·재무·기업행사·USDKRW·원자재)를
-     fmp_backfill_ecs.run_silver_range 로 재적재한다. (3만 하고 4를 빠뜨리면
-     FMP 가 통째로 사라진다.)
+  4. TRUNCATE 로 함께 지워졌지만 s3_backfill 이 복구하지 않는 나머지 소스를
+     재적재한다: FMP(fmp_backfill_ecs.run_silver_range)와 DART 정기보고서 배당
+     (dart_silver_backfill_ecs.run_dart_extras). (3만 하고 4를 빠뜨리면 FMP·DART
+     DIVIDEND 가 통째로 사라진다.)
 
 파괴적 TRUNCATE는 반드시 실행 전에 RDS 스냅샷을 만든 뒤, ``--confirm REBUILD``
 (또는 env ``KRX_HISTORY_REBUILD_CONFIRM=REBUILD``)를 명시했을 때만 수행한다.
@@ -188,10 +189,26 @@ def run(
     run_id = s3_backfill.run(src="local", resume=resume)
     print(f"[krx-rebuild] s3_backfill certified run={run_id}", flush=True)
 
-    # 3) TRUNCATE 는 FMP 행도 지웠고 s3_backfill 은 KRX/DART 만 복구하므로,
-    #    FMP(미국주식·재무·기업행사·USDKRW·원자재)를 source-scoped 로 재적재한다.
-    #    이 단계를 빼면 FMP 가 통째로 사라진다.
+    # 3) TRUNCATE 로 함께 지워졌지만 s3_backfill(KRX/DART 주요계정·기업행사)이
+    #    복구하지 않는 나머지 소스를 각자의 로더로 source-scoped 재적재한다.
+    #    이 단계를 빼면 해당 데이터가 통째로 사라진다.
+    #    - FMP: 미국주식·재무·기업행사·USDKRW·원자재
+    #    - DART dart-extras: 정기보고서 배당(fundamental DIVIDEND/REPORTED) 등
     _reload_fmp()
+    _reload_dart_extras()
+
+
+def _reload_dart_extras() -> None:
+    """Reload DART dividend-report fundamentals (DIVIDEND/REPORTED) etc.
+
+    These come from dart_silver_backfill_ecs.run_dart_extras (dividends.py /
+    alotMatter), not s3_backfill, so a full rebuild drops them otherwise.
+    """
+    from pipeline import dart_silver_backfill_ecs
+
+    print("[krx-rebuild] reloading DART dart-extras (DIVIDEND reports)", flush=True)
+    dart_silver_backfill_ecs.run_dart_extras()
+    print("[krx-rebuild] DART dart-extras reload complete", flush=True)
 
 
 def _reload_fmp() -> None:

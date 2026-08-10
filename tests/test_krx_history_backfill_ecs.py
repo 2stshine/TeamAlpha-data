@@ -47,6 +47,8 @@ def test_rebuild_reloads_fmp_after_s3_backfill(monkeypatch):
     monkeypatch.setattr(rebuild, "_truncate_silver", lambda: calls.append("truncate"))
     monkeypatch.setattr(rebuild.s3_backfill, "run", lambda **k: calls.append("s3_backfill") or "run-id")
     monkeypatch.setattr(rebuild, "_reload_fmp", lambda: calls.append("reload_fmp"))
+    monkeypatch.setattr(rebuild, "_reload_dart_extras", lambda: calls.append("reload_dart"))
     rebuild.run(confirm="REBUILD")
-    # FMP reload must run after the KRX/DART rebuild so it isn't left wiped.
-    assert calls == ["truncate", "s3_backfill", "reload_fmp"]
+    # FMP and DART-extras reloads must run after the KRX/DART rebuild so the
+    # truncate doesn't leave them wiped.
+    assert calls == ["truncate", "s3_backfill", "reload_fmp", "reload_dart"]

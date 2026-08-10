@@ -1,4 +1,5 @@
 from copy import deepcopy
+from datetime import date
 import json
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from pipeline.gold.run import build_upsert_sql
 from pipeline.gold.publish import (
     DEFAULT_APPROVAL_PATH,
     _acquire_publish_lock,
+    _build_correlation_values,
     _desired_metadata,
     _month_count,
     _release_publish_lock,
@@ -126,6 +128,40 @@ def test_upsert_wrapper_cannot_write_outside_approved_month_range():
     )
     assert "as_of_date >= %(start_month)s::date" in sql
     assert "as_of_date < (%(end_month)s::date + interval '1 month')" in sql
+
+
+def test_correlation_cache_uses_an_equivalent_month_equality_join():
+    class FakeCursor:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement, params=None):
+            self.statements.append((statement, params))
+
+        def fetchall(self):
+            return [(17, 2, 1, 1)]
+
+    cur = FakeCursor()
+    summary = _build_correlation_values(
+        cur,
+        factor_ids={"example": 17},
+        start_month="2026-01",
+        end_month="2026-01",
+    )
+
+    create_sql, params = cur.statements[0]
+    assert (
+        "date_trunc('month', v.as_of_date)::date = u.signal_month"
+        in create_sql
+    )
+    assert "v.as_of_date >= u.signal_month" not in create_sql
+    assert "v.as_of_date < (u.signal_month + interval '1 month')" not in create_sql
+    assert params == ([17], date(2026, 1, 1), date(2026, 1, 1))
+    assert summary["factors"]["example"] == {
+        "rows": 2,
+        "signal_months": 1,
+        "max_rows_per_asset_month": 1,
+    }
 
 
 def test_publisher_lock_is_session_scoped_and_committed_before_snapshot():

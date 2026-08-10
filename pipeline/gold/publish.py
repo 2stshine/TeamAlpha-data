@@ -581,7 +581,7 @@ def _build_investable_universe(
     cur.execute("ANALYZE gold_publish_investable_universe")
     cur.execute(
         """
-        SELECT count(*)::bigint,
+        SELECT sum(monthly_observations)::bigint,
                count(DISTINCT signal_month)::integer,
                min(monthly_observations)::integer,
                max(monthly_observations)::integer
@@ -629,8 +629,7 @@ def _build_correlation_values(
         FROM gold_publish_investable_universe u
         JOIN gold.factor_value v
           ON v.asset_id = u.asset_id
-         AND v.as_of_date >= u.signal_month
-         AND v.as_of_date < (u.signal_month + interval '1 month')
+         AND date_trunc('month', v.as_of_date)::date = u.signal_month
         WHERE v.factor_id = ANY(%s)
           AND v.as_of_date >= %s::date
           AND v.as_of_date < (%s::date + interval '1 month')

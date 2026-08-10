@@ -38,3 +38,15 @@ def test_dry_run_skips_confirm_and_truncate(monkeypatch):
     # no confirm needed for dry-run; must not truncate
     rebuild.run(confirm=None, dry_run=True)
     assert calls == ["dry_run"]
+
+
+def test_rebuild_reloads_fmp_after_s3_backfill(monkeypatch):
+    monkeypatch.setenv("S3_BRONZE_BUCKET", "b")
+    calls = []
+    monkeypatch.setattr(rebuild, "_download_prefixes", lambda *a, **k: 10)
+    monkeypatch.setattr(rebuild, "_truncate_silver", lambda: calls.append("truncate"))
+    monkeypatch.setattr(rebuild.s3_backfill, "run", lambda **k: calls.append("s3_backfill") or "run-id")
+    monkeypatch.setattr(rebuild, "_reload_fmp", lambda: calls.append("reload_fmp"))
+    rebuild.run(confirm="REBUILD")
+    # FMP reload must run after the KRX/DART rebuild so it isn't left wiped.
+    assert calls == ["truncate", "s3_backfill", "reload_fmp"]

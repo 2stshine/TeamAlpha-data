@@ -6,7 +6,10 @@ RDS가 사설망이라 로컬에서 직접 적재할 수 없으므로 VPC 내부
 
   1. marcap/krxapi/index/DART Bronze 전체를 /app/data로 내려받고
   2. (다운로드 성공 후) Silver 5개 테이블을 TRUNCATE 하고
-  3. s3_backfill.run() 으로 1995~현재 전체를 재구축·인증한다.
+  3. s3_backfill.run() 으로 1995~현재 KRX/DART 전체를 재구축·인증하고
+  4. TRUNCATE 로 함께 지워진 FMP(미국주식·재무·기업행사·USDKRW·원자재)를
+     fmp_backfill_ecs.run_silver_range 로 재적재한다. (3만 하고 4를 빠뜨리면
+     FMP 가 통째로 사라진다.)
 
 파괴적 TRUNCATE는 반드시 실행 전에 RDS 스냅샷을 만든 뒤, ``--confirm REBUILD``
 (또는 env ``KRX_HISTORY_REBUILD_CONFIRM=REBUILD``)를 명시했을 때만 수행한다.
@@ -27,6 +30,10 @@ from pipeline.silver_quality import s3_backfill
 _DOWNLOAD_WORKERS = 32
 
 CONFIRM_TOKEN = "REBUILD"
+# The full rebuild truncates ALL Silver tables, but s3_backfill only rebuilds
+# KRX/DART. FMP lives in the same tables and must be reloaded afterwards or it
+# is silently wiped. FMP price/financial bronze starts in 2015.
+FMP_SILVER_FROM_YEAR = 2015
 
 # s3_backfill 의 _candidate_bundle 이 읽는 KRX/DART Bronze 전체.
 BRONZE_PREFIXES = (
@@ -177,9 +184,29 @@ def run(
     if not resume:
         _truncate_silver()
 
-    # 2) 전기간 일괄 재구축·인증.
+    # 2) 전기간 일괄 재구축·인증 (KRX/DART).
     run_id = s3_backfill.run(src="local", resume=resume)
     print(f"[krx-rebuild] s3_backfill certified run={run_id}", flush=True)
+
+    # 3) TRUNCATE 는 FMP 행도 지웠고 s3_backfill 은 KRX/DART 만 복구하므로,
+    #    FMP(미국주식·재무·기업행사·USDKRW·원자재)를 source-scoped 로 재적재한다.
+    #    이 단계를 빼면 FMP 가 통째로 사라진다.
+    _reload_fmp()
+
+
+def _reload_fmp() -> None:
+    """Reload FMP silver after a KRX/DART rebuild truncated the shared tables."""
+    from datetime import date
+
+    from pipeline import fmp_backfill_ecs
+
+    to_year = date.today().year
+    print(
+        f"[krx-rebuild] reloading FMP silver {FMP_SILVER_FROM_YEAR}-{to_year}",
+        flush=True,
+    )
+    fmp_backfill_ecs.run_silver_range(FMP_SILVER_FROM_YEAR, to_year)
+    print("[krx-rebuild] FMP silver reload complete", flush=True)
 
 
 def parse_args() -> argparse.Namespace:

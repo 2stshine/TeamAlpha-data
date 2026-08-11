@@ -88,6 +88,23 @@
 
 ---
 
+## 2b. Point-in-Time / 정정본(restatement) — look-ahead 방지 (필수)
+
+DART 재무는 **정정본이 존재**한다(같은 period_end이 여러 revision으로 저장, 각자
+`available_date` 보유 — 32,403 scope, 그중 98.6%가 서로 다른 available_date). 백테스트가
+**최신 revision을 그냥 쓰면 미래 정보(look-ahead)** 가 새어든다.
+
+**올바른 as-of 선택 (날짜 D 시점에 실제 이용 가능했던 값만):**
+```sql
+SELECT DISTINCT ON (asset_id, period_end, fs_type, metric) *
+FROM fundamental
+WHERE source='DART' AND available_date <= :as_of_date
+ORDER BY asset_id, period_end, fs_type, metric,
+         available_date DESC, revision_key DESC;
+```
+- `available_date <= as_of_date`로 자르고, 각 스코프에서 **available_date 최댓값(그 시점 최신 정정본)** 하나만 취한다.
+- `FUNDAMENTAL_PIT_ORDER`(CRITICAL)가 `available_date > period_end`(공시 후 이용가능)를 보장하지만, **as-of 선택은 쿼리 쪽 책임**이다. "무조건 최신 revision" 금지.
+
 ## 3. 조용한-편향 함정 (반드시 인지)
 
 1. **총수익 ≠ 가격수익:** 총수익은 `total_return_close`, 가격수익은 `adj_close`. 섞지 말 것.

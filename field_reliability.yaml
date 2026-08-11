@@ -74,6 +74,11 @@ tables:
     layout: "long format: (metric, value) per (asset_id, period_end, fiscal_period, fs_type, revision_key)"
     pit_field: available_date
     pit_note: "look-ahead-safe: available_date > period_end, enforced CRITICAL (FUNDAMENTAL_PIT_ORDER)"
+    restatements:
+      present: true
+      note: "DART carries restatements: same period_end has multiple revision_key, each with its own available_date"
+      as_of_rule: "select latest revision per (asset_id, period_end, fs_type, metric) with available_date <= as_of_date; NEVER just the latest revision (that is look-ahead)"
+      as_of_sql: "SELECT DISTINCT ON (asset_id,period_end,fs_type,metric) * FROM fundamental WHERE source='DART' AND available_date <= :as_of ORDER BY asset_id,period_end,fs_type,metric,available_date DESC,revision_key DESC"
     dart:
       validated: true
       validations: [FUNDAMENTAL_VALUE_PLAUSIBILITY, FUNDAMENTAL_ACCOUNTING_EQUATION_GROSS, DIVIDEND_NONNEGATIVE, FUNDAMENTAL_PIT_ORDER]

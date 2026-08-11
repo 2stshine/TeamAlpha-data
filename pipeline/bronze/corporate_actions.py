@@ -33,11 +33,13 @@ import io
 import json
 import os
 import re
+import tempfile
 import time
 import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Iterator
 
 import requests
@@ -47,8 +49,6 @@ from pipeline.common.paths import base_uri
 from pipeline.common.sink import (
     exists,
     read_bytes,
-    write_bytes,
-    write_text_if_changed,
 )
 
 API_ROOT = "https://opendart.fss.or.kr/api"
@@ -204,6 +204,36 @@ class _BronzeWriter:
         self._futures[future] = path
         return True
 
+    @staticmethod
+    def _atomic_local_write(path: str, data: bytes) -> None:
+        """Durably replace one local object without exposing partial bytes."""
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+            # Persist the directory entry as well as the file contents.  Some
+            # platforms/filesystems do not permit directory fsync; an atomic
+            # replace has still completed safely in that case.
+            try:
+                directory_fd = os.open(target.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
     def save_json(self, row: object, path: str) -> bool:
         rendered = json.dumps(
             row,
@@ -212,14 +242,19 @@ class _BronzeWriter:
         )
         if self._executor is not None:
             return self._submit(path, rendered.encode("utf-8"))
-        return write_text_if_changed(rendered, path)
+        encoded = rendered.encode("utf-8")
+        target = Path(path)
+        if target.is_file() and target.read_bytes() == encoded:
+            return False
+        self._atomic_local_write(path, encoded)
+        return True
 
     def save_bytes(self, data: bytes, path: str) -> bool:
         if self._executor is not None:
             return self._submit(path, data)
         if exists(path):
             return False
-        write_bytes(data, path)
+        self._atomic_local_write(path, data)
         return True
 
     def close(self) -> None:
@@ -253,9 +288,12 @@ DOCUMENT_KEYWORDS = (
     "주식분할",
     "액면병합",
     "주식병합",
+    "권배락",
     "권리락",
     "배당락",
     "현금현물배당결정",
+    "주식배당결정",
+    "무상증자결정",
 )
 
 # 목록 JSON만으로 공시 발생과 접수일을 보존한다. 가격조정 효력일·비율을
@@ -322,8 +360,12 @@ def _fetch_json(
     *,
     tries: int = 4,
 ) -> dict:
-    last_error: Exception | None = None
+    endpoint = url.split("?", 1)[0].split("#", 1)[0].rsplit("/", 1)[-1]
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", endpoint):
+        endpoint = "unknown"
+    last_failure: tuple[str, int | None] | None = None
     for attempt in range(tries):
+        failure: tuple[str, int | None] | None = None
         try:
             response = requests.get(url, params=params, timeout=60)
             response.raise_for_status()
@@ -331,7 +373,7 @@ def _fetch_json(
             status = str(payload.get("status") or "")
             if status == "020":
                 raise QuotaExceeded(
-                    f"OpenDART quota exceeded: endpoint={url.rsplit('/', 1)[-1]}"
+                    f"OpenDART quota exceeded: endpoint={endpoint}"
                 )
             if status == "800" and attempt + 1 < tries:
                 time.sleep(2 * (attempt + 1))
@@ -339,8 +381,8 @@ def _fetch_json(
             if status not in {"000", "013"}:
                 raise DartApiError(
                     "OpenDART error: "
-                    f"endpoint={url.rsplit('/', 1)[-1]}, "
-                    f"status={status}, message={payload.get('message')}"
+                    f"endpoint={endpoint}, "
+                    f"status={status}"
                 )
             return payload
         except QuotaExceeded:
@@ -348,15 +390,40 @@ def _fetch_json(
         except DartApiError:
             raise
         except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            if attempt + 1 < tries:
-                time.sleep(2 * (attempt + 1))
-    raise DartApiError(f"OpenDART JSON request failed: {url}") from last_error
+            # Never retain or chain requests exceptions.  Their URL includes
+            # ``crtfc_key`` and therefore their string/repr/traceback can expose
+            # the DART secret.  Only non-secret failure metadata survives.
+            raw_status = getattr(
+                getattr(exc, "response", None),
+                "status_code",
+                None,
+            )
+            status_code = raw_status if isinstance(raw_status, int) else None
+            failure = (
+                type(exc).__name__,
+                status_code,
+            )
+            response = None
+        assert failure is not None
+        last_failure = failure
+        if attempt + 1 < tries:
+            time.sleep(2 * (attempt + 1))
+    # Do not retain the caller's secret-bearing params in this traceback frame.
+    del params, url
+    failure_name, status_code = last_failure or ("UnknownError", None)
+    status = f", http_status={status_code}" if status_code is not None else ""
+    # This raise deliberately occurs outside the ``except`` block and suppresses
+    # implicit chaining, so even ``__context__`` cannot retain a secret URL.
+    raise DartApiError(
+        "OpenDART JSON request failed: "
+        f"endpoint={endpoint}, failure={failure_name}{status}"
+    ) from None
 
 
 def _fetch_document(rcept_no: str, *, tries: int = 4) -> bytes:
-    last_error: Exception | None = None
+    last_failure: tuple[str, int | None] | None = None
     for attempt in range(tries):
+        failure: tuple[str, int | None] | None = None
         try:
             response = requests.get(
                 DOCUMENT_URL,
@@ -379,19 +446,34 @@ def _fetch_document(rcept_no: str, *, tries: int = 4) -> bytes:
                 raise DocumentUnavailable(rcept_no, rendered)
             raise DartApiError(
                 f"OpenDART document is not ZIP: rcept_no={rcept_no}, "
-                f"response={rendered[:200]}"
+                f"response_bytes={len(content)}"
             )
         except QuotaExceeded:
             raise
         except DartApiError:
             raise
         except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            if attempt + 1 < tries:
-                time.sleep(2 * (attempt + 1))
+            raw_status = getattr(
+                getattr(exc, "response", None),
+                "status_code",
+                None,
+            )
+            status_code = raw_status if isinstance(raw_status, int) else None
+            failure = (
+                type(exc).__name__,
+                status_code,
+            )
+            response = None
+        assert failure is not None
+        last_failure = failure
+        if attempt + 1 < tries:
+            time.sleep(2 * (attempt + 1))
+    failure_name, status_code = last_failure or ("UnknownError", None)
+    status = f", http_status={status_code}" if status_code is not None else ""
     raise DartApiError(
-        f"OpenDART document request failed: rcept_no={rcept_no}"
-    ) from last_error
+        "OpenDART document request failed: "
+        f"rcept_no={rcept_no}, failure={failure_name}{status}"
+    ) from None
 
 
 def _disclosure_path(base: str, row: dict, ticker: str) -> str:
@@ -522,6 +604,7 @@ def run(
     document_shard_index: int | None = None,
     document_shard_count: int | None = None,
     changed_sink: list[str] | None = None,
+    base_override: str | None = None,
 ) -> list[str]:
     """기간 내 기업행사 원본을 수집하고 Silver 입력 URI를 반환한다.
 
@@ -544,7 +627,15 @@ def run(
         or not 0 <= document_shard_index < document_shard_count
     ):
         raise ValueError("invalid document shard index/count")
-    base = base_uri(dest)
+    if base_override is not None:
+        requested_base = Path(base_override).expanduser()
+        if dest != "local":
+            raise ValueError("base_override is mutually exclusive with S3 dest")
+        if not requested_base.is_absolute():
+            raise ValueError("base_override must be an absolute local path")
+        base = str(requested_base.resolve())
+    else:
+        base = base_uri(dest)
     corps = financials.ensure_corp_code_xml(base)
     corp_to_stock = dict(corps)
     writer = _BronzeWriter(base)
@@ -564,17 +655,20 @@ def run(
                 dependency_fromdate or fromdate,
                 todate,
             ))
+        # v3 discovery re-runs the list API after adding 권배락.  Neither the
+        # older discovery body nor its completion markers may be reused: they
+        # prove completeness only for the earlier keyword sets.
         structured_marker = _manifest_path(
             base,
             fromdate,
             todate,
-            "structured_complete",
+            "structured_complete_v3",
         )
         discovery_manifest_path = _manifest_path(
             base,
             fromdate,
             todate,
-            "disclosures",
+            "disclosures_v3",
         )
         manifest_bytes = read_bytes(discovery_manifest_path)
         if manifest_bytes is not None:
@@ -585,46 +679,39 @@ def run(
                 flush=True,
             )
         else:
-            discovered_rows = []
-            if writer.exists(structured_marker):
-                discovered_rows = writer.recover_disclosures(
-                    fromdate,
-                    todate,
-                )
-            if not discovered_rows:
-                windows = list(_month_windows(fromdate, todate))
-                discovered_by_receipt: dict[str, dict] = {}
-                with ThreadPoolExecutor(max_workers=API_WORKERS) as executor:
-                    discovery_futures = [
-                        executor.submit(
-                            _discover_window,
-                            api_key,
-                            window_start,
-                            window_end,
-                        )
-                        for window_start, window_end in windows
-                    ]
-                    for completed_windows, future in enumerate(
-                        as_completed(discovery_futures),
-                        start=1,
-                    ):
-                        window_end, rows, calls = future.result()
-                        list_calls += calls
-                        for row in rows:
-                            rcept_no = str(row.get("rcept_no") or "")
-                            if re.fullmatch(r"\d{14}", rcept_no):
-                                discovered_by_receipt[rcept_no] = row
-                        print(
-                            "[corporate-actions] discovery "
-                            f"{completed_windows}/{len(windows)} "
-                            f"window_end={window_end.isoformat()} "
-                            f"rows={len(discovered_by_receipt)}",
-                            flush=True,
-                        )
-                discovered_rows = [
-                    discovered_by_receipt[key]
-                    for key in sorted(discovered_by_receipt)
+            windows = list(_month_windows(fromdate, todate))
+            discovered_by_receipt: dict[str, dict] = {}
+            with ThreadPoolExecutor(max_workers=API_WORKERS) as executor:
+                discovery_futures = [
+                    executor.submit(
+                        _discover_window,
+                        api_key,
+                        window_start,
+                        window_end,
+                    )
+                    for window_start, window_end in windows
                 ]
+                for completed_windows, future in enumerate(
+                    as_completed(discovery_futures),
+                    start=1,
+                ):
+                    window_end, rows, calls = future.result()
+                    list_calls += calls
+                    for row in rows:
+                        rcept_no = str(row.get("rcept_no") or "")
+                        if re.fullmatch(r"\d{14}", rcept_no):
+                            discovered_by_receipt[rcept_no] = row
+                    print(
+                        "[corporate-actions] discovery "
+                        f"{completed_windows}/{len(windows)} "
+                        f"window_end={window_end.isoformat()} "
+                        f"rows={len(discovered_by_receipt)}",
+                        flush=True,
+                    )
+            discovered_rows = [
+                discovered_by_receipt[key]
+                for key in sorted(discovered_by_receipt)
+            ]
             if writer.save_json(discovered_rows, discovery_manifest_path):
                 changed_paths.append(discovery_manifest_path)
 
@@ -739,13 +826,14 @@ def run(
                 changed_paths.append(structured_marker)
 
         if download_documents:
-            # v2는 현금·현물배당결정 원문을 추가한다. 기존 v1 완료 marker가
-            # 있어도 한 번 더 후보를 검사하되 이미 받은 ZIP은 재사용한다.
+            # v5는 무상증자 결정/정정 원문까지 추가한다. 기존 v4 완료
+            # marker는 더 좁은 후보집합만 증명하므로 재사용하지 않는다.
+            # 이미 받은 immutable ZIP 자체는 content body로 재사용한다.
             documents_marker = _manifest_path(
                 base,
                 fromdate,
                 todate,
-                "documents_complete_v2",
+                "documents_complete_v5",
             )
             if writer.exists(documents_marker):
                 print(
@@ -824,7 +912,7 @@ def run(
                     time.sleep(CALL_GAP_SEC)
                 # Shards deliberately do not claim global completion.  A final
                 # unsharded resume sees no missing documents and writes the
-                # single authoritative v2 marker.
+                # single authoritative v5 marker.
                 if document_shard_count is None:
                     marker = {
                         "status": "COMPLETE",
@@ -853,7 +941,7 @@ def run(
     return sorted(set(changed_paths) | dependency_paths)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -862,13 +950,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--to", dest="todate", required=True, help="YYYYMMDD")
     parser.add_argument("--dest", choices=["local", "s3"], default="local")
     parser.add_argument(
+        "--base",
+        help="absolute local snapshot root (cannot be combined with --dest s3)",
+    )
+    parser.add_argument(
         "--no-documents",
         action="store_true",
         help="전용 API 없는 공시의 ZIP 원문 다운로드 생략",
     )
     parser.add_argument("--document-shard-index", type=int)
     parser.add_argument("--document-shard-count", type=int)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -880,6 +972,7 @@ def main() -> None:
         download_documents=not args.no_documents,
         document_shard_index=args.document_shard_index,
         document_shard_count=args.document_shard_count,
+        base_override=args.base,
     )
 
 

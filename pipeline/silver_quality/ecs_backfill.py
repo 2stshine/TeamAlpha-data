@@ -18,6 +18,9 @@ from urllib.parse import urlparse
 import boto3
 
 from pipeline.common import db
+from pipeline.silver.return_contract import (
+    acquire_return_writer_transaction_lock,
+)
 from pipeline.silver_quality import audit, backfill, s3_backfill
 from pipeline.silver_quality.migrate import MIGRATIONS_DIR
 
@@ -175,6 +178,7 @@ def _prepare_rds(*, s3_candidate_mode: bool, resume: bool) -> None:
     conn = db.connect()
     try:
         with conn.transaction():
+            acquire_return_writer_transaction_lock(conn)
             with conn.cursor() as cur:
                 cur.execute("SELECT current_database()")
                 actual_database = cur.fetchone()[0]

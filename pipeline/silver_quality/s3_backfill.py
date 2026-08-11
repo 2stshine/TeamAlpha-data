@@ -14,6 +14,9 @@ import pandas as pd
 
 from pipeline.common import db
 from pipeline.silver import assets, corporate_actions, financials, prices
+from pipeline.silver.return_contract import (
+    acquire_return_writer_transaction_lock,
+)
 from pipeline.silver_quality import repository
 from pipeline.silver_quality.backfill import (
     PUBLISH_LOCK_ID,
@@ -277,6 +280,7 @@ def _publish(
         autovacuum_disabled = True
 
         with conn.transaction():
+            acquire_return_writer_transaction_lock(conn)
             krx_map = assets.publish(
                 conn, bundle.assets, bundle.identifiers, context.run_id,
             )

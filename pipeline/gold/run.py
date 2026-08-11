@@ -19,7 +19,7 @@ ALLOWED_SILVER_RELATIONS = frozenset({
     "public.corporate_action",
     "public.dq_run",
     "public.fundamental",
-    "public.price_daily",
+    "public.factor_price_feature_daily",
 })
 
 

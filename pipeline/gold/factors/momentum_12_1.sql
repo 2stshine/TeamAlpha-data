@@ -7,7 +7,7 @@
 -- 호출자는 %(factor_id)s를 전달하고 transaction을 소유한다.
 WITH market_calendar AS (
     SELECT DISTINCT trade_date
-    FROM public.price_daily
+    FROM public.factor_price_feature_daily
     WHERE source = 'KRX'
       AND market IN ('KOSPI', 'KOSDAQ')
 ),
@@ -30,15 +30,15 @@ raw_values AS (
             / p_start.adj_close::double precision
         ) - 1.0 AS value
     FROM anchors
-    JOIN public.price_daily p_asof
+    JOIN public.factor_price_feature_daily p_asof
       ON p_asof.source = 'KRX'
      AND p_asof.trade_date = anchors.as_of_date
      AND p_asof.market IN ('KOSPI', 'KOSDAQ')
-    JOIN public.price_daily p_end
+    JOIN public.factor_price_feature_daily p_end
       ON p_end.asset_id = p_asof.asset_id
      AND p_end.source = 'KRX'
      AND p_end.trade_date = anchors.signal_end_date
-    JOIN public.price_daily p_start
+    JOIN public.factor_price_feature_daily p_start
       ON p_start.asset_id = p_end.asset_id
      AND p_start.source = 'KRX'
      AND p_start.trade_date = anchors.signal_start_date

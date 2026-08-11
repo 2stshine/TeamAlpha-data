@@ -16,6 +16,9 @@ import pandas as pd
 from pipeline.common import db
 from pipeline.common.paths import base_uri
 from pipeline.silver import assets, corporate_actions, financials, prices
+from pipeline.silver.return_contract import (
+    acquire_return_writer_transaction_lock,
+)
 from pipeline.silver_quality import repository, staging
 from pipeline.silver_quality.models import (
     CandidateBundle,
@@ -241,6 +244,7 @@ def _publish(conn, context, bundle: CandidateBundle, results) -> None:
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (PUBLISH_LOCK_ID,))
+        acquire_return_writer_transaction_lock(conn)
         _assert_final_empty(conn)
         krx_map = assets.publish(
             conn, bundle.assets, bundle.identifiers, context.run_id,

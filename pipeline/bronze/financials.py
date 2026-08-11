@@ -57,6 +57,10 @@ class QuotaExceeded(Exception):
     """OpenDART 사용한도 초과(status 020)."""
 
 
+class CorpCodeDownloadError(RuntimeError):
+    """Secret-free failure raised when the DART corp-code download fails."""
+
+
 def _parse_listed_corps(xml_bytes: bytes) -> list[tuple[str, str]]:
     """corpCode.xml bytes → [(corp_code, stock_code)] (상장사=stock_code 있음, 상폐 포함)."""
     root = ET.fromstring(xml_bytes)
@@ -71,9 +75,39 @@ def _parse_listed_corps(xml_bytes: bytes) -> list[tuple[str, str]]:
 
 def _download_corp_code_xml() -> bytes:
     """OpenDART corpCode.zip 다운로드 후 내부 CORPCODE.xml bytes 반환."""
-    r = requests.get(CORPCODE_URL, params={"crtfc_key": os.environ["DART_API_KEY"]}, timeout=60)
-    r.raise_for_status()
-    z = zipfile.ZipFile(io.BytesIO(r.content))
+    failure: tuple[str, int | None] | None = None
+    response = None
+    try:
+        response = requests.get(
+            CORPCODE_URL,
+            params={"crtfc_key": os.environ["DART_API_KEY"]},
+            timeout=60,
+        )
+        response.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        # A requests exception retains its fully prepared URL, including the
+        # ``crtfc_key`` query value.  Preserve only non-secret diagnostics and
+        # discard both the exception and response before raising below.
+        raw_status = getattr(
+            getattr(exc, "response", None),
+            "status_code",
+            None,
+        )
+        status_code = raw_status if isinstance(raw_status, int) else None
+        failure = (
+            type(exc).__name__,
+            status_code,
+        )
+        response = None
+    if failure is not None:
+        failure_name, status_code = failure
+        status = f", http_status={status_code}" if status_code is not None else ""
+        raise CorpCodeDownloadError(
+            "OpenDART corp-code request failed: "
+            f"endpoint=corpCode.xml, failure={failure_name}{status}"
+        ) from None
+    assert response is not None
+    z = zipfile.ZipFile(io.BytesIO(response.content))
     return z.read(z.namelist()[0])
 
 

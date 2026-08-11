@@ -640,7 +640,7 @@ def finish_run(
         cur.execute(
             """
             UPDATE dq_run
-            SET status=%s, finished_at=now(), total_rule_count=%s,
+            SET status=%s, finished_at=clock_timestamp(), total_rule_count=%s,
                 failed_rule_count=%s, error_message=%s
             WHERE run_id=%s
             """,

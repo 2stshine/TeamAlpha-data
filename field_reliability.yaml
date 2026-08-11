@@ -1,0 +1,135 @@
+# Machine-readable field reliability contract for the research agent / guardrails.
+# Human companion: DATA_CONTRACT.md. Keep both in sync.
+version: "2026-08-11"
+ruleset_version: "1.27.0"
+
+coverage:
+  krx_equity: {from: "1995-05-02", assets: 6677, survivorship_bias: false}
+  krx_index: {from: "2010-01-04", codes: ["1028", "2203"]}
+  fmp_us_equity: {from: "2015-01-02", assets: 8720, survivorship_bias: false}
+  fmp_commodity: {from: "2015-01-01", assets: 28}
+  fmp_fx: {from: "2015-01-01", assets: 1, symbol: "USDKRW"}
+  dart_fundamental: {from: "2015-03-31"}
+  dart_dividend: {from: "2013-09-30"}
+  fmp_fundamental: {from: "2015-01-02"}
+
+# Requested-but-absent. Factors requiring these CANNOT be built; do not proxy.
+not_provided:
+  - free_float_shares
+  - order_book
+  - short_selling
+  - securities_lending
+  - sector_classification_pit
+  - detailed_cashflow_lines   # CFO, CAPEX, depreciation, COGS, SG&A, cash (KRX/DART)
+
+sources:
+  krx: {trust: internally_validated}
+  dart: {trust: internally_validated}
+  fmp:
+    trust: vendor_trusted_not_internally_validated
+    note: "total_assets<=0 / revenue<0 / accounting mismatch can exist by vendor convention"
+
+tables:
+  price_daily:
+    fields:
+      close:
+        meaning: "raw closing price, unadjusted/nominal"
+        unit: currency
+        validated: true
+        safe_for: [point_in_time_display]
+        unsafe_for: [time_series_return, momentum, any_cross_time_ratio]
+      open: {meaning: "raw open; NULL on zero-volume no-trade days", validated: true}
+      high: {meaning: "raw high; NULL on zero-volume no-trade days", validated: true}
+      low: {meaning: "raw low; NULL on zero-volume no-trade days", validated: true}
+      adj_close:
+        meaning: "split/rights adjusted close (PRICE return only, NO dividends); back-adjusted so latest == raw close"
+        unit: currency
+        validated: true
+        reliability: high
+        safe_for: [price_momentum, reversal, volatility, technical, beta]
+        unsafe_for: [total_return, dividend_yield, carry]
+        note: "dividends are NOT reflected; use total_return_close for total return"
+      total_return_close:
+        meaning: "dividend-reinvested total return; latest == adj_close (back-adjusted)"
+        unit: currency
+        validated: true
+        reliability: high
+        safe_for: [total_return, dividend_yield, carry, momentum]
+        unsafe_for: []
+        caveats:
+          - "KRX ex-date derived from record_date (approx +/-1-2 trading days); cumulative return exact, only intra-window daily returns may shift by a day"
+          - "FMP uses native dividend-adjusted adjClose"
+      volume: {meaning: "traded shares; 0 == no-trade (OHLC NULL)", validated: true}
+      trading_value: {meaning: "traded value", unit: currency, validated: true}
+      shares:
+        meaning: "TOTAL listed shares (LIST_SHRS)"
+        unit: shares
+        validated: true
+        unsafe_for: [free_float_weighting]
+        note: "NOT free float"
+      market_cap: {meaning: "market cap == close*shares (reconciled)", unit: currency, validated: true}
+      market: {meaning: "KOSPI|KOSDAQ|KONEX (KRX) / exchange", validated: true}
+
+  fundamental:
+    layout: "long format: (metric, value) per (asset_id, period_end, fiscal_period, fs_type, revision_key)"
+    pit_field: available_date
+    pit_note: "look-ahead-safe: available_date > period_end, enforced CRITICAL (FUNDAMENTAL_PIT_ORDER)"
+    dart:
+      validated: true
+      validations: [FUNDAMENTAL_VALUE_PLAUSIBILITY, FUNDAMENTAL_ACCOUNTING_EQUATION_GROSS, DIVIDEND_NONNEGATIVE, FUNDAMENTAL_PIT_ORDER]
+      metrics_bs: [total_assets, current_assets, noncurrent_assets, total_liabilities, current_liabilities, noncurrent_liabilities, total_equity, capital_stock, retained_earnings]
+      metrics_is: [revenue, operating_income, pretax_income, net_income, comprehensive_income]
+      metrics_dividend: [cash_dividend_per_share, dividend_yield, stock_dividend_per_share, payout_ratio]
+      metrics_absent: [cogs, sga, cash, cfo, capex, depreciation]
+      note: "fs_type CFS(consolidated)/OFS(separate) — do not mix within a scope"
+    fmp:
+      validated: false
+      trust: vendor_trusted
+      statements: [BS, IS, CF]
+      note: "US only; not internally validated"
+
+  corporate_action:
+    fields:
+      action_type: {values: [cash_dividend, stock_split, reverse_split, capital_reduction, bonus_issue, merger, rights_detachment, listing_change, delisting, trading_halt]}
+      ex_date: {meaning: "ex-date", note: "NULL for KRX cash dividends (derived from record_date); present for FMP"}
+      record_date: {meaning: "baedang gijunil (KRX dividend anchor)"}
+      cash_amount: {meaning: "cash dividend per share", coverage: "partial for KRX (~17761/19880)"}
+      adjusted_cash_amount: {meaning: "split-adjusted per-share dividend"}
+
+  asset:
+    fields:
+      asset_id: {meaning: "surrogate key; reused tickers map to distinct asset_ids (no identity collision)"}
+      name: {meaning: "issuer/security name"}
+      asset_type: {values: [stock, index, commodity, fx]}
+      exchange: {meaning: "KRX / NYSE / NASDAQ / AMEX / COMMODITY / FX"}
+      sector: {present: false, note: "not provided"}
+
+quality_guarantees:
+  guaranteed:
+    - no_null_close
+    - non_positive_prices_excluded
+    - market_cap_equals_close_times_shares_within_1pct
+    - fundamental_point_in_time_order
+    - fundamental_value_plausibility
+    - accounting_equation_gross_excluded
+    - adj_close_reconciliation_consistent
+    - no_duplicate_price_rows
+    - no_active_security_identifier_collision
+  not_guaranteed:
+    - un_encoded_error_types
+    - warning_severity_items
+    - fmp_fundamental_accuracy
+    - anything_in_not_provided
+
+outlier_policy:
+  statement: "extreme returns are mostly real (penny/distressed stocks), not errors"
+  action: "winsorize returns and apply a liquidity filter at factor-construction time"
+  flags_location: "dq_warning_state worklist; inspect via `python -m pipeline.silver_quality.review list`"
+
+factor_guidance:
+  price_momentum_reversal_volatility: {use: [adj_close], avoid: [close]}
+  total_return_dividend_carry: {use: [total_return_close, corporate_action.cash_dividend], avoid: [adj_close]}
+  value_quality_kr: {use: [fundamental.dart.bs, fundamental.dart.is, market_cap], avoid: [detailed_cashflow_lines, fmp_mixing]}
+  liquidity_size: {use: [trading_value, market_cap, shares], note: "shares != free float"}
+  us_factors: {use: [fmp_price, fmp_fundamental], note: "vendor-trusted"}
+  float_short_orderbook_based: {buildable: false, reason: not_provided}

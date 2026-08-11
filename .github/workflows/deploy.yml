@@ -98,15 +98,34 @@ jobs:
           IMAGE_SHA="${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
           IMAGE_LATEST="${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
 
+          [[ "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "GITHUB_SHA must be a full 40-character commit SHA" >&2
+            exit 1
+          }
+
           docker buildx build \
             --platform linux/amd64 \
             -f deploy/Dockerfile \
+            --build-arg "SOURCE_COMMIT=${GITHUB_SHA}" \
+            --build-arg "SOURCE_REPOSITORY=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
             -t "${IMAGE_SHA}" \
             -t "${IMAGE_LATEST}" \
+            --metadata-file image-metadata.json \
             --push \
             .
 
-          echo "image_uri=${IMAGE_SHA}" >> "${GITHUB_OUTPUT}"
+          IMAGE_DIGEST="$(
+            jq -r '."containerimage.digest" // empty' image-metadata.json
+          )"
+          [[ "${IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "Buildx did not return an immutable image digest" >&2
+            exit 1
+          }
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
+
+          echo "image_uri=${IMAGE_URI}" >> "${GITHUB_OUTPUT}"
+          echo "image_tag_uri=${IMAGE_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "image_digest=${IMAGE_DIGEST}" >> "${GITHUB_OUTPUT}"
 
       - name: Register ECS task definition
         id: task
@@ -191,8 +210,17 @@ jobs:
 
           aws scheduler get-schedule \
             --name "${SCHEDULE_NAME}" \
-            --query Target \
-            --output json > current-schedule-target.json
+            --output json > current-schedule.json
+
+          jq '.Target' current-schedule.json > current-schedule-target.json
+          CURRENT_SCHEDULE_STATE="$(jq -r '.State' current-schedule.json)"
+          SCHEDULE_GROUP="$(
+            jq -r '.GroupName // "default"' current-schedule.json
+          )"
+          [[ "${CURRENT_SCHEDULE_STATE}" =~ ^(ENABLED|DISABLED)$ ]] || {
+            echo "Unexpected Scheduler state: ${CURRENT_SCHEDULE_STATE}" >&2
+            exit 1
+          }
 
           jq \
             --arg task_definition_arn "${TASK_DEFINITION_ARN}" \
@@ -201,11 +229,12 @@ jobs:
 
           aws scheduler update-schedule \
             --name "${SCHEDULE_NAME}" \
+            --group-name "${SCHEDULE_GROUP}" \
             --schedule-expression "${SCHEDULE_EXPRESSION}" \
             --schedule-expression-timezone "${SCHEDULE_TIMEZONE}" \
             --flexible-time-window '{"Mode":"OFF"}' \
             --target file://new-schedule-target.json \
-            --state ENABLED
+            --state "${CURRENT_SCHEDULE_STATE}"
 
       - name: Show deployed version
         run: |

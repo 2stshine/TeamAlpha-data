@@ -26,7 +26,8 @@ erDiagram
 | `base_currency` | 가격의 표시통화 (`KRW`, `USD`) |
 | `price_unit` | 원자재 표준 가격 단위. 그 외 자산은 NULL |
 | `listed_from`, `listed_to` | 상장 유효기간 |
-| `quality_run_id`, `loaded_at` | 인증 실행과 적재 시각 |
+| `quality_run_id`, `loaded_at` | 원 가격 인증 실행과 원 가격 적재 시각 |
+| `total_return_quality_run_id`, `total_return_loaded_at` | 배당 포함 파생값의 별도 인증 실행과 생성 시각 |
 
 ## 2. asset_identifier
 
@@ -49,8 +50,8 @@ PK는 `(asset_id, source, identifier_type, identifier, valid_from)`이다. CIK�
 |---|---|
 | `asset_id`, `source`, `trade_date` | PK |
 | `open`, `high`, `low`, `close` | 원 가격 기준 OHLC |
-| `adj_close` | 분할·증자 등 가격조정 종가 |
-| `total_return_close` | 배당까지 반영한 총수익 종가 |
+| `adj_close` | KRX 기준가격 계수 기반 price-only 조정 종가(일반 주권 현금배당 제외) |
+| `total_return_close` | 최신 정정을 소급 반영한 배당 포함 ex-post forward-label 종가 |
 | `currency` | 해당 가격의 표시통화 |
 | `vwap` | 원천이 제공할 때의 VWAP |
 | `available_at` | 해당 행을 실제로 사용할 수 있었던 시각 |
@@ -59,7 +60,15 @@ PK는 `(asset_id, source, identifier_type, identifier, valid_from)`이다. CIK�
 | `market` | 날짜별 주식시장 또는 `FX`. 원자재는 NULL |
 | `quality_run_id`, `loaded_at` | 인증 실행과 적재 시각 |
 
-KRX는 기존 가격조정 로직을 유지하고 `total_return_close=adj_close`로 둔다.
+KRX 보통주는 인증된 `krx_gross_dividend_reinvested_v3` rebuild가 2015-01-01부터
+`adj_close`에 ISSUER 현금배당을 배당락일 기준 gross 재투자해
+`total_return_close`를 만든다. 날짜별 `market`이 KOSPI/KOSDAQ인 common stock만
+대상이며 우선주·KONEX와 2015년 이전 원 가격은 인증 범위가 아니다.
+계약이 `CERTIFIED`가 아니거나 행의 `total_return_quality_run_id`가 계약 run과
+다르면 연구 입력으로 사용할 수 없다.
+과거 수익률 feature는 `factor_price_feature_daily` view만 읽는다. 이 view는
+`adj_close`를 제공하지만 `total_return_close`와 total-return lineage를 노출하지
+않는다. `total_return_close`는 IC의 미래 수익 label로만 사용한다.
 FMP EOD bulk에서는 `close`가 분할조정 값이고 `adjClose`가 배당조정 값이다.
 따라서 FMP `close→adj_close`, `adjClose→total_return_close`로 저장하며, 원 OHLC는
 Silver에서 이후 split ratio의 누적곱으로 복원한다. `USDKRW`도 `fx` asset의
@@ -109,6 +118,8 @@ fiscal_period, fs_type, revision_key, metric)`이다. `fundamental_current`는
 | `expected_price_factor` | 예상 가격 조정계수 |
 | `share_count_factor` | 예상 주식수 조정계수 |
 | `status`, `confidence`, `filing_id` | 상태·근거 신뢰도·공시 ID |
+| `report_name`, `corp_cls`, `action_scope` | 원 공시명, DART 시장구분 (`Y`, `K`, `N`, `E`), 발행회사/관계회사 범위 |
+| `source_body_sha256` | 해당 corporate action을 만든 content-addressed 원문 SHA-256 |
 | `quality_run_id`, `loaded_at` | 인증 실행과 적재 시각 |
 
 DART 구조화 공시와 공시 원문 증거뿐 아니라 FMP split/dividend calendar도
@@ -122,6 +133,31 @@ DART 구조화 공시와 공시 원문 증거뿐 아니라 FMP split/dividend ca
 
 배당 연구자는 물리 테이블을 하나 더 만들지 않고 `dividend_history` view를
 조회한다. 이 view는 `corporate_action`의 `cash_dividend`만 노출한다.
+
+KRX 주식 총수익은 `dividend_event_resolution`에 rebuild run별 append-only로
+원천행별 canonical 선택, 제외 사유, 추론/명시 배당락일과 실제 가격 적용일을
+기록한다. `dart_action_snapshot_contract`는 사용한 DART body digest/count와 연속
+TR-relevant coverage를 해당 DQ run에 묶는다. `corp_cls`는 원문 provenance와 통계로만
+보존하고, 포함 여부는 최종 경제기준일의 PIT ticker identity, common-stock 여부,
+인증 KOSPI/KOSDAQ 가격 episode로만 결정한다.
+`dividend_source_receipt`는 포함·제외된 모든 cash receipt, 정정 root/previous/terminal,
+원문 SHA, PIT 매핑 사유를 보존한다. 전체·terminal receipt, 게시 cash/ex action,
+manifest가 참조한 주식배당·무상증자·권배락 support action, included receipt↔cash
+action의 deterministic row digest가 snapshot 및 최종 계약에
+동시에 기록되어 같은 run_id/count를 유지한 값 변조도 audit에서 차단한다.
+`cash_adjustment_scale_source_evidence`와
+`cash_adjustment_scale_support_action`은 전일/당일 가격 조정계수가 달라지는 cash
+event만 parent/child로 보존한다. 현금 원문, 각 support action 원문, 이전일·적용일
+KRX 가격 object를 별도 SHA/ETag로 결속하고, component semantic group마다 정확히
+하나의 공식 조정 원인을 요구한다. stable-scale event에는 evidence를 허용하지 않고,
+changed-scale event는 `PRE_EVENT_PRICE_SCALE` 증거 parent를 정확히 하나 사용한다.
+KRX ticker는 숫자 단축값을 6자리 zero-pad하고 `0008Z0` 같은 신규 코드도 보존하는
+대문자 영숫자 6자리(`^[0-9A-Z]{6}$`) 계약이다. 유효성은 코드 모양만으로 결정하지
+않고 위 PIT identity와 인증 가격 episode가 최종 판정한다.
+`price_return_contract`가 `krx_gross_dividend_reinvested_v3` 방법론과 coverage,
+DQ run을 `CERTIFIED`로 선언한 경우에만 `price_daily.total_return_close`를
+배당 포함 연구 레이블로 사용할 수 있다. 새 가격이나 ISSUER 배당 입력이 들어오면
+계약은 `BUILDING`으로 강등된다.
 
 OpenDART `배당에 관한 사항`의 보고기간 단위 값은 기업행사가 아니라 공시 사실이므로
 기존 `fundamental`에 `statement_type='DIVIDEND'`, `data_basis='REPORTED'`로 저장한다.

@@ -9,6 +9,9 @@ import pandas as pd
 from pipeline.common import db
 from pipeline.common.paths import base_uri
 from pipeline.silver import assets, corporate_actions, dividends, financials, prices
+from pipeline.silver.return_contract import (
+    acquire_return_writer_transaction_lock,
+)
 from pipeline.silver_quality.models import (
     CandidateBundle,
     CheckResult,
@@ -228,6 +231,10 @@ def incremental(
 
         try:
             with conn.transaction():
+                # The total-return rebuild holds the same advisory key while
+                # reading asset/price inputs.  Acquire it before *any* KRX
+                # identity or price mutation, including the daily DELETE.
+                acquire_return_writer_transaction_lock(conn)
                 krx_map = assets.publish(
                     conn, bundle.assets, bundle.identifiers, context.run_id,
                 )

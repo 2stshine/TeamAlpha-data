@@ -26,6 +26,9 @@ from pathlib import Path
 import boto3
 
 from pipeline.common import db
+from pipeline.silver.return_contract import (
+    acquire_return_writer_transaction_lock,
+)
 from pipeline.silver_quality import s3_backfill
 
 _DOWNLOAD_WORKERS = 32
@@ -102,13 +105,14 @@ def _download_prefixes(bucket: str, root: Path, prefixes: tuple[str, ...]) -> in
 def _truncate_silver() -> None:
     conn = db.connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "TRUNCATE "
-                + ", ".join(SILVER_TABLES)
-                + " RESTART IDENTITY CASCADE"
-            )
-        conn.commit()
+        with conn.transaction():
+            acquire_return_writer_transaction_lock(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "TRUNCATE "
+                    + ", ".join(SILVER_TABLES)
+                    + " RESTART IDENTITY CASCADE"
+                )
         print(
             f"[krx-rebuild] truncated {', '.join(SILVER_TABLES)} (CASCADE)",
             flush=True,

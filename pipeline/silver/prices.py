@@ -1,7 +1,11 @@
 """price_daily 적재: 개별종목(marcap+krxapi) + 지수(벤치마크). adj_close(가격수정) 계산.
 
-adj_close: KRX 등락률·전일대비가 조정기준 → 일별 계수 m = (close−전일대비)/이전close (정상일=1,
-분할·증자일=조정비율) 누적곱 C, adj_close = close × C_last/C. (배당 미반영 — 소스 없음.)
+adj_close: KRX ``CMPPREVDD_PRC``/marcap ``Changes``(전일대비)가 조정기준 →
+일별 계수 m = (close−전일대비)/이전close (정상일=1, 분할·증자·주식배당 등
+기준가격 조정일=조정비율) 누적곱 C, adj_close = close × C_last/C.
+일반 주권의 현금배당은 KRX 기준가격 조정식에 포함되지 않으므로 이 값은
+price-only이며 DART 현금을 별도로 한 번 가산한다. KRX 공식 기준가격 규정:
+https://global.krx.co.kr/contents/GLB/06/0602/0602020202/GLB0602020202T3.jsp
 소스는 marcap·krxapi 모두 같은 KRX 데이터라 price_daily.source='KRX' 로 통일.
 """
 from __future__ import annotations
@@ -15,13 +19,17 @@ import numpy as np
 import pandas as pd
 
 from pipeline.common import db
+from pipeline.silver.return_contract import (
+    acquire_return_writer_transaction_lock,
+    invalidate_krx_total_return,
+)
 from pipeline.silver.assets import BENCHMARKS
 
 COLS = [
     "asset_id", "source", "trade_date", "open", "high", "low", "close",
     "adj_close", "total_return_close", "currency", "vwap", "available_at",
     "volume", "trading_value", "shares", "market_cap", "market",
-    "quality_run_id",
+    "quality_run_id", "total_return_quality_run_id", "total_return_loaded_at",
 ]
 
 # marcap 은 코스닥 글로벌 세그먼트를 따로 표기하지만 krxapi 는 KOSDAQ 으로 합쳐 준다(1771+50=1821 일치).
@@ -624,16 +632,31 @@ def publish(
             + pd.Timedelta(days=1, hours=8, minutes=30)
         )
     both["quality_run_id"] = quality_run_id
+    # This load certifies raw price fields only.  The derived total-return
+    # placeholder is deliberately left without derived lineage until rebuild.
+    both["total_return_quality_run_id"] = None
+    both["total_return_loaded_at"] = None
     rows = list(
         both[COLS].astype(object).where(pd.notna(both[COLS]), None)
         .itertuples(index=False, name=None)
     )
+    published_krx_stock = (
+        "asset_type" in both
+        and "source" in both
+        and (
+            both["asset_type"].eq("stock")
+            & both["source"].eq("KRX")
+        ).any()
+    )
+    if published_krx_stock:
+        acquire_return_writer_transaction_lock(conn)
     n = db.upsert(conn, "price_daily", COLS, rows,
                   conflict=["asset_id", "source", "trade_date"],
                   update=["open", "high", "low", "close", "adj_close",
                           "total_return_close", "currency", "vwap", "available_at",
                           "volume", "trading_value", "shares", "market_cap", "market",
-                          "quality_run_id", "loaded_at"],
+                          "quality_run_id", "total_return_quality_run_id",
+                          "total_return_loaded_at", "loaded_at"],
                   temp_name="_stg_price_publish")
     print(f"[prices] price_daily upsert {n}행")
 
@@ -643,6 +666,12 @@ def publish(
         if n_ev:
             print(f"[prices] 조정이벤트 {n_ev}종목 소급조정 완료")
         _verify_adj_close_post_publish(conn, both, target_date)
+    if n > 0 and published_krx_stock:
+        invalidate_krx_total_return(
+            conn,
+            reason="KRX_PRICE_PUBLISHED",
+            quality_run_id=quality_run_id,
+        )
     return n
 
 

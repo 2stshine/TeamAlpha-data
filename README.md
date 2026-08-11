@@ -88,9 +88,10 @@ GitHub main push
      - 태그 1: Git commit SHA
      - 태그 2: latest
   -> ECS task definition 새 revision 등록
-     - 새 revision이 방금 push한 ECR 이미지를 바라봄
+     - 새 revision은 태그가 아니라 방금 push한 이미지의 SHA-256 digest를 바라봄
   -> EventBridge Scheduler target 갱신
      - 다음 스케줄 실행부터 새 task definition 사용
+     - 기존 Scheduler가 DISABLED면 그대로 DISABLED를 유지
 ```
 
 즉, GitHub에 코드를 push하면 새 Docker 이미지가 ECR에 올라가고, ECS는 다음 실행부터 그 이미지를 받아 실행합니다.
@@ -197,9 +198,17 @@ corporate_actions/
         rcept=<접수번호>.xml  # DART status=014 원문
     manifests/
       from=YYYYMMDD/to=YYYYMMDD/
-        disclosures.json
-        structured_complete.json
-        documents_complete_v2.json
+        disclosures_v3.json
+        structured_complete_v3.json
+        documents_complete_v5.json
+  krx/
+    cash_adjustment_scale_source_evidence.json
+    cash_adjustment_scale_price_objects.json
+    kind/
+      cash_adjustment_scale_support.json
+      request_objects/sha256=<sha>.json
+      body_objects/sha256=<sha>.html
+    # 위 manifest들이 가리키는 KIND 요청/원문과 날짜별 KRX 가격 object
 
 dividends/dart/alot-matter/
   year=YYYY/report=<보고서코드>/corp=<ticker>/rcept=<접수번호>/
@@ -256,7 +265,7 @@ bronze 원칙:
 
 ## RDS Silver 구조
 
-핵심 silver는 PostgreSQL 테이블 5개로 구성됩니다.
+핵심 Silver 원천 테이블 5개와 파생 총수익 계약·감사 테이블로 구성됩니다.
 
 ```text
 asset
@@ -265,6 +274,11 @@ price_daily
 fundamental
 corporate_action
 dividend_history  # corporate_action의 cash_dividend 조회 view
+dart_action_snapshot_contract  # v5 action/source-evidence snapshot 계약
+cash_adjustment_scale_source_evidence  # scale-change cash event parent 증거
+cash_adjustment_scale_support_action   # parent별 공식 support action lineage
+dividend_event_resolution  # 배당 정정·배당락일·적용일 감사
+price_return_contract      # total_return_close 방법론·인증 상태
 ```
 
 관계:
@@ -284,12 +298,33 @@ asset
 | `price_daily` | 주식·지수·FX·원자재 연속선물 일봉 | `(asset_id, source, trade_date)` |
 | `fundamental` | DART/FMP 재무계정 long format | `(asset_id, source, statement_type, data_basis, period_end, fiscal_period, fs_type, revision_key, metric)` |
 | `corporate_action` | 배당·분할·증자·감자 등 기업행사 | `(asset_id, source, action_key)` |
+| `dividend_source_receipt` | DART 현금배당 접수 원문·정정 family·PIT 매핑의 append-only 영수증 | `(quality_run_id, receipt_no)` |
+| `dart_action_snapshot_contract` | v5 원문·receipt·게시 action·scale evidence snapshot | `quality_run_id` |
+| `cash_adjustment_scale_source_evidence` | 조정계수 변경일 현금배당의 content-addressed parent 증거 | `(action_snapshot_run_id, evidence_key)` |
+| `cash_adjustment_scale_support_action` | parent가 참조한 주식배당·무상증자·권배락 공식 증거 | `(action_snapshot_run_id, evidence_key, support_action_source, support_action_key, support_action_type)` |
+| `dividend_event_resolution` | 원천 현금배당별 canonical/제외·배당락일·실제 적용일 감사 | `(quality_run_id, asset_id, source, action_key, resolution_version)` |
+| `price_return_contract` | 자산군별 총수익 방법론과 현재 인증 상태 | `(source, asset_type, field_name)` |
 
 배당은 별도 물리 테이블을 추가하지 않는다. 이벤트 날짜·원/분할조정 주당배당금·통화·
 지급주기는 `corporate_action`에 저장하고 `dividend_history` view로 조회한다. DART
 정기보고서의 배당총액·배당성향·배당수익률은 `fundamental`의 `DIVIDEND` 지표로
 저장한다. 원천 가격과 결합해 다시 계산할 수 있는 시점별 배당수익률은
 `corporate_action`에 저장하지 않는다.
+
+KRX `adj_close`는 KRX 전일대비/기준가격 계수로 분할·증자·주식배당 같은 가격
+조정만 누적한 **price-only** 값이며 일반 주권 현금배당은 포함하지 않는다. KRX
+공식 [기준가격 산정 규정](https://global.krx.co.kr/contents/GLB/06/0602/0602020202/GLB0602020202T3.jsp)은
+일반 주권의 현금배당이 아니라 주식배당 등 주식수 변화의 권리락 기준가격을 조정한다.
+주식 `total_return_close`는 이 `adj_close`에 ISSUER 현금배당을 gross 기준으로
+배당락일 종가 재투자해 계산한다. 명시된 배당락일이 없으면 KRX 결제 관행에 따라
+기준일 이전 두 번째 시장 세션을 사용하고, 모든 원천행의 선택·제외 근거는
+`dividend_event_resolution`에 남긴다. 새 KRX 가격이나 ISSUER 현금배당이 적재되면
+`price_return_contract`는 즉시 `BUILDING`으로 강등되며, 전체 재구축·행 parity가
+끝난 뒤에만 다시 `CERTIFIED`가 된다.
+`total_return_close`는 최신 정정까지 소급 반영한 ex-post 실현수익 **forward label**로만
+사용한다. bitemporal action vintage가 생기기 전에는 모멘텀 같은 과거 feature가 이를
+읽으면 안 되며, `factor_price_feature_daily` view의 `adj_close`를 사용한다. 이 view는
+`total_return_close`와 그 lineage 컬럼을 물리적으로 노출하지 않는다.
 
 FMP Silver 편입 대상은 NASDAQ·NYSE·AMEX에서 거래되는 common stock,
 preferred stock, ADR, REIT입니다. ETF, fund, ETN, warrant, unit, listed note는
@@ -307,6 +342,11 @@ FMP 원자재는 `asset_type=commodity`,
 유지하고, 거래 세션이 아닌 토요일 행과 OHLC 불일치 행은 Bronze에 보존하되
 Silver에서 제외해 `MODIFIED`로 기록합니다. 롤오버 가능 급변은 값을 고치지 않고
 warning으로 남깁니다.
+
+현재 2015~2026 원자재 이력은 2026년 일괄 백필이므로 과거 각 시점에 실제로
+가용했던 PIT 입력으로 간주하지 않는다. 또한 롤 조정/선물 총수익 계약이 없으므로
+팩터 연구의 hidden OOS·Gold 입력에는 바로 사용하지 않고, retrospective 진단이나
+향후 별도 PIT·롤 방법론을 구축하는 원천으로만 사용한다.
 
 컬럼별 상세 설계는 [schema_tables.md](schema_tables.md)와 [sql/schema.sql](sql/schema.sql)를 참고합니다.
 
@@ -505,10 +545,141 @@ uv run python -m pipeline.dart_silver_backfill_ecs --phase dart-extras
 uv run python -m pipeline.dart_silver_backfill_ecs --phase krx-gap
 ```
 
-`dart-extras`는 정기보고서 배당 이력을 `fundamental`의
-`DIVIDEND/REPORTED` 행으로, 배당결정 공시는 `corporate_action`의
-`cash_dividend` 행으로 적재한다. 기존 KRX 식별자에 매핑되는 후보만 품질
-게이트를 통과시킨 뒤 source-scoped transaction으로 반영한다.
+`dart-extras`는 총수익에 필요한 `cash_dividend`/실제일 `ex_dividend`와 scale-change가
+참조하는 정확한 주식배당·무상증자·권배락 support action/source body까지 한정한다.
+TR 전용 v5 snapshot을 발행한 뒤
+`total_return_close` 전체 rebuild와 독립 audit까지 성공해야 종료하며, 중간 실패 시
+총수익 계약은 `BUILDING`에 남는다. `dividends/dart/alot-matter`의 정기보고서 배당
+지표는 별도의 content-addressed completeness manifest가 없으므로 이 phase에서
+`fundamental DIVIDEND/REPORTED`로 인증·적재하지 않는다. 해당 fundamental 복구는
+전용 원문 manifest와 object/receipt parity 계약을 마련한 별도 작업으로 남긴다.
+
+조정계수 변경 현금배당 331건의 로컬 증거 복구는 다음 순서로 준비한다. KIND 입력은
+공식 고지를 검토한 두 외부 canonical artifact다. reference request는 KOSPI 99311과
+KOSDAQ 70767 기준가 공시를, component request는 KRX에만 존재하는 61474 비현금
+구성요소를 선언한다. 첫 명령은 두 raw request bytes와 각 공시의 공식 main identity,
+선택된 body, 필요한 contents page를 모두 SHA-256 content-addressed object로 보존한다.
+검증기는 main의 issuer·ticker·acceptance·selected document, form별 표 구조,
+security·적용일·기준가·비현금 사유, component의 배당기준일·종류·비율을 다시 읽는다.
+모든 request는 대상 현금 receipt/date의 정확히 한 KIND child에 소비되어야 하며
+미사용·중복·우선주 혼입은 허용하지 않는다. 아래 수집 명령은 AWS/RDS에 쓰지 않으며,
+`build`도 로컬 manifest만 원자적으로 게시한다.
+
+먼저 `DART_API_KEY`를 argv나 문서에 쓰지 말고 실행 프로세스 환경에 secret으로
+주입한다. 아래 세 명령은 하나의 로컬 base에 native disclosure/structured/document
+완료 marker와 공식 cash/support revision-family manifest를 순서대로 만든다.
+`corporate_actions`는 `--no-documents`나 document shard 없이 끝까지 실행해야
+`disclosures_v3.json`, `structured_complete_v3.json`, `documents_complete_v5.json`을
+완료 상태로 게시할 수 있다.
+
+```bash
+uv run python -m pipeline.bronze.corporate_actions \
+  --from 20150101 --to 20260810 --dest local \
+  --base /complete/dart/snapshot
+
+uv run python -m pipeline.bronze.dart_viewer_corrections \
+  --base /complete/dart/snapshot --apply
+
+uv run python -m pipeline.bronze.dart_support_action_families \
+  --base /complete/dart/snapshot --apply
+```
+
+종료일 전체를 덮는 v3/v3/v5 marker, viewer correction manifest, support-action
+family manifest 중 하나라도 없거나 old marker만 있으면 이후 `build`는 fail-closed로
+중단한다. Viewer/support 수집도 공식 DART HTTPS 원문만 로컬에 추가하며 AWS/RDS에는
+쓰지 않는다.
+
+```bash
+uv run python -m pipeline.silver.cash_adjustment_scale_builder \
+  download-kind \
+  --base /complete/dart/snapshot \
+  --reference-requests /reviewed/kind-reference-requests-v2.json \
+  --component-requests /reviewed/kind-component-requests-v1.json
+
+uv run python -m pipeline.silver.cash_adjustment_scale_builder \
+  download-prices \
+  --base /complete/dart/snapshot \
+  --overlap /private/tmp/teamalpha-dividend-scale-overlap-20260812.csv \
+  --expectations /private/tmp/teamalpha-dividend-final-gate-expectations-20260812.json \
+  --s3-root s3://<bronze-bucket>/<optional-prefix> \
+  --aws-profile <read-only-profile>
+
+uv run python -m pipeline.silver.cash_adjustment_scale_builder \
+  build \
+  --base /complete/dart/snapshot \
+  --overlap /private/tmp/teamalpha-dividend-scale-overlap-20260812.csv \
+  --expectations /private/tmp/teamalpha-dividend-final-gate-expectations-20260812.json \
+  --coverage-end 2026-08-10 \
+  --s3-root s3://<bronze-bucket>/<optional-prefix>
+```
+
+KRX gross 배당재투자 총수익의 최초 구축·복구는 maintenance window에서 아래
+순서로 실행한다. 첫 preview는 로컬 complete Bronze와 RDS 가격을 DB-level
+read-only transaction으로 대조한다. 그 뒤 총수익에 필요한 ISSUER 현금배당·
+배당락만 Silver에 적재하고, 두 번째 preview가 같은 인증 snapshot으로 재현되는지
+확인한 후에만 `--apply`한다.
+
+```bash
+uv run python -m pipeline.silver_quality.migrate
+uv run python -m pipeline.silver.dart_action_snapshot \
+  --base /complete/dart/snapshot --coverage-end 2026-08-10
+uv run python -m pipeline.silver.dart_extra_load \
+  --base /complete/dart/snapshot --total-return-actions-only \
+  --expected-coverage-end 2026-08-10
+uv run python -m pipeline.silver.total_return_rebuild \
+  --actions-base /complete/dart/snapshot
+uv run python -m pipeline.silver.dart_extra_load \
+  --base /complete/dart/snapshot --total-return-actions-only --apply \
+  --expected-coverage-end 2026-08-10
+uv run python -m pipeline.silver.total_return_rebuild
+uv run python -m pipeline.silver.total_return_rebuild --apply
+uv run python -m pipeline.silver.total_return_audit
+```
+
+두 loader 모두 기본은 dry-run이며 `--apply`만 RDS를 변경한다. DART snapshot은
+generic 기업행사 전체가 아니라 총수익에 필요한 `cash_dividend`/실제일
+`ex_dividend`와 manifest가 정확히 참조한 scale-support action의 완전성 계약이다.
+2015-01-01부터 지정 종료일까지 native atomic
+완료 marker와 TR 관련 receipt/body/ticker/정정 family를 검증하고 모든 증거의
+크기·SHA-256을 고정한다. 겹치는 DART 목록에서 접수번호·종목코드·공시명 같은
+불변 필드가 바뀌면 차단하고, `rm`·회사명·`corp_cls`처럼 후일 갱신되는 목록 표시는
+명시적 manifest 종료일이 가장 늦은 관측만 선택해 conflict count/digest를 남긴다.
+
+`corp_cls`는 포함 여부가 아니라 원문 provenance다. 모든 분류를 먼저 family의 최종
+경제기준일에 유효한 `asset_identifier`로 연결하고, common stock이면서 그 날짜를
+포괄하는 인증 KOSPI/KOSDAQ 가격 episode가 있을 때만 포함한다. 따라서 과거 상장사가
+`E`로 오표기되어도 포함되고, 실제 KONEX·비상장·우선주는 PIT identity/가격/상품
+사유로 제외된다. 포함·제외의 `corp_cls`별 건수는 감사 통계로만 보존한다.
+
+인증 범위는 `2015-01-01+`, `KRX common_stock`, 날짜별 시장이
+`KOSPI`/`KOSDAQ`인 행뿐이다. 우선주·KONEX와 2015년 이전 원 가격은 인증 범위가
+아니다. 1995년부터 존재하는 원 가격 범위는 계약 metadata에 참고값으로만 남고
+배당 포함 총수익으로 인증되지 않는다.
+`price_daily.quality_run_id`는 원 가격 인증을 계속 가리키며, rebuild는
+`total_return_quality_run_id`만 기록한다. `dividend_event_resolution`은 rebuild run별
+append-only다. `dividend_source_receipt`는 제외된 접수까지 보존하고 각 family의
+`terminal_receipt_no`·`terminal_announcement_date`를 명시한다. 최종 계약 metadata에는
+원 action snapshot digest/count/coverage뿐 아니라 전체·terminal receipt row digest,
+게시된 cash/ex 및 manifest 참조 support action row digest, 포함 receipt↔cash action과
+parent/child support action exact parity digest,
+PIT asset identity digest와 모든 2015+ 행의 run parity가 들어간다.
+
+새 KRX 주가 또는 ISSUER `cash_dividend`/`ex_dividend`/참조 support action이 들어오면 계약은
+`BUILDING`이 되므로, 다음 팩터 연구 전에 최신 complete action snapshot으로 위
+재구축을 다시 완료해야 한다. writer와 rebuild는 같은 PostgreSQL advisory lock을
+사용해 동시에 입력과 파생값을 변경하지 않는다.
+`total_return_audit`는 언제나 `REPEATABLE READ, READ ONLY`이며 rebuild/action DQ run,
+실제 첫·마지막 거래일의 정확한 일치, 총수익 전행 양수·비NULL, 원 가격 인증,
+행별 총수익 run parity, append-only resolution의 버전·적용/제외 의미, snapshot
+SHA·PIT 제외 partition·parsed row digest와 재계산한 asset identity를 함께 검사한다.
+또 모든 실제 현금 적용일에 전일/당일 `adj_close/close` scale을 4자리 저장구간으로
+재검산한다. scale이 바뀐 event는 exact parent 1개와 공식 support component를 요구하고
+`PRE_EVENT_PRICE_SCALE`로 현금을 환산하며, stable event는 evidence를 허용하지 않는다.
+첫 가격일 exclusion과 parent/child/action/body/가격 digest가 하나라도 맞지 않으면
+exit code 2를 반환한다.
+checksum-frozen migration 009 뒤의 migration 010은 이 증거가 없는 기존
+v1/v2 `CERTIFIED` 계약을 자동으로 `BUILDING`으로
+강등하며, 명시적인 전체 rebuild 전에는 다시 인증하지 않는다.
 
 완료된 `response.*`/`manifest.json` 파티션은 재호출하지 않으므로 같은 범위로
 재실행해도 이어서 진행합니다. 운영에서는 daily task와 겹치지 않도록 Scheduler를
@@ -523,7 +694,9 @@ uv run python -m pipeline.silver.fmp_load --mode backfill --from 2015 --to 2026
 uv run python -m pipeline.silver.fmp_load --mode backfill --resume <dq-run-uuid>
 uv run python -m pipeline.silver.fmp_load --mode daily --date 20260713
 uv run python -m pipeline.silver.fmp_load --mode commodities --from 2015 --to 2026
-uv run python -m pipeline.silver.dart_extra_load
+uv run python -m pipeline.silver.dart_extra_load \
+  --total-return-actions-only --expected-coverage-end YYYY-MM-DD  # TR preview
+# TR write는 위 명령에 --apply를 추가한다. generic fundamental apply는 비활성화됨.
 ```
 
 Gold schema 생성:
@@ -541,6 +714,11 @@ GitHub Actions를 쓰지 못할 때 수동 이미지 배포:
 AWS_ACCOUNT_ID=<aws-account-id>
 AWS_REGION=ap-northeast-2
 ECR_REPOSITORY=<ecr-repository>
+SOURCE_COMMIT="$(git rev-parse HEAD)"
+SOURCE_REPOSITORY="$(git config --get remote.origin.url)"
+
+test -z "$(git status --porcelain)"
+test "${#SOURCE_COMMIT}" -eq 40
 
 AWS_PROFILE=<aws-profile> aws ecr get-login-password --region ap-northeast-2 \
   | docker login --username AWS --password-stdin \
@@ -549,10 +727,28 @@ AWS_PROFILE=<aws-profile> aws ecr get-login-password --region ap-northeast-2 \
 docker buildx build \
   --platform linux/amd64 \
   -f deploy/Dockerfile \
-  -t "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest" \
+  --build-arg "SOURCE_COMMIT=${SOURCE_COMMIT}" \
+  --build-arg "SOURCE_REPOSITORY=${SOURCE_REPOSITORY}" \
+  -t "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${SOURCE_COMMIT}" \
+  --metadata-file image-metadata.json \
   --push \
   .
+
+IMAGE_DIGEST="$(jq -r '."containerimage.digest"' image-metadata.json)"
+IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
 ```
+
+수동·자동 배포 모두 ECS task definition에는 `latest`나 commit 태그가 아니라
+`IMAGE_URI`처럼 digest가 포함된 URI를 기록한다. 40자리 commit은 원격 저장소에
+push된 clean tree여야 하며 이미지의 `org.opencontainers.image.revision` label에도
+같은 값이 들어간다.
+
+현재 `deploy/Dockerfile`의 `python:3.12-slim`과
+`ghcr.io/astral-sh/uv:latest` upstream 참조는 mutable이다. 따라서 이미 push된
+ECR digest의 실행 바이트는 불변이지만, 나중에 같은 source commit을 다시 build해
+bit-for-bit 동일한 digest가 나온다고 보장하지는 않는다. 공식 upstream digest를
+별도로 검증한 뒤 두 `FROM` 참조를 digest로 고정하기 전까지 이 제한을 배포
+영수증에 기록한다.
 
 ## 자동 배포
 
@@ -566,9 +762,10 @@ docker buildx build \
 1. 외부 DB 접속이 필요 없는 전체 pytest를 실행합니다.
 2. GitHub OIDC로 AWS deploy role을 assume합니다.
 3. `linux/amd64` Docker 이미지를 빌드합니다.
-4. ECR에 commit SHA 태그와 `latest` 태그를 push합니다.
-5. ECS task definition 새 revision을 등록합니다.
-6. EventBridge Scheduler target을 새 task definition으로 갱신합니다.
+4. ECR에 commit SHA 태그와 `latest` 태그를 push하고 image digest를 확인합니다.
+5. ECS task definition 새 revision을 digest URI로 등록합니다.
+6. EventBridge Scheduler target을 새 task definition으로 갱신하되 기존
+   `ENABLED`/`DISABLED` 상태를 그대로 보존합니다.
 
 필요한 GitHub secret:
 

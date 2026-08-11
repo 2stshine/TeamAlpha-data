@@ -11,6 +11,9 @@ import json
 
 from pipeline.common import db
 from pipeline.silver_quality import repository
+from pipeline.silver.return_contract import (
+    acquire_return_writer_transaction_lock,
+)
 from pipeline.silver_quality.backfill import PUBLISH_LOCK_ID
 from pipeline.silver_quality.models import (
     CheckResult,
@@ -87,6 +90,7 @@ def run(*, apply: bool = False) -> dict[str, int]:
                     "SELECT pg_advisory_xact_lock(%s)",
                     (PUBLISH_LOCK_ID,),
                 )
+            acquire_return_writer_transaction_lock(conn)
             counts = _prepare_scope(conn)
             with conn.cursor() as cur:
                 cur.execute(

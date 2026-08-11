@@ -21,6 +21,7 @@ from pipeline.bronze import (
 from pipeline.common.paths import base_uri, ymd_to_dash
 from pipeline.silver import load
 from pipeline.silver import fmp_load
+from pipeline.silver_quality import freshness
 from pipeline.silver_quality import migrate
 
 
@@ -29,6 +30,8 @@ EXPECTED_STOCK_FILES = {"kospi.parquet", "kosdaq.parquet"}
 EXPECTED_INDEX_FILES = {"krx.parquet", "kospi.parquet", "kosdaq.parquet"}
 CORPORATE_ACTION_DISCOVERY_LOOKBACK_DAYS = 14
 CORPORATE_ACTION_EVIDENCE_LOOKBACK_DAYS = 180
+ACTION_DISCLOSURE_MANIFEST_NAME = "disclosures_v3.json"
+LEGACY_ACTION_DISCLOSURE_MANIFEST_NAME = "disclosures.json"
 
 
 def _target_day() -> str:
@@ -53,6 +56,26 @@ def _fmp_target_day(krx_day: str) -> str:
 
 def _key_from_s3_uri(uri: str) -> str:
     return uri.removeprefix(base_uri("s3") + "/")
+
+
+def _action_disclosure_manifest_key(action_from: str, day: str) -> str:
+    return (
+        "corporate_actions/dart/manifests/"
+        f"from={action_from}/to={day}/{ACTION_DISCLOSURE_MANIFEST_NAME}"
+    )
+
+
+def _reject_legacy_action_manifests(keys: list[str]) -> None:
+    legacy = [
+        key for key in keys
+        if key.endswith(f"/{LEGACY_ACTION_DISCLOSURE_MANIFEST_NAME}")
+        and "/corporate_actions/dart/manifests/" in f"/{key}"
+    ]
+    if legacy:
+        raise RuntimeError(
+            "legacy corporate-action disclosure manifests cannot authenticate "
+            f"the v3 collector universe: {sorted(legacy)}"
+        )
 
 
 def _list_prefix(bucket: str, prefix: str) -> list[str]:
@@ -160,9 +183,10 @@ def main() -> None:
     changed_action_keys = [
         _key_from_s3_uri(uri) for uri in changed_action_uris
     ]
-    action_disclosure_manifest = (
-        "corporate_actions/dart/manifests/"
-        f"from={action_from}/to={day}/disclosures.json"
+    _reject_legacy_action_manifests(changed_action_keys)
+    action_disclosure_manifest = _action_disclosure_manifest_key(
+        action_from,
+        day,
     )
     if action_disclosure_manifest not in changed_action_keys:
         changed_action_keys.append(action_disclosure_manifest)
@@ -212,6 +236,18 @@ def main() -> None:
     )
     print(f"[silver] incremental complete day={day}", flush=True)
 
+    # KRX 가격 또는 배당 입력을 게시한 트랜잭션은 total-return 계약을
+    # BUILDING으로 내린다. 일일 증분만으로는 최신 정정 DART 패밀리, 공식
+    # 권리변동 증거와 전체 가격 스케일을 인증할 수 없으므로 여기서 부분
+    # 재계산하거나 다시 CERTIFIED로 올리지 않는다. 연구 재개 전에는 반드시
+    # action-only snapshot -> full rebuild -> independent audit 폐쇄 흐름을
+    # 실행해야 한다.
+    print(
+        "[total-return] source publication complete; certified full rebuild "
+        "and audit are required before research",
+        flush=True,
+    )
+
     # FMP is a separate source transaction. KRX/DART remains committed if FMP
     # later fails, and a task retry safely reuses the immutable raw objects.
     fmp_day = _fmp_target_day(day)
@@ -221,6 +257,14 @@ def main() -> None:
     _download_keys(bucket, fmp_keys, root)
     fmp_load.run(src="local", day=fmp_day)
     print(f"[fmp] daily complete day={fmp_day}", flush=True)
+
+    # 신선도 자기점검(비치명적). 파이프라인이 아예 멈춘 경우까지 잡으려면 별도
+    # 스케줄로 `python -m pipeline.silver_quality.freshness` 를 돌린다.
+    try:
+        fr = freshness.assert_fresh()
+        print(f"[freshness] ok {fr['sources']}", flush=True)
+    except RuntimeError as exc:
+        print(f"[freshness] WARNING {exc}", flush=True)
 
 
 if __name__ == "__main__":

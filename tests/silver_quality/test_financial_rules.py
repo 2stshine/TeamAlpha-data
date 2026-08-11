@@ -60,6 +60,63 @@ def test_accounting_difference_is_warning():
     assert not result.blocks_publish
 
 
+def test_nonpositive_total_assets_blocks():
+    frame = _frame()
+    frame.loc[frame["metric"] == "total_assets", "value"] = 0.0
+    r = next(
+        x for x in check_financials(frame)
+        if x.rule_code == "FUNDAMENTAL_VALUE_PLAUSIBILITY"
+    )
+    assert r.status.value == "FAIL"
+    assert r.severity.value == "ERROR"
+    assert r.blocks_publish
+
+
+def test_negative_revenue_blocks():
+    frame = pd.concat([_frame(), _frame().assign(metric="revenue", value=-100.0)],
+                      ignore_index=True)
+    r = next(
+        x for x in check_financials(frame)
+        if x.rule_code == "FUNDAMENTAL_VALUE_PLAUSIBILITY"
+    )
+    assert r.status.value == "FAIL" and r.blocks_publish
+
+
+def test_negative_equity_is_allowed():
+    # a capital deficit (negative equity) is legitimate and must not be flagged
+    frame = _frame()
+    frame.loc[frame["metric"] == "total_assets", "value"] = 100.0
+    frame.loc[frame["metric"] == "total_liabilities", "value"] = 140.0
+    frame.loc[frame["metric"] == "total_equity", "value"] = -40.0
+    r = next(
+        x for x in check_financials(frame)
+        if x.rule_code == "FUNDAMENTAL_VALUE_PLAUSIBILITY"
+    )
+    assert r.status.value == "PASS"
+
+
+def test_implausible_value_exclusion_reported():
+    identifiers = pd.DataFrame([{
+        "natural_key": "005930", "source": "KRX", "identifier": "005930",
+    }])
+    results = run_registered_rules(CandidateBundle(
+        identifiers=identifiers,
+        fundamentals=_frame(),
+        stats={"fundamental": {
+            "implausible_value_excluded": {
+                "row_count": 38,
+                "samples": [{"identifier": "072520", "metric": "total_assets",
+                             "value": 0.0}],
+            },
+        }},
+    ))
+    r = next(
+        x for x in results if x.rule_code == "FUNDAMENTAL_VALUE_EXCLUDED"
+    )
+    assert r.severity.value == "MODIFIED" and r.status.value == "PASS"
+    assert "excluded_rows=38" in r.actual
+
+
 def test_gross_accounting_imbalance_blocks():
     frame = _frame()
     frame.loc[frame["metric"] == "total_equity", "value"] = 10.0  # 30% error

@@ -2,7 +2,10 @@ from datetime import date
 
 import pandas as pd
 
-from pipeline.silver.total_return import compute_total_return_close
+from pipeline.silver.total_return import (
+    compute_total_return_close,
+    derive_ex_dates,
+)
 
 
 def _prices(rows):
@@ -69,6 +72,44 @@ def test_assets_are_isolated():
     # asset 1 latest == adj_close
     a1 = s[p["asset_id"] == 1]
     assert round(a1.iloc[-1], 4) == 950.0
+
+
+def test_derive_ex_date_is_last_trading_day_before_record_date():
+    p = _prices([
+        (1, date(2020, 12, 28), 1000.0, 1000.0),
+        (1, date(2020, 12, 29), 1000.0, 1000.0),
+        (1, date(2020, 12, 30), 1000.0, 1000.0),   # last trading day before record 12/31
+        (1, date(2021, 1, 4), 1000.0, 1000.0),
+    ])
+    div = pd.DataFrame([(1, date(2020, 12, 31), 50.0)],
+                       columns=["asset_id", "record_date", "cash_amount"])
+    ex = derive_ex_dates(p, div)
+    assert len(ex) == 1
+    assert ex.iloc[0]["ex_date"] == date(2020, 12, 30)
+    assert ex.iloc[0]["cash_amount"] == 50.0
+
+
+def test_derive_ex_date_drops_dividend_before_first_trade():
+    p = _prices([(1, date(2021, 1, 4), 1000.0, 1000.0)])
+    div = pd.DataFrame([(1, date(2020, 12, 31), 50.0)],
+                       columns=["asset_id", "record_date", "cash_amount"])
+    assert derive_ex_dates(p, div).empty
+
+
+def test_end_to_end_record_date_reinvestment():
+    # record 2020-12-31 -> ex 2020-12-30; price drops by the dividend on ex-date
+    p = _prices([
+        (1, date(2020, 12, 29), 1000.0, 1000.0),
+        (1, date(2020, 12, 30), 950.0, 950.0),   # ex-date, -50 == dividend
+        (1, date(2021, 1, 4), 950.0, 950.0),
+    ])
+    div = pd.DataFrame([(1, date(2020, 12, 31), 50.0)],
+                       columns=["asset_id", "record_date", "cash_amount"])
+    ex = derive_ex_dates(p, div)
+    tr = compute_total_return_close(
+        p[["asset_id", "trade_date", "close", "adj_close"]], ex)
+    assert round(tr.iloc[-1], 4) == 950.0                 # latest == adj_close
+    assert abs(tr.iloc[1] / tr.iloc[0] - 1) < 1e-9        # ex-date total return ~0
 
 
 def test_absurd_yield_is_ignored():

@@ -20,6 +20,39 @@ import numpy as np
 import pandas as pd
 
 
+def derive_ex_dates(
+    prices: pd.DataFrame,
+    dividends: pd.DataFrame,
+) -> pd.DataFrame:
+    """KRX 배당은 ex_date(배당락일)가 없고 record_date(배당기준일)만 있다.
+
+    배당락일 ≈ **record_date 직전 거래일**(결제 T+2)로 근사한다. 자산별 실제
+    거래일(price_daily)을 써서 record_date 보다 엄격히 이전인 마지막 거래일에
+    배당을 붙인다. record_date 가 첫 거래일보다 앞서는 배당은 버린다.
+
+    dividends: [asset_id, record_date, cash_amount] → [asset_id, ex_date, cash_amount].
+    """
+    empty = pd.DataFrame(columns=["asset_id", "ex_date", "cash_amount"])
+    if dividends is None or len(dividends) == 0:
+        return empty
+    px = prices[["asset_id", "trade_date"]].copy()
+    px["trade_date"] = pd.to_datetime(px["trade_date"])
+    px = px.sort_values("trade_date").reset_index(drop=True)
+    div = dividends.dropna(subset=["record_date"]).copy()
+    if div.empty:
+        return empty
+    div["record_date"] = pd.to_datetime(div["record_date"])
+    div = div.sort_values("record_date").reset_index(drop=True)
+    merged = pd.merge_asof(
+        div, px, by="asset_id",
+        left_on="record_date", right_on="trade_date",
+        direction="backward", allow_exact_matches=False,
+    )
+    out = merged.dropna(subset=["trade_date"]).copy()
+    out["ex_date"] = out["trade_date"].dt.date
+    return out[["asset_id", "ex_date", "cash_amount"]]
+
+
 def compute_total_return_close(
     prices: pd.DataFrame,
     dividends: pd.DataFrame,
@@ -90,13 +123,15 @@ def _load_krx(conn):
             columns=["asset_id", "trade_date", "close", "adj_close",
                      "current_trc"],
         )
+        # KRX cash dividends carry record_date (배당기준일), not ex_date.
+        # ex_date is derived from record_date against each asset's trading days.
         c.execute(
-            "SELECT asset_id, ex_date, cash_amount FROM corporate_action "
+            "SELECT asset_id, record_date, cash_amount FROM corporate_action "
             "WHERE action_type='cash_dividend' AND cash_amount IS NOT NULL "
-            "AND ex_date IS NOT NULL"
+            "AND record_date IS NOT NULL"
         )
         dividends = pd.DataFrame(
-            c.fetchall(), columns=["asset_id", "ex_date", "cash_amount"],
+            c.fetchall(), columns=["asset_id", "record_date", "cash_amount"],
         )
     for col in ("close", "adj_close", "current_trc"):
         prices[col] = pd.to_numeric(prices[col], errors="coerce")
@@ -118,13 +153,14 @@ def run(conn=None, *, dry_run: bool = True) -> dict:
     conn = conn or db.connect()
     try:
         prices, dividends = _load_krx(conn)
+        ex_dividends = derive_ex_dates(prices, dividends)
         new_trc = compute_total_return_close(
             prices[["asset_id", "trade_date", "close", "adj_close"]],
-            dividends,
+            ex_dividends,
             group_keys=["asset_id"],
         )
         prices["new_trc"] = new_trc.to_numpy()
-        div_assets = set(dividends.dropna(subset=["cash_amount"])["asset_id"])
+        div_assets = set(ex_dividends["asset_id"])
         changed = prices[
             prices["new_trc"].notna()
             & (
@@ -139,8 +175,9 @@ def run(conn=None, *, dry_run: bool = True) -> dict:
         )
         stats = {
             "krx_price_rows": int(len(prices)),
+            "dividend_events_with_record_date": int(len(dividends)),
             "dividend_assets": int(len(div_assets)),
-            "dividend_events": int(len(dividends.dropna(subset=["cash_amount"]))),
+            "ex_dividends_aligned": int(len(ex_dividends)),
             "rows_changed": int(len(changed)),
             "anchor_mismatch": anchor_bad,
             "dry_run": dry_run,

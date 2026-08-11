@@ -21,6 +21,7 @@ from pipeline.bronze import (
 from pipeline.common.paths import base_uri, ymd_to_dash
 from pipeline.silver import load
 from pipeline.silver import fmp_load
+from pipeline.silver import total_return
 from pipeline.silver_quality import migrate
 
 
@@ -211,6 +212,14 @@ def main() -> None:
         has_action_change=has_action_change,
     )
     print(f"[silver] incremental complete day={day}", flush=True)
+
+    # 배당 재투자 총수익(total_return_close) 유지: 새 배당이 들어온 KRX 자산만
+    # back-adjustment 앵커가 바뀌므로 그 자산 전체 시계열을 스코프 재계산한다.
+    # 비배당일 신규 행은 total_return_close == adj_close 가 이미 정답이라 무관.
+    tr_stats = total_return.run_daily(
+        datetime.strptime(day, "%Y%m%d").date()
+    )
+    print(f"[total-return] daily maintenance {tr_stats}", flush=True)
 
     # FMP is a separate source transaction. KRX/DART remains committed if FMP
     # later fails, and a task retry safely reuses the immutable raw objects.

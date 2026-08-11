@@ -111,12 +111,25 @@ def compute_total_return_close(
 # Batch recompute over the KRX price series in the DB.
 # ---------------------------------------------------------------------------
 
-def _load_krx(conn):
+def _load_krx(conn, asset_ids=None):
     import pandas as pd
+    scope = ""
+    params: tuple = ()
+    if asset_ids is not None:
+        ids = [int(a) for a in asset_ids]
+        if not ids:
+            empty_p = pd.DataFrame(
+                columns=["asset_id", "trade_date", "close", "adj_close",
+                         "current_trc"])
+            empty_d = pd.DataFrame(
+                columns=["asset_id", "record_date", "cash_amount"])
+            return empty_p, empty_d
+        scope = " AND asset_id = ANY(%s)"
+        params = (ids,)
     with conn.cursor() as c:
         c.execute(
             "SELECT asset_id, trade_date, close, adj_close, total_return_close "
-            "FROM price_daily WHERE source='KRX'"
+            f"FROM price_daily WHERE source='KRX'{scope}", params,
         )
         prices = pd.DataFrame(
             c.fetchall(),
@@ -128,7 +141,7 @@ def _load_krx(conn):
         c.execute(
             "SELECT asset_id, record_date, cash_amount FROM corporate_action "
             "WHERE action_type='cash_dividend' AND cash_amount IS NOT NULL "
-            "AND record_date IS NOT NULL"
+            f"AND record_date IS NOT NULL{scope}", params,
         )
         dividends = pd.DataFrame(
             c.fetchall(), columns=["asset_id", "record_date", "cash_amount"],
@@ -140,10 +153,28 @@ def _load_krx(conn):
     return prices, dividends
 
 
-def run(conn=None, *, dry_run: bool = True) -> dict:
+def assets_with_recent_dividend_changes(conn, since_date) -> list[int]:
+    """since_date 이후 loaded_at 된 현금배당이 있는 KRX asset_id 목록.
+
+    daily 증분에서 새로 들어오거나 정정된 배당의 자산만 골라 스코프 재계산한다.
+    """
+    with conn.cursor() as c:
+        c.execute(
+            "SELECT DISTINCT ca.asset_id FROM corporate_action ca "
+            "WHERE ca.action_type='cash_dividend' AND ca.loaded_at >= %s "
+            "AND EXISTS (SELECT 1 FROM price_daily p "
+            "            WHERE p.asset_id=ca.asset_id AND p.source='KRX')",
+            (since_date,),
+        )
+        return [int(r[0]) for r in c.fetchall()]
+
+
+def run(conn=None, *, dry_run: bool = True, asset_ids=None) -> dict:
     """KRX total_return_close 를 배당 재투자로 재계산한다.
 
     dry_run=True: 통계만 반환(쓰기 없음). False: 값이 바뀌는 행만 UPDATE 한다.
+    asset_ids 를 주면 해당 자산만 스코프 재계산한다(daily 증분용). 자산은 서로
+    독립이라 부분 재계산 결과가 전체와 동일하다.
     total_return_close 한 컬럼만 건드리므로 truncate/reload 는 없다.
     """
     import pandas as pd
@@ -152,7 +183,12 @@ def run(conn=None, *, dry_run: bool = True) -> dict:
     owns = conn is None
     conn = conn or db.connect()
     try:
-        prices, dividends = _load_krx(conn)
+        prices, dividends = _load_krx(conn, asset_ids=asset_ids)
+        if prices.empty:
+            if owns:
+                conn.rollback()
+            return {"krx_price_rows": 0, "rows_changed": 0, "rows_updated": 0,
+                    "dry_run": dry_run, "scoped": asset_ids is not None}
         ex_dividends = derive_ex_dates(prices, dividends)
         new_trc = compute_total_return_close(
             prices[["asset_id", "trade_date", "close", "adj_close"]],
@@ -210,6 +246,29 @@ def run(conn=None, *, dry_run: bool = True) -> dict:
             )
             stats["rows_updated"] = c.rowcount
         conn.commit()
+        return stats
+    finally:
+        if owns:
+            conn.close()
+
+
+def run_daily(target_date, conn=None) -> dict:
+    """daily 증분 유지: target_date 이후 로드된 배당이 있는 KRX 자산만 재계산한다.
+
+    비배당일 신규 행은 total_return_close == adj_close 가 이미 정답(계수 1)이라
+    건드릴 필요가 없다. 새 배당이 들어온 자산만 back-adjustment 앵커가 바뀌므로
+    그 자산 전체 시계열을 스코프 재계산한다.
+    """
+    from pipeline.common import db
+
+    owns = conn is None
+    conn = conn or db.connect()
+    try:
+        assets = assets_with_recent_dividend_changes(conn, target_date)
+        if not assets:
+            return {"changed_dividend_assets": 0, "rows_updated": 0}
+        stats = run(conn, dry_run=False, asset_ids=assets)
+        stats["changed_dividend_assets"] = len(assets)
         return stats
     finally:
         if owns:

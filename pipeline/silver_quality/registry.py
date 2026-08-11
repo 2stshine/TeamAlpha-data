@@ -254,6 +254,26 @@ def run_registered_rules(
             samples=list(negative_dividend.get("samples", []))[:20],
             partition_key=partition_key,
         ))
+    implausible_value = bundle.stats.get("fundamental", {}).get(
+        "implausible_value_excluded",
+        {"row_count": 0, "samples": []},
+    )
+    implausible_value_rows = int(implausible_value.get("row_count", 0))
+    if implausible_value_rows > 0:
+        results.append(CheckResult(
+            rule_code="FUNDAMENTAL_VALUE_EXCLUDED",
+            dataset="fundamental",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected=(
+                "physically impossible values (total_assets<=0, revenue<0, "
+                "total_liabilities<0) are excluded before publish"
+            ),
+            actual=f"excluded_rows={implausible_value_rows}",
+            failed_count=0,
+            samples=list(implausible_value.get("samples", []))[:20],
+            partition_key=partition_key,
+        ))
     gross_excluded = bundle.stats.get("fundamental", {}).get(
         "accounting_equation_gross_excluded",
         {"row_count": 0, "scope_count": 0, "samples": []},

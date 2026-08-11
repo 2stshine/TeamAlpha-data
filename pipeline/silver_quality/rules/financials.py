@@ -81,6 +81,18 @@ def check_financials(
         partition_key=partition_key,
     ))
 
+    value_num = pd.to_numeric(df["value"], errors="coerce")
+    implausible = df[
+        (df["metric"].isin({"total_assets"}) & value_num.le(0))
+        | (df["metric"].isin({"revenue", "total_liabilities"}) & value_num.lt(0))
+    ]
+    checks.append(result(
+        "FUNDAMENTAL_VALUE_PLAUSIBILITY", "fundamental", Severity.ERROR,
+        implausible,
+        "total_assets > 0; revenue and total_liabilities >= 0",
+        partition_key=partition_key,
+    ))
+
     accounting_df = df[~dividend]
     pivot = accounting_df.pivot_table(
         index=filing_scope,

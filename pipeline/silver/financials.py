@@ -69,6 +69,12 @@ NONNEGATIVE_DIVIDEND_METRICS = frozenset({
     "cash_dividend_per_share",
     "stock_dividend_per_share",
 })
+# 부호가 물리적으로 불가능한 값은 원천/파싱 오류다(결측이 0으로 기록되는 등).
+# total_assets 는 항상 양수여야 하고(자산총계 0/음수 불가), revenue·total_liabilities
+# 는 음수가 될 수 없다. total_equity·net_income·operating_income 등은 적자로 음수가
+# 가능하므로 제약하지 않는다.
+STRICTLY_POSITIVE_METRICS = frozenset({"total_assets"})
+NONNEGATIVE_VALUE_METRICS = frozenset({"revenue", "total_liabilities"})
 
 
 def _available_date(period_end: date, fiscal_period: str, filed: date | None) -> date:
@@ -745,6 +751,35 @@ def prepare(
             df = df[~neg_mask].reset_index(drop=True)
             excluded_rows += negative_dividend_rows
 
+    # 물리적으로 불가능한 재무 값 제외: total_assets<=0, revenue<0, total_liabilities<0.
+    # 결측이 0 으로 파싱되거나 원천 부호오류인 경우로, factor(가치·퀄리티·P/S 등)를
+    # 오염시키므로 제외하고 MODIFIED 로 남긴다(FUNDAMENTAL_VALUE_PLAUSIBILITY 는 ERROR).
+    implausible_value_rows = 0
+    implausible_value_samples: list[dict] = []
+    if not df.empty and "metric" in df.columns:
+        numeric = pd.to_numeric(df["value"], errors="coerce")
+        bad_mask = (
+            (df["metric"].isin(STRICTLY_POSITIVE_METRICS) & numeric.le(0))
+            | (df["metric"].isin(NONNEGATIVE_VALUE_METRICS) & numeric.lt(0))
+        )
+        if bad_mask.any():
+            bad = df[bad_mask]
+            implausible_value_rows = int(len(bad))
+            cols = [
+                c for c in (
+                    "identifier", "period_end", "fiscal_period",
+                    "metric", "value", "revision_key",
+                )
+                if c in bad.columns
+            ]
+            implausible_value_samples = (
+                bad.head(20)[cols].astype(object)
+                .where(pd.notna(bad.head(20)[cols]), None)
+                .to_dict("records")
+            )
+            df = df[~bad_mask].reset_index(drop=True)
+            excluded_rows += implausible_value_rows
+
     return df, {
         "input_rows": input_rows,
         "transformed_rows": len(df),
@@ -752,6 +787,10 @@ def prepare(
         "negative_dividend_excluded": {
             "row_count": negative_dividend_rows,
             "samples": negative_dividend_samples,
+        },
+        "implausible_value_excluded": {
+            "row_count": implausible_value_rows,
+            "samples": implausible_value_samples,
         },
         "accounting_equation_gross_excluded": {
             "row_count": gross_excluded_rows,

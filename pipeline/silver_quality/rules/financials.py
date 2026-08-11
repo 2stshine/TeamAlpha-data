@@ -240,7 +240,7 @@ def check_financials(
             & pd.to_numeric(dividend_rows["value"], errors="coerce").lt(0)
         ]
         checks.append(result(
-            "DIVIDEND_NONNEGATIVE", "fundamental", Severity.WARNING,
+            "DIVIDEND_NONNEGATIVE", "fundamental", Severity.ERROR,
             nonnegative, "cash amount, yield and per-share dividend >= 0",
             partition_key=partition_key,
         ))

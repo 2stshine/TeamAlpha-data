@@ -234,6 +234,26 @@ def run_registered_rules(
             samples=list(presentation_conflict.get("samples", []))[:20],
             partition_key=partition_key,
         ))
+    negative_dividend = bundle.stats.get("fundamental", {}).get(
+        "negative_dividend_excluded",
+        {"row_count": 0, "samples": []},
+    )
+    negative_dividend_rows = int(negative_dividend.get("row_count", 0))
+    if negative_dividend_rows > 0:
+        results.append(CheckResult(
+            rule_code="NEGATIVE_DIVIDEND_EXCLUDED",
+            dataset="fundamental",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected=(
+                "cash amount, yield and per-share dividend are non-negative; "
+                "negative source values are excluded before publish"
+            ),
+            actual=f"excluded_rows={negative_dividend_rows}",
+            failed_count=0,
+            samples=list(negative_dividend.get("samples", []))[:20],
+            partition_key=partition_key,
+        ))
     replacement = bundle.stats.get("fundamental", {}).get(
         "accounting_equation_supplement_replacement",
         {"row_count": 0, "scope_count": 0, "samples": []},

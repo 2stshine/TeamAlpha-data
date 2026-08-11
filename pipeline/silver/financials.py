@@ -58,6 +58,14 @@ ACCOUNTING_METRICS = (
     "total_equity",
 )
 ACCOUNTING_TOLERANCE = 0.01
+# 배당수익률·주당배당·현금배당총액은 음수가 불가능하다. 음수 값은 원천/파싱
+# 오류이므로 신뢰할 수 없어 적재 단계에서 제외한다(DIVIDEND_NONNEGATIVE 는 ERROR).
+NONNEGATIVE_DIVIDEND_METRICS = frozenset({
+    "total_cash_dividend",
+    "dividend_yield",
+    "cash_dividend_per_share",
+    "stock_dividend_per_share",
+})
 
 
 def _available_date(period_end: date, fiscal_period: str, filed: date | None) -> date:
@@ -667,10 +675,41 @@ def prepare(
                 excluded_rows += presentation_conflict_rows
     df = df.drop(columns="_ord", errors="ignore")
 
+    # 음수 배당 제외: dividend_yield/주당배당/현금배당총액이 음수인 행은 원천 또는
+    # 파싱 오류다(배당은 음수 불가). 값을 신뢰할 수 없어 제외하고 MODIFIED 로 남긴다.
+    negative_dividend_rows = 0
+    negative_dividend_samples: list[dict] = []
+    if not df.empty and "metric" in df.columns:
+        neg_mask = (
+            df["metric"].isin(NONNEGATIVE_DIVIDEND_METRICS)
+            & pd.to_numeric(df["value"], errors="coerce").lt(0)
+        )
+        if neg_mask.any():
+            neg = df[neg_mask]
+            negative_dividend_rows = int(len(neg))
+            sample_cols = [
+                c for c in (
+                    "identifier", "period_end", "fiscal_period",
+                    "metric", "value", "revision_key",
+                )
+                if c in neg.columns
+            ]
+            negative_dividend_samples = (
+                neg.head(20)[sample_cols].astype(object)
+                .where(pd.notna(neg.head(20)[sample_cols]), None)
+                .to_dict("records")
+            )
+            df = df[~neg_mask].reset_index(drop=True)
+            excluded_rows += negative_dividend_rows
+
     return df, {
         "input_rows": input_rows,
         "transformed_rows": len(df),
         "excluded_rows": excluded_rows,
+        "negative_dividend_excluded": {
+            "row_count": negative_dividend_rows,
+            "samples": negative_dividend_samples,
+        },
         "rejected_rows": rejected_rows,
         "known_net_income_ord_duplicate": {
             "row_count": known_duplicate_rows,

@@ -60,6 +60,82 @@ def test_accounting_difference_is_warning():
     assert not result.blocks_publish
 
 
+def _dividend_frame(value):
+    return pd.DataFrame([{
+        "identifier": "155900",
+        "source": "DART",
+        "statement_type": "DIVIDEND",
+        "data_basis": "REPORTED",
+        "period_end": date(2015, 12, 31),
+        "fiscal_period": "FY",
+        "fs_type": "UNKNOWN",
+        "filing_id": "20160426000563",
+        "filed": date(2016, 4, 26),
+        "available_date": date(2016, 4, 27),
+        "currency": "KRW",
+        "revision_key": "20160426000563:thstrm",
+        "metric": "cash_dividend_per_share",
+        "unit_type": "per_share",
+        "value": value,
+    }])
+
+
+def test_negative_dividend_is_blocking_error():
+    result = next(
+        r for r in check_financials(_dividend_frame(-1934.0))
+        if r.rule_code == "DIVIDEND_NONNEGATIVE"
+    )
+    assert result.status.value == "FAIL"
+    assert result.severity.value == "ERROR"
+    assert result.blocks_publish
+
+
+def test_nonnegative_dividend_passes():
+    result = next(
+        r for r in check_financials(_dividend_frame(1934.0))
+        if r.rule_code == "DIVIDEND_NONNEGATIVE"
+    )
+    assert result.status.value == "PASS"
+    assert not result.blocks_publish
+
+
+def test_prepare_excludes_negative_dividend_rows():
+    frame = pd.concat([_dividend_frame(-1934.0), _dividend_frame(863.0)],
+                      ignore_index=True)
+    # emulate prepare()'s tail exclusion directly on the metric/value contract
+    from pipeline.silver.financials import NONNEGATIVE_DIVIDEND_METRICS
+    neg_mask = (
+        frame["metric"].isin(NONNEGATIVE_DIVIDEND_METRICS)
+        & pd.to_numeric(frame["value"], errors="coerce").lt(0)
+    )
+    assert int(neg_mask.sum()) == 1
+    kept = frame[~neg_mask]
+    assert (kept["value"] >= 0).all()
+
+
+def test_negative_dividend_exclusion_reported_as_modified():
+    identifiers = pd.DataFrame([{
+        "natural_key": "155900", "source": "KRX", "identifier": "155900",
+    }])
+    results = run_registered_rules(CandidateBundle(
+        identifiers=identifiers,
+        fundamentals=_dividend_frame(863.0),
+        stats={"fundamental": {
+            "negative_dividend_excluded": {
+                "row_count": 3,
+                "samples": [{"identifier": "155900", "metric":
+                             "cash_dividend_per_share", "value": -1934.0}],
+            },
+        }},
+    ))
+    excluded = next(
+        r for r in results if r.rule_code == "NEGATIVE_DIVIDEND_EXCLUDED"
+    )
+    assert excluded.status.value == "PASS"
+    assert excluded.severity.value == "MODIFIED"
+    assert "excluded_rows=3" in excluded.actual
+
+
 def test_dart_only_rows_are_explicitly_excluded_and_reported():
     frame = pd.concat([
         _frame(),

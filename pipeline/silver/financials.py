@@ -58,6 +58,9 @@ ACCOUNTING_METRICS = (
     "total_equity",
 )
 ACCOUNTING_TOLERANCE = 0.01
+# 자산=부채+자본 상대오차가 이 값을 넘으면 재무제표 자체를 신뢰할 수 없어(단순
+# 표시오차 이상) 주요계정을 제외한다. 1%~이 값 사이는 WARNING 으로 검토만 한다.
+ACCOUNTING_GROSS_THRESHOLD = 0.10
 # 배당수익률·주당배당·현금배당총액은 음수가 불가능하다. 음수 값은 원천/파싱
 # 오류이므로 신뢰할 수 없어 적재 단계에서 제외한다(DIVIDEND_NONNEGATIVE 는 ERROR).
 NONNEGATIVE_DIVIDEND_METRICS = frozenset({
@@ -623,6 +626,46 @@ def prepare(
     for column in candidate_cols:
         if column != "_supplemental" and column not in df:
             df[column] = pd.Series(dtype="object")
+
+    # 재무 항등식 gross 제외: supplement 교체 후에도 자산=부채+자본이 10% 초과로
+    # 어긋나는 filing scope 는 재무제표 자체가 신뢰 불가라 주요계정 3종을 제외한다
+    # (FUNDAMENTAL_ACCOUNTING_EQUATION_GROSS 는 ERROR). 두 DART API 가 같은 비대사
+    # 값을 반환해 원천 불일치로 확인된 scope 는 별도 WARNING 으로 보존하므로 제외 대상이
+    # 아니다(rule 의 confirmed_keys 와 동일). 1~10% 는 WARNING 으로 계속 검토한다.
+    gross_excluded_rows = 0
+    gross_excluded_scopes = 0
+    gross_samples: list[dict] = []
+    if not df.empty and "metric" in df.columns:
+        confirmed_keys = {
+            tuple(k)
+            for k in source_accounting_inconsistency.get("scope_keys", [])
+        }
+        gross_drop: list = []
+        for key, group in df.groupby(filing_scope, sort=False):
+            if tuple(key) in confirmed_keys:
+                continue
+            rel = _accounting_relative_error(group)
+            if rel is not None and rel > ACCOUNTING_GROSS_THRESHOLD:
+                metric_rows = group.index[
+                    group["metric"].isin(ACCOUNTING_METRICS)
+                ].tolist()
+                gross_drop.extend(metric_rows)
+                gross_excluded_scopes += 1
+                if len(gross_samples) < 20:
+                    head = group.iloc[0]
+                    gross_samples.append({
+                        "identifier": head["identifier"],
+                        "period_end": head["period_end"],
+                        "fiscal_period": head["fiscal_period"],
+                        "fs_type": head["fs_type"],
+                        "revision_key": head["revision_key"],
+                        "relative_error": round(float(rel), 4),
+                    })
+        if gross_drop:
+            gross_excluded_rows = len(gross_drop)
+            df = df.drop(index=gross_drop).reset_index(drop=True)
+            excluded_rows += gross_excluded_rows
+
     balance_metrics = {
         metric
         for metric, statements in SUPPLEMENT_STATEMENT_BY_METRIC.items()
@@ -709,6 +752,11 @@ def prepare(
         "negative_dividend_excluded": {
             "row_count": negative_dividend_rows,
             "samples": negative_dividend_samples,
+        },
+        "accounting_equation_gross_excluded": {
+            "row_count": gross_excluded_rows,
+            "scope_count": gross_excluded_scopes,
+            "samples": gross_samples,
         },
         "rejected_rows": rejected_rows,
         "known_net_income_ord_duplicate": {

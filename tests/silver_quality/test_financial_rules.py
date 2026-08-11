@@ -60,6 +60,50 @@ def test_accounting_difference_is_warning():
     assert not result.blocks_publish
 
 
+def test_gross_accounting_imbalance_blocks():
+    frame = _frame()
+    frame.loc[frame["metric"] == "total_equity", "value"] = 10.0  # 30% error
+    gross = next(
+        r for r in check_financials(frame)
+        if r.rule_code == "FUNDAMENTAL_ACCOUNTING_EQUATION_GROSS"
+    )
+    assert gross.status.value == "FAIL"
+    assert gross.severity.value == "ERROR"
+    assert gross.blocks_publish
+
+
+def test_moderate_accounting_imbalance_is_not_gross():
+    frame = _frame()
+    frame.loc[frame["metric"] == "total_equity", "value"] = 35.0  # 5% error
+    results = {r.rule_code: r for r in check_financials(frame)}
+    assert results["FUNDAMENTAL_ACCOUNTING_EQUATION"].status.value == "FAIL"
+    assert not results["FUNDAMENTAL_ACCOUNTING_EQUATION"].blocks_publish
+    assert results["FUNDAMENTAL_ACCOUNTING_EQUATION_GROSS"].status.value == "PASS"
+    assert not results["FUNDAMENTAL_ACCOUNTING_EQUATION_GROSS"].blocks_publish
+
+
+def test_gross_exclusion_reported_as_modified():
+    identifiers = pd.DataFrame([{
+        "natural_key": "005930", "source": "KRX", "identifier": "005930",
+    }])
+    results = run_registered_rules(CandidateBundle(
+        identifiers=identifiers,
+        fundamentals=_frame(),
+        stats={"fundamental": {
+            "accounting_equation_gross_excluded": {
+                "row_count": 6, "scope_count": 2,
+                "samples": [{"identifier": "015540", "relative_error": 0.22}],
+            },
+        }},
+    ))
+    excluded = next(
+        r for r in results if r.rule_code == "ACCOUNTING_EQUATION_GROSS_EXCLUDED"
+    )
+    assert excluded.severity.value == "MODIFIED"
+    assert excluded.status.value == "PASS"
+    assert "scopes=2" in excluded.actual
+
+
 def _dividend_frame(value):
     return pd.DataFrame([{
         "identifier": "155900",

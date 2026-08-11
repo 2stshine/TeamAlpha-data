@@ -254,6 +254,29 @@ def run_registered_rules(
             samples=list(negative_dividend.get("samples", []))[:20],
             partition_key=partition_key,
         ))
+    gross_excluded = bundle.stats.get("fundamental", {}).get(
+        "accounting_equation_gross_excluded",
+        {"row_count": 0, "scope_count": 0, "samples": []},
+    )
+    gross_excluded_rows = int(gross_excluded.get("row_count", 0))
+    if gross_excluded_rows > 0:
+        results.append(CheckResult(
+            rule_code="ACCOUNTING_EQUATION_GROSS_EXCLUDED",
+            dataset="fundamental",
+            severity=Severity.MODIFIED,
+            status=CheckStatus.PASS,
+            expected=(
+                "filing scopes whose assets != liabilities + equity by >10% are "
+                "excluded before publish (statement untrustworthy)"
+            ),
+            actual=(
+                f"excluded_rows={gross_excluded_rows}, "
+                f"scopes={int(gross_excluded.get('scope_count', 0))}"
+            ),
+            failed_count=0,
+            samples=list(gross_excluded.get("samples", []))[:20],
+            partition_key=partition_key,
+        ))
     replacement = bundle.stats.get("fundamental", {}).get(
         "accounting_equation_supplement_replacement",
         {"row_count": 0, "scope_count": 0, "samples": []},

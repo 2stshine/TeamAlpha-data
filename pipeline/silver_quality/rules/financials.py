@@ -138,6 +138,31 @@ def check_financials(
         samples=accounting_samples,
         partition_key=partition_key,
     ))
+    # Gross imbalance (>10%) is not a presentation quirk — the statement itself is
+    # untrustworthy — so it blocks. Load-time exclusion drops these scopes before
+    # publish, so this fires only if a gross scope somehow reaches evaluation.
+    if len(accounting_scopes) and "relative_error" in accounting_scopes:
+        gross_scopes = accounting_scopes[
+            accounting_scopes["relative_error"] > 0.10
+        ]
+    else:
+        gross_scopes = accounting_scopes.iloc[0:0]
+    gross_samples = (
+        gross_scopes.head(20).astype(object)
+        .where(pd.notna(gross_scopes.head(20)), None)
+        .to_dict("records")
+    )
+    checks.append(CheckResult(
+        rule_code="FUNDAMENTAL_ACCOUNTING_EQUATION_GROSS",
+        dataset="fundamental",
+        severity=Severity.ERROR,
+        status=CheckStatus.FAIL if len(gross_scopes) else CheckStatus.PASS,
+        expected="Assets ≈ Liabilities + Equity within 10% per filing revision",
+        actual=f"gross_scopes={len(gross_scopes)}",
+        failed_count=len(gross_scopes),
+        samples=gross_samples,
+        partition_key=partition_key,
+    ))
     confirmed = source_inconsistency or {}
     confirmed_scopes = int(confirmed.get("scope_count", 0))
     confirmed_rows = int(confirmed.get("row_count", 0))

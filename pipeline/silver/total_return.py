@@ -209,6 +209,12 @@ def run(conn=None, *, dry_run: bool = True, asset_ids=None) -> dict:
         anchor_bad = int(
             ((latest["new_trc"] - latest["adj_close"]).abs() > 1e-4).sum()
         )
+        # sanity: total return must be finite and strictly positive
+        import numpy as _np
+        nonpos = int(
+            (~_np.isfinite(prices["new_trc"].to_numpy(dtype="float64"))
+             | (prices["new_trc"] <= 0)).sum()
+        )
         stats = {
             "krx_price_rows": int(len(prices)),
             "dividend_events_with_record_date": int(len(dividends)),
@@ -216,14 +222,17 @@ def run(conn=None, *, dry_run: bool = True, asset_ids=None) -> dict:
             "ex_dividends_aligned": int(len(ex_dividends)),
             "rows_changed": int(len(changed)),
             "anchor_mismatch": anchor_bad,
+            "nonpositive_total_return": nonpos,
             "dry_run": dry_run,
         }
         if dry_run or changed.empty:
             conn.rollback()
             return stats
-        if anchor_bad:
+        if anchor_bad or nonpos:
             conn.rollback()
-            stats["aborted"] = "anchor mismatch > 0"
+            stats["aborted"] = (
+                "anchor mismatch" if anchor_bad else "non-positive total return"
+            )
             return stats
         with conn.cursor() as c:
             c.execute(

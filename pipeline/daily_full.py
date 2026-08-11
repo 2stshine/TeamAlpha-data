@@ -22,6 +22,7 @@ from pipeline.common.paths import base_uri, ymd_to_dash
 from pipeline.silver import load
 from pipeline.silver import fmp_load
 from pipeline.silver import total_return
+from pipeline.silver_quality import freshness
 from pipeline.silver_quality import migrate
 
 
@@ -230,6 +231,14 @@ def main() -> None:
     _download_keys(bucket, fmp_keys, root)
     fmp_load.run(src="local", day=fmp_day)
     print(f"[fmp] daily complete day={fmp_day}", flush=True)
+
+    # 신선도 자기점검(비치명적). 파이프라인이 아예 멈춘 경우까지 잡으려면 별도
+    # 스케줄로 `python -m pipeline.silver_quality.freshness` 를 돌린다.
+    try:
+        fr = freshness.assert_fresh()
+        print(f"[freshness] ok {fr['sources']}", flush=True)
+    except RuntimeError as exc:
+        print(f"[freshness] WARNING {exc}", flush=True)
 
 
 if __name__ == "__main__":

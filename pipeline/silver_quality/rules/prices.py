@@ -838,6 +838,19 @@ def check_prices(
         partition_key=partition_key,
     ))
 
+    # total_return_close(배당 재투자 총수익)는 항상 유한·양수여야 한다. 배당 재투자
+    # 계산이 깨지면 여기서 차단된다(published 데이터 audit 시 실효).
+    if "total_return_close" in prices.columns:
+        total_return_bad = prices[
+            prices["total_return_close"].notna()
+            & (prices["total_return_close"] <= 0)
+        ]
+        checks.append(result(
+            "PRICE_TOTAL_RETURN_POSITIVE", "price_daily", Severity.ERROR,
+            total_return_bad, "total_return_close > 0 where present",
+            partition_key=partition_key,
+        ))
+
     negatives = prices[
         (prices[["volume", "trading_value", "market_cap"]].fillna(0) < 0).any(axis=1)
         | ((prices["asset_type"] == "stock") & (prices["shares"].fillna(0) <= 0))

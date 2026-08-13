@@ -63,3 +63,15 @@ def test_source_receipt_schema_idempotently_admits_krx_alphanumeric_codes():
     ).read_text(encoding="utf-8")
     assert "pg_get_constraintdef" in rebuild
     assert "KRX_TICKER_REGEX" in rebuild
+
+
+def test_cash_scale_support_ratio_precision_preserves_reviewed_terms():
+    schema = (ROOT / "sql/schema.sql").read_text(encoding="utf-8")
+    migration = (
+        ROOT / "pipeline/silver_quality/migrations/"
+        "011_cash_scale_ratio_precision.sql"
+    ).read_text(encoding="utf-8")
+    assert "support_ratio_numerator NUMERIC(28,12)" in schema
+    assert "support_ratio_denominator NUMERIC(28,12)" in schema
+    assert "support_ratio_numerator TYPE NUMERIC(28,12)" in migration
+    assert "support_ratio_denominator TYPE NUMERIC(28,12)" in migration

@@ -36,6 +36,7 @@ from pipeline.silver.dividend_evidence import (
 )
 from pipeline.silver.krx_kind_reference import (
     KIND_COMPONENT_REPORT_NAME_61474,
+    KIND_COMPONENT_REPORT_NAME_11306,
     KIND_REFERENCE_REPORT_NAME_70767,
     KIND_REFERENCE_REPORT_NAME_99311,
 )
@@ -48,6 +49,10 @@ from pipeline.silver.return_identity import (
     krx_common_stock_identity_digest,
 )
 from pipeline.silver.return_contract import CONTRACT_RELEASE
+from pipeline.silver.reviewed_cash_scale_exceptions import (
+    PAID_RIGHTS_COMPONENT_BODY_SHA256,
+    PAID_RIGHTS_IDENTITY,
+)
 
 
 CONTRACT_START = date(2015, 1, 1)
@@ -199,6 +204,42 @@ def _canonical_support_groups(value: object) -> tuple[str, ...]:
     return tuple(canonical)
 
 
+def _viewer_bonus_group_parity(
+    parent: dict[str, object],
+    child: dict[str, object],
+    groups: tuple[str, ...],
+) -> bool:
+    """Bind the producer's sole canonical bonus group to DB row semantics."""
+    if len(groups) != 1:
+        return False
+    numerator = _positive_float(child["support_ratio_numerator"])
+    denominator = _positive_float(child["support_ratio_denominator"])
+    effective = pd.Timestamp(child["support_ex_date"]).date()
+    expected = (
+        f"{parent['ticker']}|{effective.isoformat()}|BONUS_ISSUE|"
+        f"{format(numerator / denominator, '.12g')}"
+    )
+    return groups == (expected,)
+
+
+def _viewer_stock_dividend_group_parity(
+    parent: dict[str, object],
+    child: dict[str, object],
+    groups: tuple[str, ...],
+) -> bool:
+    """Bind the producer's sole canonical stock-dividend group exactly."""
+    if len(groups) != 1:
+        return False
+    numerator = _positive_float(child["support_ratio_numerator"])
+    denominator = _positive_float(child["support_ratio_denominator"])
+    record = pd.Timestamp(child["support_record_date"]).date()
+    expected = (
+        f"{parent['ticker']}|{record.isoformat()}|STOCK_DIVIDEND|"
+        f"{format(numerator / denominator, '.12g')}"
+    )
+    return groups == (expected,)
+
+
 def _validate_scale_source_rows(
     parents: pd.DataFrame,
     supports: pd.DataFrame,
@@ -261,7 +302,10 @@ def _validate_scale_source_rows(
                         ("DART_DISCLOSURE", "stock_dividend"),
                         ("DART_DISCLOSURE", "combined_detachment"),
                         ("DART_STRUCTURED", "bonus_issue"),
+                        ("DART_VIEWER", "bonus_issue"),
+                        ("DART_VIEWER", "stock_dividend"),
                         ("KRX_KIND", "stock_dividend"),
+                        ("KRX_KIND", "paid_increase"),
                         ("KRX_KIND", "ex_dividend"),
                         ("KRX_KIND", "rights_detachment"),
                         ("KRX_KIND", "combined_detachment"),
@@ -293,15 +337,21 @@ def _validate_scale_source_rows(
                 if role == "ADJUSTMENT_COMPONENT":
                     if source_type not in {
                         ("DART_STRUCTURED", "bonus_issue"),
+                        ("DART_VIEWER", "bonus_issue"),
+                        ("DART_VIEWER", "stock_dividend"),
                         ("DART_DISCLOSURE", "stock_dividend"),
                         ("KRX_KIND", "stock_dividend"),
+                        ("KRX_KIND", "paid_increase"),
                     }:
                         return False, 0
                     security_classes = (
                         child["support_entitlement_security_class"],
                         child["support_distributed_security_class"],
                     )
-                    if source_type == ("DART_STRUCTURED", "bonus_issue"):
+                    if source_type in {
+                        ("DART_STRUCTURED", "bonus_issue"),
+                        ("DART_VIEWER", "bonus_issue"),
+                    }:
                         numerator = _positive_float(
                             child["support_ratio_numerator"]
                         )
@@ -317,6 +367,48 @@ def _validate_scale_source_rows(
                             ) != _decimal(expected, _DECIMAL_12)
                         ):
                             return False, 0
+                        if source_type == ("DART_VIEWER", "bonus_issue"):
+                            body_sha = str(
+                                child["support_action_body_sha256"] or ""
+                            )
+                            body_path = str(
+                                child["support_action_body_path"] or ""
+                            )
+                            report_name = re.sub(
+                                r"\s+", "",
+                                str(child["support_report_name"] or ""),
+                            )
+                            if (
+                                re.fullmatch(r"[0-9]{14}", str(
+                                    child["support_action_key"] or ""
+                                )) is None
+                                or re.fullmatch(
+                                    r"corporate_actions/dart/"
+                                    r"support_action_families/objects/"
+                                    r"sha256=([0-9a-f]{64})\.html",
+                                    body_path,
+                                ) is None
+                                or not body_path.endswith(
+                                    f"sha256={body_sha}.html"
+                                )
+                                or re.fullmatch(
+                                    r"(?:\[기재정정\])?"
+                                    r"주요사항보고서\(무상증자결정\)",
+                                    report_name,
+                                ) is None
+                                or child["support_ex_date"] is None
+                                or pd.isna(child["support_ex_date"])
+                                or (
+                                    child["support_record_date"] is not None
+                                    and not pd.isna(
+                                        child["support_record_date"]
+                                    )
+                                )
+                                or not _viewer_bonus_group_parity(
+                                    parent, child, groups,
+                                )
+                            ):
+                                return False, 0
                     else:
                         _positive_float(child["support_ratio_numerator"])
                         _positive_float(child["support_ratio_denominator"])
@@ -325,12 +417,93 @@ def _validate_scale_source_rows(
                             ("COMMON_AND_PREFERRED", "NEW_PREFERRED"),
                         }:
                             return False, 0
-                        if (
-                            source_type == ("KRX_KIND", "stock_dividend")
-                            and child["support_report_name"]
+                        if source_type == ("KRX_KIND", "stock_dividend") and (
+                            child["support_report_name"]
                             != KIND_COMPONENT_REPORT_NAME_61474
                         ):
                             return False, 0
+                        if source_type == ("KRX_KIND", "paid_increase"):
+                            paid_identity = (
+                                str(parent["ticker"]).zfill(6),
+                                str(parent["cash_receipt_no"]),
+                                pd.Timestamp(
+                                    parent["adjustment_trade_date"]
+                                ).date().isoformat(),
+                                str(child["support_action_key"]),
+                                pd.Timestamp(
+                                    child["support_record_date"]
+                                ).date().isoformat(),
+                                format(
+                                    float(child["support_ratio_numerator"])
+                                    / float(child["support_ratio_denominator"]),
+                                    ".12g",
+                                ),
+                            )
+                            if (
+                                paid_identity != PAID_RIGHTS_IDENTITY
+                                or str(child["support_action_body_sha256"])
+                                != PAID_RIGHTS_COMPONENT_BODY_SHA256
+                                or child["support_report_name"]
+                                != KIND_COMPONENT_REPORT_NAME_11306
+                                or security_classes != ("COMMON", "COMMON")
+                                or (
+                                    child["support_expected_price_factor"]
+                                    is not None
+                                    and not pd.isna(
+                                        child["support_expected_price_factor"]
+                                    )
+                                )
+                            ):
+                                return False, 0
+                        if source_type == ("DART_VIEWER", "stock_dividend"):
+                            body_sha = str(
+                                child["support_action_body_sha256"] or ""
+                            )
+                            body_path = str(
+                                child["support_action_body_path"] or ""
+                            )
+                            report_name = re.sub(
+                                r"\s+", "",
+                                str(child["support_report_name"] or ""),
+                            )
+                            expected_factor = child.get(
+                                "support_expected_price_factor"
+                            )
+                            if (
+                                security_classes != ("COMMON", "COMMON")
+                                or re.fullmatch(
+                                    r"[0-9]{14}", str(
+                                        child["support_action_key"] or ""
+                                    ),
+                                ) is None
+                                or re.fullmatch(
+                                    r"corporate_actions/dart/"
+                                    r"support_action_families/objects/"
+                                    r"sha256=([0-9a-f]{64})\.html",
+                                    body_path,
+                                ) is None
+                                or not body_path.endswith(
+                                    f"sha256={body_sha}.html"
+                                )
+                                or re.fullmatch(
+                                    r"(?:\[기재정정\])?주식배당결정",
+                                    report_name,
+                                ) is None
+                                or (
+                                    child["support_ex_date"] is not None
+                                    and not pd.isna(child["support_ex_date"])
+                                )
+                                or child["support_record_date"] is None
+                                or pd.isna(child["support_record_date"])
+                                or (
+                                    expected_factor is not None
+                                    and not pd.isna(expected_factor)
+                                )
+                                or not _viewer_stock_dividend_group_parity(
+                                    parent, child, groups,
+                                )
+                            ):
+                                return False, 0
                 elif source_type not in {
                     ("DART_DISCLOSURE", "ex_dividend"),
                     ("DART_DISCLOSURE", "rights_detachment"),
@@ -1585,11 +1758,6 @@ def audit(conn=None, *, use_existing_transaction: bool = False) -> dict:
                                  se.support_report_name
                               OR ca.action_scope IS DISTINCT FROM
                                  se.support_action_scope
-                              OR (
-                                  se.support_action_type='stock_dividend'
-                                  AND se.support_record_date IS DISTINCT FROM
-                                      dr.record_date
-                              )
                           )
                         """,
                         (action_snapshot_run_id,),

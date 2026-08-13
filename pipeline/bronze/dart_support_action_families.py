@@ -8,9 +8,10 @@ viewer body for every stock-dividend and structured bonus-issue candidate.
 
 Collection is local-only and opt-in: without ``--apply`` no HTTP request and no
 write is performed.  Main/body objects are stored under their SHA-256 names and
-the final manifest is installed atomically only after a complete round-trip
-verification.  Silver consumes the verified family identity; it must not
-reconstruct a family from dates or receipt-number proximity.
+the current complete manifest is replaced atomically only after a complete
+round-trip verification.  Older content-addressed objects remain immutable.
+Silver consumes the verified family identity; it must not reconstruct a family
+from dates or receipt-number proximity.
 """
 from __future__ import annotations
 
@@ -34,20 +35,32 @@ from urllib.parse import urlencode
 import requests
 
 from pipeline.bronze.corporate_actions import (
-    _event_api_for_title,
-    _needs_document,
+    _candidate_corp_to_stock,
+    _document_candidate_receipts,
+    _is_listed_disclosure_candidate,
+    _listed_disclosure_ticker,
+    _structured_query_keys,
 )
 from pipeline.bronze.dart_disclosure_observations import (
     canonicalize_disclosures,
 )
 
 
-SCHEMA_VERSION = "dart_support_action_family_snapshot_v2"
-SOURCE_CONTRACT = "dart_official_main_family_attachment_viewer_body_v2"
+SCHEMA_VERSION = "dart_support_action_family_snapshot_v3"
+# The serialized field layout remains v3.  v4 records the stricter semantic
+# source interpretation (viewer fallback, optional origin provenance, and
+# body-labelled terminal states) without adding mutable manifest fields.
+SOURCE_CONTRACT = "dart_official_main_family_attachment_viewer_body_v4"
 FAMILY_ORDER_CONTRACT = "OFFICIAL_MAIN_AND_ATTACHMENT_NEWEST_TO_OLDEST"
 TERMINAL_RATIO_CONTRACT = (
     "PER_ELIGIBLE_COMMON_SHARE_ENTITLEMENT_NOT_PRICE_DILUTION"
 )
+# The certified total-return action history starts here.  A correction inside
+# that history can legitimately point at an older official DART family root.
+# Complete pre-coverage list intervals therefore remain available below as
+# exact dependency lookup/provenance, but they must not silently enlarge the
+# support candidate set (or its digest) before the certified coverage floor.
+SUPPORT_FAMILY_COVERAGE_START = date(2015, 1, 1)
 MANIFEST_RELATIVE_PATH = Path(
     "corporate_actions/dart/support_action_families/manifest.json"
 )
@@ -129,11 +142,67 @@ class VerifiedSupportActionFamilies:
     base: str
     manifest_path: str
     manifest_sha256: str
+    seed_coverage_start: date
+    seed_coverage_end: date
     candidate_count: int
     candidate_digest: str
     entry_count: int
     entry_digest: str
     entries: tuple[SupportActionFamilyEntry, ...]
+
+
+@dataclass(frozen=True)
+class BonusIssueCommonTerms:
+    """Exact ordinary-share entitlement and record date from a DART body."""
+
+    common_ratio: float
+    record_date: str
+
+
+@dataclass(frozen=True)
+class StockDividendCommonTerms:
+    """Exact common-share entitlement and record date from a DART body."""
+
+    common_ratio: float
+    record_date: str
+
+
+# Closed recovery set reviewed against the fresh official ``main.do`` family
+# selector and the content-addressed terminal viewer body.  OpenDART does not
+# expose current structured economics for these four corrected decisions, so
+# Silver may use the viewer body only when every frozen family/economic field
+# below matches exactly.  Keeping this identity in Bronze lets every consumer
+# re-apply the same restriction instead of trusting the builder's selection.
+VIEWER_STOCK_DIVIDEND_FALLBACKS = frozenset({
+    ("032960", "20151216900093", "20151228900387", "2015-12-31", "0.05"),
+    ("033540", "20151207900194", "20151228900494", "2015-12-31", "0.0085763"),
+    ("045970", "20191202900143", "20191226900105", "2019-12-31", "0.04"),
+    ("187270", "20171220900499", "20171222900807", "2017-12-31", "0.02"),
+})
+
+
+def viewer_stock_dividend_fallback_identity(
+    ticker: object,
+    root_receipt_no: object,
+    terminal_receipt_no: object,
+    record_date: object,
+    common_ratio: object,
+) -> tuple[str, str, str, str, str]:
+    """Canonical identity used by all four viewer-fallback trust boundaries."""
+    return (
+        str(ticker).zfill(6),
+        str(root_receipt_no),
+        str(terminal_receipt_no),
+        str(record_date),
+        format(float(common_ratio), ".12g"),
+    )
+
+
+VIEWER_STOCK_DIVIDEND_CHILD_IDENTITIES = frozenset(
+    (ticker, terminal, record_date, ratio)
+    for ticker, _root, terminal, record_date, ratio
+    in VIEWER_STOCK_DIVIDEND_FALLBACKS
+)
 
 
 @dataclass(frozen=True)
@@ -672,13 +741,159 @@ def stock_dividend_common_ratio_from_body(payload: bytes) -> float | None:
     return next(iter(unique))
 
 
+def stock_dividend_common_terms_from_body(
+    payload: bytes,
+) -> StockDividendCommonTerms | None:
+    """Parse one exact common-share stock-dividend ratio and record date.
+
+    The family snapshot already binds the selected official body.  A viewer
+    fallback must additionally prove that this one body contains both current
+    economics; combining a ratio from one revision with a date from another is
+    deliberately inadmissible.
+    """
+    ratio = stock_dividend_common_ratio_from_body(payload)
+    parser = _TableRowParser()
+    parser.feed(_decode(payload))
+    date_labels = {"배당기준일"}
+    record_dates: list[str] = []
+    for row in parser.rows:
+        for index, cell in enumerate(row[:-1]):
+            without_item_number = re.sub(
+                r"^\s*\d+\s*[.)]\s*", "", cell,
+            )
+            if _compact(without_item_number) not in date_labels:
+                continue
+            parsed = parse_dart_date(row[index + 1])
+            if parsed is not None:
+                record_dates.append(parsed)
+    unique_dates = set(record_dates)
+    if ratio is None and not unique_dates:
+        return None
+    if ratio is None or len(unique_dates) != 1:
+        raise RuntimeError(
+            "stock-dividend common terms are missing/ambiguous: "
+            f"ratio={ratio} dates={sorted(unique_dates)}"
+        )
+    return StockDividendCommonTerms(
+        common_ratio=ratio,
+        record_date=next(iter(unique_dates)),
+    )
+
+
+def _stock_dividend_is_cross_class_distribution(payload: bytes) -> bool:
+    """Return whether ordinary holders receive an exact preferred-share ratio."""
+    parser = _TableRowParser()
+    parser.feed(_decode(payload))
+    ordinary_missing = False
+    preferred_ratios: list[float] = []
+    main_labels = {
+        "1주당배당주식수주", "1주당배당주식수",
+        "1주당주식배당주", "1주당주식배당",
+    }
+    ordinary_classes = {"보통주", "보통주식"}
+    for row in parser.rows:
+        for index, cell in enumerate(row):
+            label = _compact(re.sub(r"^\s*\d+\s*[.)]\s*", "", cell))
+            if label not in main_labels or index + 2 >= len(row):
+                continue
+            if _compact(row[index + 1]) not in ordinary_classes:
+                continue
+            if row[index + 2].strip() == "-":
+                ordinary_missing = True
+    for index, header in enumerate(parser.rows[:-1]):
+        compact_header = tuple(_compact(cell) for cell in header)
+        if (
+            "종류주식구분" not in compact_header
+            or "1주당배당주식수주" not in compact_header
+        ):
+            continue
+        class_index = compact_header.index("종류주식구분")
+        ratio_index = compact_header.index("1주당배당주식수주")
+        row = parser.rows[index + 1]
+        if max(class_index, ratio_index) >= len(row):
+            continue
+        if _compact(row[class_index]) not in {"우선주", "우선주식"}:
+            continue
+        rendered = row[ratio_index].replace(",", "").strip()
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", rendered):
+            ratio = _number(rendered)
+            if ratio is not None and ratio > 0:
+                preferred_ratios.append(ratio)
+    return ordinary_missing and len(set(preferred_ratios)) == 1
+
+
+def bonus_issue_common_terms_from_body(
+    payload: bytes,
+) -> BonusIssueCommonTerms | None:
+    """Parse one exact common-share bonus ratio and allocation record date.
+
+    Only the labelled decision-table rows are admissible.  Free-form numbers,
+    total share counts, and preferred/other-security rows are deliberately
+    ignored.  A partial match or conflicting exact rows fails closed; a body
+    with neither term (for example an attachment-only document) returns
+    ``None`` so the caller can use the economic family member instead.
+    """
+    parser = _TableRowParser()
+    parser.feed(_decode(payload))
+    ratio_labels = {"1주당신주배정주식수", "1주당신주배정주식수주"}
+    date_labels = {"신주배정기준일"}
+    ordinary_classes = {"보통주", "보통주주", "보통주식", "보통주식주"}
+    ratios: list[float] = []
+    record_dates: list[str] = []
+    for row in parser.rows:
+        for index, cell in enumerate(row):
+            without_item_number = re.sub(
+                r"^\s*\d+\s*[.)]\s*", "", cell,
+            )
+            label = _compact(without_item_number)
+            if label in ratio_labels:
+                if index + 2 >= len(row):
+                    continue
+                if _compact(row[index + 1]) not in ordinary_classes:
+                    continue
+                rendered = re.sub(
+                    r"\s*주\s*$", "", row[index + 2], flags=re.IGNORECASE,
+                ).replace(",", "").strip()
+                if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", rendered):
+                    value = _number(rendered)
+                    if value is not None and value >= 0:
+                        ratios.append(value)
+            elif label in date_labels and index + 1 < len(row):
+                parsed = parse_dart_date(row[index + 1])
+                if parsed is not None:
+                    record_dates.append(parsed)
+    unique_ratios = set(ratios)
+    unique_dates = set(record_dates)
+    if not unique_ratios and not unique_dates:
+        return None
+    if len(unique_ratios) != 1 or len(unique_dates) != 1:
+        raise RuntimeError(
+            "bonus-issue common terms are missing/ambiguous: "
+            f"ratios={sorted(unique_ratios)} dates={sorted(unique_dates)}"
+        )
+    return BonusIssueCommonTerms(
+        common_ratio=next(iter(unique_ratios)),
+        record_date=next(iter(unique_dates)),
+    )
+
+
 def _action_type(report_name: object) -> str | None:
     compact = _compact(report_name)
     if "자회사의주요경영사항" in compact or "종속회사의주요경영사항" in compact:
         return None
     if "주식배당결정" in compact:
         return "stock_dividend"
-    if "무상증자결정" in compact:
+    # A bonus-action seed must be the issuer's pure bonus decision report.
+    # DART list titles also repeat ``무상증자결정`` in independent exchange
+    # notices and in ``유무상증자결정`` reports.  The latter belong to the
+    # combined-offering structured/event contract, not this bonus-only support
+    # schema.  Exclude both shapes before family collection; genuine pure-bonus
+    # corrections/attachments retain ``주요사항보고서(무상증자결정)``.
+    if (
+        "주요사항보고서" in compact
+        and "무상증자결정" in compact
+        and "유무상증자결정" not in compact
+    ):
         return "bonus_issue"
     return None
 
@@ -776,7 +991,15 @@ def _observation_digest(
     return _sha256_bytes(_canonical_bytes(rows))
 
 
-def _load_fresh_snapshot(root: Path) -> _FreshSnapshot:
+def _load_fresh_snapshot(
+    root: Path,
+    *,
+    coverage_start: date,
+    coverage_end: date,
+) -> _FreshSnapshot:
+    if coverage_end < coverage_start:
+        raise ValueError("support-family coverage_end precedes coverage_start")
+    corp_to_stock: dict[str, str] = {}
     manifest_root = root / "corporate_actions" / "dart" / "manifests"
     complete_observations: list[tuple[Path, dict]] = []
     observations_by_receipt: dict[str, list[tuple[Path, dict]]] = {}
@@ -789,32 +1012,23 @@ def _load_fresh_snapshot(root: Path) -> _FreshSnapshot:
         rows = _read_json(path)
         if not isinstance(rows, list):
             raise RuntimeError(f"DART disclosures must be a list: {path}")
+        corp_to_stock.update(_candidate_corp_to_stock(str(root), rows))
         relevant = {
             str(row.get("rcept_no") or ""): row
             for row in rows
-            if isinstance(row, dict) and _action_type(row.get("report_nm")) is not None
+            if isinstance(row, dict)
+            and _is_listed_disclosure_candidate(row, corp_to_stock)
+            and _action_type(row.get("report_nm")) is not None
         }
         structured_marker = path.parent / "structured_complete_v3.json"
         document_marker = path.parent / "documents_complete_v5.json"
         if not structured_marker.is_file() or not document_marker.is_file():
             incomplete_relevant.update(relevant)
             continue
-        structured_queries = {
-            (event_api.slug, str(row.get("corp_code") or ""))
-            for row in rows
-            if isinstance(row, dict)
-            and str(row.get("stock_code") or "").strip()
-            and str(row.get("corp_code") or "")
-            and (event_api := _event_api_for_title(row.get("report_nm")))
-            is not None
-        }
-        document_candidates = {
-            str(row.get("rcept_no") or "")
-            for row in rows
-            if isinstance(row, dict)
-            and _needs_document(row.get("report_nm"))
-            and str(row.get("rcept_no") or "")
-        }
+        structured_queries = _structured_query_keys(rows, corp_to_stock)
+        document_candidates = _document_candidate_receipts(
+            rows, corp_to_stock,
+        )
         _verify_marker(
             structured_marker,
             start,
@@ -832,7 +1046,10 @@ def _load_fresh_snapshot(root: Path) -> _FreshSnapshot:
         complete_interval_count += 1
         complete_intervals.append((start, end))
         for row in rows:
-            if not isinstance(row, dict):
+            if (
+                not isinstance(row, dict)
+                or not _is_listed_disclosure_candidate(row, corp_to_stock)
+            ):
                 continue
             receipt = str(row.get("rcept_no") or "")
             if not receipt:
@@ -857,7 +1074,7 @@ def _load_fresh_snapshot(root: Path) -> _FreshSnapshot:
             raise RuntimeError(f"canonical DART disclosure is not an object: {receipt}")
         if _action_type(row.get("report_nm")) is None:
             continue
-        ticker = _ticker(row.get("stock_code"))
+        ticker = _ticker(_listed_disclosure_ticker(row, corp_to_stock))
         individual = _individual_disclosure_path(root, row, ticker)
         individual_row = _read_json(individual)
         if individual_row != row:
@@ -927,10 +1144,35 @@ def _load_fresh_snapshot(root: Path) -> _FreshSnapshot:
     candidates: dict[str, tuple[str, str]] = {}
     for receipt, disclosure in disclosures.items():
         action_type = _action_type(disclosure.row.get("report_nm"))
-        if action_type in {"stock_dividend", "bonus_issue"}:
+        receipt_date = parse_dart_date(
+            str(disclosure.row.get("rcept_dt") or "")
+        )
+        # The completed fresh-list ``rcept_dt`` is the authoritative public
+        # acceptance timeline.  ``rcept_no`` is only the official selector
+        # identity: overnight processing can give it an earlier-looking
+        # prefix, which must not silently demote a coverage-day candidate to a
+        # pre-coverage dependency.  Both raw values remain exact provenance.
+        if receipt_date is None:
+            raise RuntimeError(f"invalid DART receipt date: {receipt}")
+        if (
+            action_type in {"stock_dividend", "bonus_issue"}
+            and coverage_start <= date.fromisoformat(receipt_date) <= coverage_end
+        ):
             candidates[receipt] = (disclosure.ticker, action_type)
     for receipt, item in structured.items():
-        if candidates.get(receipt) != (item.ticker, "bonus_issue"):
+        disclosure = disclosures[receipt]
+        receipt_date = parse_dart_date(
+            str(disclosure.row.get("rcept_dt") or "")
+        )
+        if receipt_date is None:
+            raise RuntimeError(f"invalid DART receipt date: {receipt}")
+        # Pre-coverage structured rows remain exact family dependencies.  They
+        # are intentionally not seeds, but a later attachment/correction can
+        # select such a root as its terminal economic bonus source.
+        if (
+            coverage_start <= date.fromisoformat(receipt_date) <= coverage_end
+            and candidates.get(receipt) != (item.ticker, "bonus_issue")
+        ):
             raise RuntimeError(
                 f"structured bonus candidate identity changed: {receipt}"
             )
@@ -1004,7 +1246,34 @@ def _http_fetch(
     raise RuntimeError(f"DART support-family request failed: {url}") from last_error
 
 
-def _revision_kind(report_name: str, *, root: bool) -> str:
+def _body_bonus_termination_kind(payload: bytes) -> str | None:
+    """Recognize an exact labelled body-only bonus withdrawal."""
+    parser = _TableRowParser()
+    parser.feed(_decode(payload))
+    matches: list[str] = []
+    for index, header in enumerate(parser.rows[:-1]):
+        compact_header = tuple(_compact(cell) for cell in header)
+        if "정정사유" not in compact_header or "정정후" not in compact_header:
+            continue
+        reason_index = compact_header.index("정정사유")
+        after_index = compact_header.index("정정후")
+        row = parser.rows[index + 1]
+        if max(reason_index, after_index) >= len(row):
+            continue
+        reason = _compact(row[reason_index])
+        after = _compact(row[after_index])
+        if reason == "무상증자결정철회" and after in {
+            "무상증자철회", "무상증자결정철회",
+        }:
+            matches.append("WITHDRAWN")
+    if not matches:
+        return None
+    if set(matches) != {"WITHDRAWN"}:
+        raise RuntimeError("bonus body termination status is ambiguous")
+    return "WITHDRAWN"
+
+
+def _revision_kind(report_name: str, *, root: bool, body: bytes) -> str:
     compact = _compact(report_name)
     if root:
         return "ORIGINAL"
@@ -1013,7 +1282,21 @@ def _revision_kind(report_name: str, *, root: bool) -> str:
     for marker, status in _TERMINATED_MARKERS:
         if marker in compact:
             return status
+    try:
+        body_status = _body_bonus_termination_kind(body)
+    except RuntimeError:
+        body_status = None
+    if body_status is not None:
+        return body_status
     return "ECONOMIC_REVISION"
+
+
+def _optional_correction_origin_date(payload: bytes) -> str | None:
+    """Return unique origin-date provenance without making it a family key."""
+    try:
+        return _correction_origin_date(payload)
+    except RuntimeError:
+        return None
 
 
 def _source(
@@ -1041,45 +1324,29 @@ def _source(
             f"official family revision lacks a revision marker: {receipt}"
         )
     receipt_date = parse_dart_date(str(disclosure.row.get("rcept_dt") or ""))
-    if receipt_date is None or receipt[:8] != receipt_date.replace("-", ""):
-        raise RuntimeError(f"DART receipt/date identity mismatch: {receipt}")
+    if receipt_date is None:
+        raise RuntimeError(f"invalid DART receipt date: {receipt}")
+    # ``rcept_no`` is the official selector identity, not the authoritative
+    # public list acceptance date.  Overnight DART processing legitimately
+    # yields e.g. receipt 20170110000774 with rcept_dt 20170111.  Preserve and
+    # bind both exact values; never infer one from the other.  Numeric ordering
+    # within the official family selector remains a separate source contract.
     origin = (
         None
         if is_root or attachment_only
-        else _correction_origin_date(artifact.body)
+        else _optional_correction_origin_date(artifact.body)
     )
     root_disclosure = snapshot.disclosures.get(official_root)
     if root_disclosure is None:
         raise RuntimeError(
             f"official family root disclosure is missing: {official_root}"
         )
-    original_date = parse_dart_date(
-        str(root_disclosure.row.get("rcept_dt") or "")
-    )
-    if not is_root and not attachment_only and origin != original_date:
-        raise RuntimeError(
-            "correction original-submission date does not bind the official "
-            f"root: receipt={receipt} origin={origin} root={official_root} "
-            f"root_date={original_date}"
-        )
-    if not is_root and not attachment_only:
-        action_type = _action_type(disclosure.row.get("report_nm"))
-        possible_originals = [
-            candidate.receipt_no
-            for candidate in snapshot.disclosures.values()
-            if candidate.ticker == disclosure.ticker
-            and _action_type(candidate.row.get("report_nm")) == action_type
-            and not _is_revision(candidate.row.get("report_nm"))
-            and parse_dart_date(str(candidate.row.get("rcept_dt") or ""))
-            == origin
-        ]
-        if possible_originals != [official_root]:
-            raise RuntimeError(
-                "correction original-submission date does not identify one "
-                "global original that equals the official family root: "
-                f"receipt={receipt} candidates={sorted(possible_originals)} "
-                f"official_root={official_root}"
-            )
+    # The body date is retained as exact provenance, but it is not a family
+    # key.  Actual DART corrections variously print the selector root date, an
+    # older member date, the correction's own date, a receipt-prefix date, an
+    # external filing date, or malformed text.  The exact official selector
+    # and its newest-to-oldest order are the lineage authority; every body is
+    # still immutably bound by its content SHA even when origin is ``None``.
     if attachment_only:
         # The att selector proves membership in this official family root, but
         # it does not identify which economic revision's supplemental file was
@@ -1108,7 +1375,9 @@ def _source(
         receipt_date=receipt_date,
         correction_of_receipt_no=correction_of,
         correction_origin_date=origin,
-        revision_kind=_revision_kind(report_name, root=is_root),
+        revision_kind=_revision_kind(
+            report_name, root=is_root, body=artifact.body,
+        ),
         main_path=artifact.main_bind.path,
         main_content_length=artifact.main_bind.content_length,
         main_sha256=artifact.main_bind.sha256,
@@ -1166,14 +1435,60 @@ def _terminal_economics(
         ratio = stock_dividend_common_ratio_from_body(
             artifacts[economic_receipt].body,
         )
+        if ratio is None and _stock_dividend_is_cross_class_distribution(
+            artifacts[economic_receipt].body,
+        ):
+            return (
+                economic_receipt,
+                "CROSS_CLASS_DISTRIBUTION",
+                False,
+                None,
+            )
     elif action_type == "bonus_issue":
         structured = snapshot.structured.get(economic_receipt)
-        if structured is None:
-            raise RuntimeError(
-                "active bonus family terminal has no exact structured row: "
-                f"{economic_receipt}"
+        if structured is not None:
+            ratio = _number(structured.row.get("nstk_ascnt_ps_ostk"))
+            # The OpenDART structured row is authoritative when present.
+            # Some official viewer documents contain nested legacy tables that
+            # the exact fallback parser deliberately rejects.  A complete,
+            # parseable viewer pair is useful parity evidence; an unsupported
+            # optional viewer shape must not invalidate exact structured data.
+            try:
+                body_terms = bonus_issue_common_terms_from_body(
+                    artifacts[economic_receipt].body,
+                )
+            except RuntimeError:
+                body_terms = None
+            if body_terms is not None:
+                structured_date = parse_dart_date(
+                    structured.row.get("nstk_asstd")
+                )
+                if (
+                    ratio is None
+                    or structured_date != body_terms.record_date
+                    or not math.isclose(
+                        ratio,
+                        body_terms.common_ratio,
+                        rel_tol=0,
+                        abs_tol=5e-13,
+                    )
+                ):
+                    raise RuntimeError(
+                        "structured/viewer bonus common terms mismatch: "
+                        f"receipt={economic_receipt} structured_ratio={ratio} "
+                        f"structured_date={structured_date} "
+                        f"viewer={body_terms}"
+                    )
+        else:
+            body_terms = bonus_issue_common_terms_from_body(
+                artifacts[economic_receipt].body,
             )
-        ratio = _number(structured.row.get("nstk_ascnt_ps_ostk"))
+            if body_terms is None:
+                raise RuntimeError(
+                    "active bonus family terminal has neither structured nor "
+                    f"exact viewer common terms: {economic_receipt}"
+                )
+            ratio = body_terms.common_ratio
     else:  # pragma: no cover - guarded by source discovery
         raise RuntimeError(f"unsupported support action type: {action_type}")
     if ratio is None:
@@ -1280,10 +1595,6 @@ def _derive_entry(
             f"actions={sorted(str(value) for value in action_values)}"
         )
     ticker = next(iter(ticker_values))
-    if action_type == "bonus_issue" and not any(
-        source.structured_path is not None for source in sources
-    ):
-        raise RuntimeError("official bonus family has no fresh structured candidate")
     economic, status, admissible, ratio = _terminal_economics(
         action_type, sources, artifacts, snapshot,
     )
@@ -1419,9 +1730,68 @@ def _fetch_artifacts(
     return tuple(entries), artifacts
 
 
+def _official_main_selector_key(
+    page: OfficialDartMainPage,
+) -> tuple[str, str, str, tuple[str, ...], tuple[str, ...]]:
+    """Return the exact mutable selector identity used by the snapshot."""
+    return (
+        page.current_selector,
+        page.dcm_no,
+        page.dtd,
+        page.family_receipts,
+        page.attachment_keys,
+    )
+
+
+def _revalidate_official_main_selectors(
+    snapshot: _FreshSnapshot,
+    entries: tuple[SupportActionFamilyEntry, ...],
+    artifacts: dict[str, _Artifact],
+    fetcher: Callable[[str], bytes],
+) -> None:
+    """Close the mutable-main TOCTOU window before manifest publication."""
+    declared_receipts = sorted({
+        source.receipt_no
+        for entry in entries
+        for source in entry.sources
+    })
+    for receipt in declared_receipts:
+        disclosure = snapshot.disclosures.get(receipt)
+        artifact = artifacts.get(receipt)
+        if disclosure is None or artifact is None:
+            raise RuntimeError(
+                "declared support-family selector has no cached source: "
+                f"{receipt}"
+            )
+        try:
+            refreshed = parse_official_dart_main_page(
+                receipt,
+                fetcher(_main_url(receipt)),
+                expected_attachment_only=_is_attachment_only(
+                    disclosure.row.get("report_nm")
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "official DART main selector could not be revalidated "
+                f"before manifest publication: receipt={receipt}"
+            ) from exc
+        if (
+            _official_main_selector_key(refreshed)
+            != _official_main_selector_key(artifact.parsed_main)
+        ):
+            raise RuntimeError(
+                "official DART main selector changed during collection; "
+                f"manifest was not published: receipt={receipt}"
+            )
+
+
 def _manifest_payload(
     snapshot: _FreshSnapshot,
     entries: tuple[SupportActionFamilyEntry, ...],
+    *,
+    coverage_start: date,
+    coverage_end: date,
 ) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1429,6 +1799,8 @@ def _manifest_payload(
         "source_contract": SOURCE_CONTRACT,
         "family_order": FAMILY_ORDER_CONTRACT,
         "terminal_ratio_contract": TERMINAL_RATIO_CONTRACT,
+        "seed_coverage_start": coverage_start.isoformat(),
+        "seed_coverage_end": coverage_end.isoformat(),
         "candidate_count": len(snapshot.candidates),
         "candidate_digest": snapshot.candidate_digest,
         "entry_count": len(entries),
@@ -1493,7 +1865,12 @@ def _parse_entries(value: object) -> tuple[SupportActionFamilyEntry, ...]:
 
 def verify_support_action_families(
     base: str | Path,
+    *,
+    required_start: date,
+    required_end: date,
 ) -> VerifiedSupportActionFamilies:
+    if required_end < required_start:
+        raise ValueError("support-family required_end precedes required_start")
     root = Path(base).expanduser().resolve()
     manifest_path = root / MANIFEST_RELATIVE_PATH
     manifest_bytes = manifest_path.read_bytes() if manifest_path.is_file() else b""
@@ -1511,7 +1888,19 @@ def verify_support_action_families(
         != TERMINAL_RATIO_CONTRACT
     ):
         raise RuntimeError("unsupported/incomplete support-family manifest")
-    snapshot = _load_fresh_snapshot(root)
+    if (
+        payload.get("seed_coverage_start") != required_start.isoformat()
+        or payload.get("seed_coverage_end") != required_end.isoformat()
+    ):
+        raise RuntimeError(
+            "support-family seed coverage mismatch: "
+            f"manifest={payload.get('seed_coverage_start')}.."
+            f"{payload.get('seed_coverage_end')} required="
+            f"{required_start.isoformat()}..{required_end.isoformat()}"
+        )
+    snapshot = _load_fresh_snapshot(
+        root, coverage_start=required_start, coverage_end=required_end,
+    )
     if (
         int(payload.get("candidate_count", -1)) != len(snapshot.candidates)
         or payload.get("candidate_digest") != snapshot.candidate_digest
@@ -1588,6 +1977,8 @@ def verify_support_action_families(
         base=str(root),
         manifest_path=_relative(root, manifest_path),
         manifest_sha256=_sha256_path(manifest_path),
+        seed_coverage_start=required_start,
+        seed_coverage_end=required_end,
         candidate_count=len(snapshot.candidates),
         candidate_digest=snapshot.candidate_digest,
         entry_count=len(entries),
@@ -1599,6 +1990,8 @@ def verify_support_action_families(
 def collect_support_action_families(
     base: str | Path,
     *,
+    coverage_end: date,
+    coverage_start: date = SUPPORT_FAMILY_COVERAGE_START,
     apply: bool = False,
     fetcher: Callable[[str], bytes] | None = None,
     tries: int = 4,
@@ -1606,12 +1999,16 @@ def collect_support_action_families(
     request_interval_seconds: float = 0.8,
 ) -> VerifiedSupportActionFamilies | dict[str, object]:
     root = Path(base).expanduser().resolve()
-    snapshot = _load_fresh_snapshot(root)
+    snapshot = _load_fresh_snapshot(
+        root, coverage_start=coverage_start, coverage_end=coverage_end,
+    )
     if not apply:
         return {
             "status": "PREVIEW",
             "schema_version": SCHEMA_VERSION,
             "terminal_ratio_contract": TERMINAL_RATIO_CONTRACT,
+            "seed_coverage_start": coverage_start.isoformat(),
+            "seed_coverage_end": coverage_end.isoformat(),
             "candidate_count": len(snapshot.candidates),
             "candidate_digest": snapshot.candidate_digest,
             "candidate_receipts": sorted(snapshot.candidates),
@@ -1628,23 +2025,50 @@ def collect_support_action_families(
             timeout=timeout,
             request_interval_seconds=request_interval_seconds,
         )
-    entries, _ = _fetch_artifacts(root, snapshot, fetcher)
-    manifest = _manifest_payload(snapshot, entries)
+    entries, artifacts = _fetch_artifacts(root, snapshot, fetcher)
+    manifest = _manifest_payload(
+        snapshot,
+        entries,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+    )
     manifest_bytes = _canonical_bytes(manifest)
     manifest_path = root / MANIFEST_RELATIVE_PATH
-    if manifest_path.is_file() and manifest_path.read_bytes() != manifest_bytes:
-        raise RuntimeError(
-            "existing support-family manifest differs; immutable snapshot "
-            "replacement is forbidden"
+    previous = manifest_path.read_bytes() if manifest_path.is_file() else None
+    # DART main.do is mutable.  Bodies can take long enough to collect for a
+    # new correction or attachment to appear after the first selector read.
+    # Re-read every declared source with the same retry/pacing-aware fetcher
+    # immediately before moving the complete manifest pointer.
+    _revalidate_official_main_selectors(
+        snapshot, entries, artifacts, fetcher,
+    )
+    try:
+        if previous != manifest_bytes:
+            _atomic_write(manifest_path, manifest_bytes)
+        # Verify from disk after publication.  This catches an incomplete
+        # refresh and makes the mutable current pointer safe for daily DART
+        # intervals while every referenced body remains content-addressed.
+        return verify_support_action_families(
+            root, required_start=coverage_start, required_end=coverage_end,
         )
-    if not manifest_path.is_file():
-        _atomic_write(manifest_path, manifest_bytes)
-    return verify_support_action_families(root)
+    except Exception:
+        if previous is None:
+            manifest_path.unlink(missing_ok=True)
+        else:
+            _atomic_write(manifest_path, previous)
+        raise
 
 
-def external_evidence_paths(base: str | Path) -> tuple[str, ...]:
+def external_evidence_paths(
+    base: str | Path,
+    *,
+    required_start: date,
+    required_end: date,
+) -> tuple[str, ...]:
     """Return every source path that an enclosing action snapshot must bind."""
-    verified = verify_support_action_families(base)
+    verified = verify_support_action_families(
+        base, required_start=required_start, required_end=required_end,
+    )
     paths = {verified.manifest_path}
     for entry in verified.entries:
         for source in entry.sources:
@@ -1664,6 +2088,12 @@ def main() -> None:
         description="Collect official DART support-action correction families",
     )
     parser.add_argument("--base", required=True)
+    parser.add_argument(
+        "--coverage-start",
+        type=date.fromisoformat,
+        default=SUPPORT_FAMILY_COVERAGE_START,
+    )
+    parser.add_argument("--coverage-end", type=date.fromisoformat, required=True)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--tries", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=30.0)
@@ -1671,6 +2101,8 @@ def main() -> None:
     args = parser.parse_args()
     result = collect_support_action_families(
         args.base,
+        coverage_start=args.coverage_start,
+        coverage_end=args.coverage_end,
         apply=args.apply,
         tries=args.tries,
         timeout=args.timeout,

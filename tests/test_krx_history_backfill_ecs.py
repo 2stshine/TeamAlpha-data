@@ -40,15 +40,19 @@ def test_dry_run_skips_confirm_and_truncate(monkeypatch):
     assert calls == ["dry_run"]
 
 
-def test_rebuild_reloads_fmp_after_s3_backfill(monkeypatch):
+def test_destructive_rebuild_is_disabled_before_lock_download_or_truncate(
+    monkeypatch,
+):
     monkeypatch.setenv("S3_BRONZE_BUCKET", "b")
     calls = []
+    monkeypatch.setattr(
+        rebuild.dart_silver_backfill_ecs,
+        "acquire_daily_certification_lock",
+        lambda: calls.append("lock"),
+    )
     monkeypatch.setattr(rebuild, "_download_prefixes", lambda *a, **k: 10)
     monkeypatch.setattr(rebuild, "_truncate_silver", lambda: calls.append("truncate"))
-    monkeypatch.setattr(rebuild.s3_backfill, "run", lambda **k: calls.append("s3_backfill") or "run-id")
-    monkeypatch.setattr(rebuild, "_reload_fmp", lambda: calls.append("reload_fmp"))
-    monkeypatch.setattr(rebuild, "_reload_dart_extras", lambda: calls.append("reload_dart"))
-    rebuild.run(confirm="REBUILD")
-    # FMP and DART-extras reloads must run after the KRX/DART rebuild so the
-    # truncate doesn't leave them wiped.
-    assert calls == ["truncate", "s3_backfill", "reload_fmp", "reload_dart"]
+
+    with pytest.raises(RuntimeError, match="DIVIDEND/REPORTED"):
+        rebuild.run(confirm="REBUILD")
+    assert calls == []

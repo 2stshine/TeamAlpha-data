@@ -40,9 +40,10 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterable, Iterator, Mapping
 
 import requests
+from botocore.exceptions import ClientError
 
 from pipeline.bronze import financials
 from pipeline.common.paths import base_uri
@@ -87,8 +88,15 @@ class EventApi:
 class _BronzeWriter:
     """로컬은 동기 저장, S3는 기존 key 인덱스와 병렬 PUT을 사용한다."""
 
-    def __init__(self, base: str, *, workers: int = 16):
+    def __init__(
+        self,
+        base: str,
+        *,
+        workers: int = 16,
+        before_change: Callable[[str], None] | None = None,
+    ):
         self.base = base
+        self._before_change = before_change
         self._existing: set[str] = set()
         self._futures: dict[Future, str] = {}
         self._executor: ThreadPoolExecutor | None = None
@@ -124,7 +132,31 @@ class _BronzeWriter:
     def _put_s3(self, path: str, data: bytes) -> None:
         assert self._s3 is not None
         key = path.removeprefix(f"s3://{self._bucket}/")
-        self._s3.put_object(Bucket=self._bucket, Key=key, Body=data)
+        try:
+            self._s3.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=data,
+                IfNoneMatch="*",
+            )
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code") or "")
+            if code not in {
+                "PreconditionFailed", "412",
+                "ConditionalRequestConflict", "409",
+            }:
+                raise
+            response = self._s3.get_object(Bucket=self._bucket, Key=key)
+            body = response["Body"]
+            try:
+                existing = body.read()
+            finally:
+                body.close()
+            if existing != data:
+                raise RuntimeError(
+                    "immutable DART Bronze object was published concurrently "
+                    f"with different bytes: s3://{self._bucket}/{key}"
+                ) from exc
 
     def _read_s3_json(self, path: str) -> dict:
         assert self._s3 is not None
@@ -198,6 +230,11 @@ class _BronzeWriter:
     def _submit(self, path: str, data: bytes) -> bool:
         if path in self._existing:
             return False
+        if self._before_change is not None:
+            # The callback completes before a new S3 object becomes visible.
+            # daily_full uses this boundary to demote the derived return
+            # contract before publishing any new action observation.
+            self._before_change(path)
         assert self._executor is not None
         self._existing.add(path)
         future = self._executor.submit(self._put_s3, path, data)
@@ -246,6 +283,8 @@ class _BronzeWriter:
         target = Path(path)
         if target.is_file() and target.read_bytes() == encoded:
             return False
+        if self._before_change is not None:
+            self._before_change(path)
         self._atomic_local_write(path, encoded)
         return True
 
@@ -254,6 +293,8 @@ class _BronzeWriter:
             return self._submit(path, data)
         if exists(path):
             return False
+        if self._before_change is not None:
+            self._before_change(path)
         self._atomic_local_write(path, data)
         return True
 
@@ -325,6 +366,99 @@ def _event_api_for_title(title: object) -> EventApi | None:
 def _needs_document(title: object) -> bool:
     compact = _compact_title(title)
     return any(keyword in compact for keyword in DOCUMENT_KEYWORDS)
+
+
+def _listed_disclosure_ticker(
+    row: Mapping[str, object],
+    corp_to_stock: Mapping[str, str],
+) -> str:
+    """Resolve the exact listed ticker used by the Bronze producer.
+
+    OpenDART list rows occasionally omit ``stock_code``.  The producer has
+    always fallen back to the immutable ``corpCode.xml`` snapshot before
+    deciding whether such a row belongs to its listed-action candidate set.
+    Completion-marker verifiers must use this same resolution rule: counting
+    title matches alone also counts unlisted issuers and exchange-wide notices
+    for which the producer deliberately downloads no document.
+    """
+    direct = str(row.get("stock_code") or "").strip()
+    if direct:
+        return direct
+    return str(
+        corp_to_stock.get(str(row.get("corp_code") or ""), "") or ""
+    ).strip()
+
+
+def _is_listed_disclosure_candidate(
+    row: object,
+    corp_to_stock: Mapping[str, str],
+) -> bool:
+    """Return whether ``run`` can materialize this disclosure by receipt."""
+    if not isinstance(row, Mapping):
+        return False
+    return (
+        re.fullmatch(r"\d{14}", str(row.get("rcept_no") or "")) is not None
+        and bool(_listed_disclosure_ticker(row, corp_to_stock))
+    )
+
+
+def _document_candidate_receipts(
+    rows: Iterable[object],
+    corp_to_stock: Mapping[str, str],
+) -> set[str]:
+    """Canonical receipt set certified by ``documents_complete_v5``."""
+    return {
+        str(row.get("rcept_no") or "")
+        for row in rows
+        if isinstance(row, Mapping)
+        and _is_listed_disclosure_candidate(row, corp_to_stock)
+        and _needs_document(row.get("report_nm"))
+    }
+
+
+def _structured_query_keys(
+    rows: Iterable[object],
+    corp_to_stock: Mapping[str, str],
+) -> set[tuple[str, str]]:
+    """Canonical query identities certified by ``structured_complete_v3``."""
+    queries: set[tuple[str, str]] = set()
+    for row in rows:
+        if not isinstance(row, Mapping) or not _is_listed_disclosure_candidate(
+            row, corp_to_stock
+        ):
+            continue
+        corp_code = str(row.get("corp_code") or "")
+        event_api = _event_api_for_title(row.get("report_nm"))
+        if corp_code and event_api is not None:
+            queries.add((event_api.slug, corp_code))
+    return queries
+
+
+def _candidate_corp_to_stock(
+    base: str,
+    rows: Iterable[object],
+) -> dict[str, str]:
+    """Load the listing snapshot only when a candidate needs its fallback.
+
+    Direct ``stock_code`` rows are self-identifying.  If a document or
+    structured candidate omits that field, however, absence of the exact
+    ``corpCode.xml`` snapshot is ambiguous (listed fallback versus unlisted)
+    and therefore fails closed through ``load_listed_corps_from_bronze``.
+    """
+    requires_fallback = any(
+        isinstance(row, Mapping)
+        and re.fullmatch(r"\d{14}", str(row.get("rcept_no") or ""))
+        is not None
+        and not str(row.get("stock_code") or "").strip()
+        and (
+            _needs_document(row.get("report_nm"))
+            or _event_api_for_title(row.get("report_nm")) is not None
+        )
+        for row in rows
+    )
+    if not requires_fallback:
+        return {}
+    return dict(financials.load_listed_corps_from_bronze(base))
 
 
 def _is_relevant_disclosure(title: object) -> bool:
@@ -588,6 +722,12 @@ def _fetch_structured(
             "bgn_de": STRUCTURED_API_START,
             "end_de": todate,
         },
+        # A complete historical snapshot makes thousands of independent
+        # structured calls.  A brief DART connection flap must not discard
+        # the whole phase after the default four attempts; discovery and
+        # immutable bodies remain resumable, while quota/status failures are
+        # still raised immediately by ``_fetch_json``.
+        tries=8,
     )
     time.sleep(CALL_GAP_SEC)
     return corp_code, event_api, payload
@@ -605,6 +745,7 @@ def run(
     document_shard_count: int | None = None,
     changed_sink: list[str] | None = None,
     base_override: str | None = None,
+    before_change: Callable[[str], None] | None = None,
 ) -> list[str]:
     """기간 내 기업행사 원본을 수집하고 Silver 입력 URI를 반환한다.
 
@@ -615,6 +756,10 @@ def run(
     ``changed_sink`` 리스트를 넘기면 이번 실행에서 실제로 새로 쓰이거나
     변경된 경로만(의존성 재다운로드 제외) 채워 준다. 호출자는 이를 이용해
     "이번 기간에 진짜 기업행사 변경이 있었는지"를 판정할 수 있다.
+
+    ``before_change``는 새 Bronze 객체를 쓰기 직전에 동기 호출된다. 콜백이
+    실패하면 해당 객체는 게시되지 않는다. 파생 계약을 먼저 fail-closed로
+    전환해야 하는 daily orchestration 전용 경계다.
     """
     api_key = os.environ.get("DART_API_KEY")
     if not api_key:
@@ -635,10 +780,16 @@ def run(
             raise ValueError("base_override must be an absolute local path")
         base = str(requested_base.resolve())
     else:
+        if dest == "s3" and before_change is None:
+            raise RuntimeError(
+                "direct S3 corporate-action publication is disabled: every "
+                "new raw action must invalidate and recertify the "
+                "total-return contract inside pipeline.daily_full"
+            )
         base = base_uri(dest)
     corps = financials.ensure_corp_code_xml(base)
     corp_to_stock = dict(corps)
-    writer = _BronzeWriter(base)
+    writer = _BronzeWriter(base, before_change=before_change)
 
     changed_paths: list[str] = []
     dependency_paths: set[str] = set()
@@ -720,10 +871,7 @@ def run(
             report_name = row.get("report_nm")
             needs_document = _needs_document(report_name)
             corp_code = str(row.get("corp_code") or "")
-            ticker = (
-                str(row.get("stock_code") or "").strip()
-                or corp_to_stock.get(corp_code, "")
-            )
+            ticker = _listed_disclosure_ticker(row, corp_to_stock)
             rcept_no = str(row.get("rcept_no") or "")
             if not ticker or not re.fullmatch(r"\d{14}", rcept_no):
                 continue
@@ -754,6 +902,9 @@ def run(
             flush=True,
         )
 
+        structured_query_keys = _structured_query_keys(
+            discovered_rows, corp_to_stock,
+        )
         structured_queries: dict[tuple[str, str], EventApi] = {}
         for candidate in candidates.values():
             event_api = candidate["event_api"]
@@ -761,7 +912,7 @@ def run(
                 continue
             row = candidate["row"]
             corp_code = str(row.get("corp_code") or "")
-            if corp_code:
+            if corp_code and (event_api.slug, corp_code) in structured_query_keys:
                 structured_queries[(event_api.slug, corp_code)] = event_api
 
         if writer.exists(structured_marker):
@@ -770,7 +921,15 @@ def run(
                 flush=True,
             )
         else:
-            with ThreadPoolExecutor(max_workers=API_WORKERS) as executor:
+            # Do not use the executor context manager here.  Its implicit
+            # ``shutdown(wait=True)`` would wait for every queued multi-minute
+            # retry after the first terminal DART outage.  On failure we stop
+            # accepting work and cancel everything that has not started; at
+            # most the bounded ``API_WORKERS`` requests already in flight can
+            # finish before process exit.
+            executor = ThreadPoolExecutor(max_workers=API_WORKERS)
+            structured_futures = []
+            try:
                 structured_futures = [
                     executor.submit(
                         _fetch_structured,
@@ -816,6 +975,13 @@ def run(
                             f"{query_no}/{len(structured_queries)}",
                             flush=True,
                         )
+            except BaseException:
+                for future in structured_futures:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True)
             marker = {
                 "status": "COMPLETE",
                 "fromdate": fromdate,
@@ -841,10 +1007,13 @@ def run(
                     flush=True,
                 )
             else:
+                document_candidate_receipts = _document_candidate_receipts(
+                    discovered_rows, corp_to_stock,
+                )
                 document_candidates = [
                     (rcept_no, candidate)
                     for rcept_no, candidate in sorted(candidates.items())
-                    if candidate["needs_document"]
+                    if rcept_no in document_candidate_receipts
                 ]
                 missing_documents = []
                 for rcept_no, candidate in document_candidates:

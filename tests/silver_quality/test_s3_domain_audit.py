@@ -1,4 +1,5 @@
 from datetime import date
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -161,10 +162,22 @@ def test_price_bundle_does_not_prepare_fundamentals(monkeypatch):
             },
         ),
     )
+    verify_calls = []
+    monkeypatch.setattr(
+        s3_domain_audit,
+        "verify_snapshot_manifest",
+        lambda base, **kwargs: verify_calls.append((base, kwargs))
+        or SimpleNamespace(
+            coverage_start=date(2015, 1, 1),
+            coverage_end=date(2026, 1, 2),
+        ),
+    )
+    action_calls = []
     monkeypatch.setattr(
         s3_domain_audit.corporate_actions,
         "prepare",
-        lambda base: (pd.DataFrame(), {}),
+        lambda base, **kwargs: action_calls.append((base, kwargs))
+        or (pd.DataFrame(), {}),
     )
     monkeypatch.setattr(
         s3_domain_audit.corporate_actions,
@@ -183,6 +196,16 @@ def test_price_bundle_does_not_prepare_fundamentals(monkeypatch):
 
     assert bundle.fundamentals.empty
     assert len(bundle.prices) == 1
+    assert verify_calls == [(
+        "/unused", {"required_start": date(2015, 1, 1)},
+    )]
+    assert action_calls == [(
+        "/unused",
+        {
+            "coverage_start": date(2015, 1, 1),
+            "coverage_end": date(2026, 1, 2),
+        },
+    )]
 
 
 def test_price_history_tail_keeps_only_last_twenty_trading_days():

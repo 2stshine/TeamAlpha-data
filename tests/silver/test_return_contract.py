@@ -2,6 +2,7 @@ from datetime import date
 from uuid import uuid4
 
 import pandas as pd
+import pytest
 
 from pipeline.silver import corporate_actions, prices
 from pipeline.silver.return_contract import invalidate_krx_total_return
@@ -292,6 +293,36 @@ def test_issuer_ex_dividend_action_also_invalidates_contract(monkeypatch):
     calls = []
     frame = _published_action_frame()
     frame["action_type"] = "ex_dividend"
+    monkeypatch.setattr(
+        corporate_actions, "normalize_for_publish", lambda _: frame.copy()
+    )
+    monkeypatch.setattr(corporate_actions.db, "upsert", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(
+        corporate_actions,
+        "acquire_return_writer_transaction_lock",
+        lambda conn: None,
+    )
+    monkeypatch.setattr(
+        corporate_actions,
+        "invalidate_krx_total_return",
+        lambda conn, **kwargs: calls.append(kwargs) or True,
+    )
+
+    corporate_actions.publish(
+        object(), pd.DataFrame([{"unused": 1}]), {"005930": 1}, uuid4()
+    )
+
+    assert calls[0]["reason"] == "ISSUER_DIVIDEND_ACTION_PUBLISHED"
+
+
+@pytest.mark.parametrize("source", ["DART_STRUCTURED", "DART_VIEWER"])
+def test_issuer_bonus_scale_support_action_invalidates_contract(
+    monkeypatch, source,
+):
+    calls = []
+    frame = _published_action_frame()
+    frame["source"] = source
+    frame["action_type"] = "bonus_issue"
     monkeypatch.setattr(
         corporate_actions, "normalize_for_publish", lambda _: frame.copy()
     )

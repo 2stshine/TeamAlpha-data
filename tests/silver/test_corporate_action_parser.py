@@ -1,7 +1,11 @@
+import ast
+import hashlib
 import json
 import zipfile
 from datetime import date
 from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -32,6 +36,610 @@ def _write_document(path, xml):
     with zipfile.ZipFile(output, "w") as archive:
         archive.writestr("document.xml", xml)
     path.write_bytes(output.getvalue())
+
+
+def test_scoped_prepare_admits_only_official_date_or_verified_lineage(
+    tmp_path, monkeypatch,
+):
+    overnight = "20141231999999"
+    precoverage = "20141201000001"
+    support_dependency = "20260811000002"
+    viewer_dependency = "20260812000003"
+    unrelated_future = "20260813000004"
+    rows = [
+        {
+            "stock_code": "005930",
+            "rcept_no": receipt,
+            "rcept_dt": accepted,
+            "report_nm": "무상증자결정",
+        }
+        for receipt, accepted in (
+            (overnight, "20150101"),
+            (precoverage, "20141201"),
+            (support_dependency, "20260811"),
+            (viewer_dependency, "20260812"),
+            (unrelated_future, "20260813"),
+        )
+    ]
+    _write_json(
+        tmp_path / "corporate_actions/dart/manifests"
+        / "from=20141201/to=20260813/disclosures_v3.json",
+        rows,
+    )
+    for row in rows:
+        receipt = row["rcept_no"]
+        _write_json(
+            tmp_path / "corporate_actions/dart/structured/event=bonus_issue"
+            / f"year={receipt[:4]}/corp=005930/rcept={receipt}.json",
+            {
+                "rcept_no": receipt,
+                "nstk_dividrk": "2026-08-14",
+                "nstk_ascnt_ps_ostk": "0.1",
+            },
+        )
+
+    viewer_calls = []
+    viewer_body = b"<html>viewer dependency</html>"
+    extra_viewer_body = b"<html>future viewer dependency</html>"
+    viewer_evidence = SimpleNamespace(
+        receipt_no=viewer_dependency,
+        revision_root_receipt_no=overnight,
+        economic_body_receipt_no=viewer_dependency,
+        family_receipt_nos=(viewer_dependency, overnight),
+        official_family_order=(viewer_dependency, overnight),
+        attachment_keys=(),
+        main_path="viewer/dependency.html",
+        main_content_length=len(viewer_body),
+        main_sha256=hashlib.sha256(viewer_body).hexdigest(),
+        viewer_path="viewer/dependency.html",
+        viewer_content_length=len(viewer_body),
+        viewer_sha256=hashlib.sha256(viewer_body).hexdigest(),
+        economic_viewer_path="viewer/dependency.html",
+        economic_viewer_content_length=len(viewer_body),
+        economic_viewer_sha256=hashlib.sha256(viewer_body).hexdigest(),
+        economic_main_path="viewer/dependency.html",
+        economic_main_content_length=len(viewer_body),
+        economic_main_sha256=hashlib.sha256(viewer_body).hexdigest(),
+    )
+    extra_viewer_evidence = SimpleNamespace(
+        receipt_no=unrelated_future,
+        revision_root_receipt_no=unrelated_future,
+        economic_body_receipt_no=unrelated_future,
+        family_receipt_nos=(unrelated_future,),
+        official_family_order=(unrelated_future,),
+        attachment_keys=(),
+        main_path="viewer/future.html",
+        main_content_length=len(extra_viewer_body),
+        main_sha256=hashlib.sha256(extra_viewer_body).hexdigest(),
+        viewer_path="viewer/future.html",
+        viewer_content_length=len(extra_viewer_body),
+        viewer_sha256=hashlib.sha256(extra_viewer_body).hexdigest(),
+        economic_viewer_path="viewer/future.html",
+        economic_viewer_content_length=len(extra_viewer_body),
+        economic_viewer_sha256=hashlib.sha256(extra_viewer_body).hexdigest(),
+        economic_main_path="viewer/future.html",
+        economic_main_content_length=len(extra_viewer_body),
+        economic_main_sha256=hashlib.sha256(extra_viewer_body).hexdigest(),
+    )
+
+    viewer_manifest = tmp_path / corporate_actions.VIEWER_MANIFEST_RELATIVE_PATH
+    _write_json(viewer_manifest, {})
+    viewer_path = tmp_path / viewer_evidence.viewer_path
+    viewer_path.parent.mkdir(parents=True, exist_ok=True)
+    viewer_path.write_bytes(viewer_body)
+    extra_viewer_path = tmp_path / extra_viewer_evidence.viewer_path
+    extra_viewer_path.write_bytes(extra_viewer_body)
+
+    def fake_viewer(base, *, required_start, required_end):
+        viewer_calls.append((base, required_start, required_end))
+        return SimpleNamespace(
+            manifest_path=str(viewer_manifest.resolve()),
+            manifest_sha256=hashlib.sha256(
+                viewer_manifest.read_bytes(),
+            ).hexdigest(),
+            dependency_probes=(),
+            receipts=(viewer_evidence, extra_viewer_evidence),
+        )
+
+    support_calls = []
+
+    def support_source(receipt):
+        body = f"support:{receipt}".encode()
+        relative = f"support/{receipt}.bin"
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(body)
+        for marker in (
+            "structured_complete_v3.json", "documents_complete_v5.json",
+        ):
+            (destination.parent / marker).write_bytes(b"{}")
+        digest = hashlib.sha256(body).hexdigest()
+        return SimpleNamespace(
+            receipt_no=receipt,
+            main_path=relative,
+            main_content_length=len(body),
+            main_sha256=digest,
+            body_path=relative,
+            body_content_length=len(body),
+            body_sha256=digest,
+            disclosure_path=relative,
+            disclosure_content_length=len(body),
+            disclosure_sha256=digest,
+            disclosure_manifest_path=relative,
+            disclosure_manifest_sha256=digest,
+            structured_path=None,
+            structured_content_length=None,
+            structured_sha256=None,
+        )
+
+    support_entry = SimpleNamespace(
+        root_receipt_no=overnight,
+        terminal_receipt_no=support_dependency,
+        terminal_economic_receipt_no=support_dependency,
+        ordered_family_receipts=(support_dependency, overnight),
+        sources=(
+            support_source(support_dependency),
+            support_source(overnight),
+        ),
+    )
+    extra_support_entry = SimpleNamespace(
+        root_receipt_no=precoverage,
+        terminal_receipt_no=precoverage,
+        terminal_economic_receipt_no=precoverage,
+        ordered_family_receipts=(precoverage,),
+        sources=(support_source(precoverage),),
+    )
+
+    def fake_support(base, *, required_start, required_end):
+        support_calls.append((str(base), required_start, required_end))
+        manifest = Path(base) / corporate_actions.SUPPORT_FAMILY_MANIFEST_RELATIVE_PATH
+        return SimpleNamespace(
+            manifest_path=str(manifest.resolve()),
+            manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            entries=(support_entry, extra_support_entry),
+        )
+
+    monkeypatch.setattr(
+        corporate_actions, "verify_viewer_corrections", fake_viewer,
+    )
+    monkeypatch.setattr(
+        corporate_actions, "verify_support_action_families", fake_support,
+    )
+    _write_json(
+        tmp_path / corporate_actions.SUPPORT_FAMILY_MANIFEST_RELATIVE_PATH,
+        {},
+    )
+
+    events, stats = corporate_actions.prepare(
+        str(tmp_path),
+        coverage_start=date(2015, 1, 1),
+        coverage_end=date(2026, 8, 10),
+    )
+
+    assert set(events["rcept_no"]) == {
+        overnight, support_dependency, viewer_dependency,
+    }
+    assert events.set_index("rcept_no").loc[
+        overnight, "announcement_date"
+    ] == date(2015, 1, 1)
+    assert stats["scoped_structured_file_count"] == 3
+    assert stats["coverage_excluded_structured_file_count"] == 2
+    assert stats["coverage_excluded_disclosure_count"] == 2
+    assert stats["verified_lineage_receipt_count"] == 3
+    assert viewer_calls == [(
+        str(tmp_path.resolve()), date(2015, 1, 1), date(2026, 8, 10),
+    )]
+    assert support_calls == [(
+        str(tmp_path.resolve()), date(2015, 1, 1), date(2026, 8, 10),
+    )]
+
+
+def test_prepare_verifies_viewer_once_per_invocation_for_many_cash_rows(
+    tmp_path, monkeypatch,
+):
+    viewer_manifest = tmp_path / corporate_actions.VIEWER_MANIFEST_RELATIVE_PATH
+    _write_json(viewer_manifest, {})
+    rows = [
+        {
+            "stock_code": "005930",
+            "rcept_no": f"20260701{index:06d}",
+            "rcept_dt": "20260701",
+            "report_nm": "현금ㆍ현물배당 결정",
+        }
+        for index in range(64)
+    ]
+    _write_json(
+        tmp_path / "corporate_actions/dart/manifests"
+        / "from=20260701/to=20260701/disclosures_v3.json",
+        rows,
+    )
+    calls = []
+
+    def fake_verify(base, *, required_start, required_end):
+        calls.append((base, required_start, required_end))
+        return SimpleNamespace(
+            manifest_path=str(viewer_manifest.resolve()),
+            manifest_sha256=hashlib.sha256(
+                viewer_manifest.read_bytes(),
+            ).hexdigest(),
+            dependency_probes=(),
+            receipts=(),
+        )
+
+    monkeypatch.setattr(
+        corporate_actions, "verify_viewer_corrections", fake_verify,
+    )
+    monkeypatch.setattr(
+        corporate_actions,
+        "_viewer_index",
+        lambda *_args, **_kwargs: pytest.fail(
+            "prepare loop must not rebuild the viewer index"
+        ),
+    )
+    for _ in range(2):
+        events, _ = corporate_actions.prepare(
+            str(tmp_path),
+            coverage_start=date(2026, 7, 1),
+            coverage_end=date(2026, 7, 1),
+        )
+        assert len(events) == 64
+    assert calls == [
+        (str(tmp_path.resolve()), date(2026, 7, 1), date(2026, 7, 1)),
+        (str(tmp_path.resolve()), date(2026, 7, 1), date(2026, 7, 1)),
+    ]
+
+
+def test_prepare_does_not_reuse_verified_viewer_object_across_runs(
+    tmp_path, monkeypatch,
+):
+    viewer_manifest = tmp_path / corporate_actions.VIEWER_MANIFEST_RELATIVE_PATH
+    _write_json(viewer_manifest, {})
+    body_path = tmp_path / "viewer/body.html"
+    body_path.parent.mkdir(parents=True, exist_ok=True)
+    original = b"<html>original</html>"
+    body_path.write_bytes(original)
+    evidence = SimpleNamespace(
+        receipt_no="20260701000001",
+        revision_root_receipt_no="20260701000001",
+        economic_body_receipt_no="20260701000001",
+        family_receipt_nos=("20260701000001",),
+        official_family_order=("20260701000001",),
+        attachment_keys=(),
+        main_path="viewer/body.html",
+        main_content_length=len(original),
+        main_sha256=hashlib.sha256(original).hexdigest(),
+        viewer_path="viewer/body.html",
+        viewer_content_length=len(original),
+        viewer_sha256=hashlib.sha256(original).hexdigest(),
+        economic_viewer_path="viewer/body.html",
+        economic_viewer_content_length=len(original),
+        economic_viewer_sha256=hashlib.sha256(original).hexdigest(),
+        economic_main_path="viewer/body.html",
+        economic_main_content_length=len(original),
+        economic_main_sha256=hashlib.sha256(original).hexdigest(),
+    )
+    calls = []
+
+    def fake_verify(base, *, required_start, required_end):
+        calls.append((base, required_start, required_end))
+        return SimpleNamespace(
+            manifest_path=str(viewer_manifest.resolve()),
+            manifest_sha256=hashlib.sha256(
+                viewer_manifest.read_bytes(),
+            ).hexdigest(),
+            dependency_probes=(),
+            receipts=(evidence,),
+        )
+
+    monkeypatch.setattr(
+        corporate_actions, "verify_viewer_corrections", fake_verify,
+    )
+    corporate_actions.prepare(
+        str(tmp_path),
+        coverage_start=date(2026, 7, 1),
+        coverage_end=date(2026, 7, 1),
+    )
+    body_path.write_bytes(b"<html>tampered</html>")
+    with pytest.raises(RuntimeError, match="changed after verification"):
+        corporate_actions.prepare(
+            str(tmp_path),
+            coverage_start=date(2026, 7, 1),
+            coverage_end=date(2026, 7, 1),
+        )
+    assert len(calls) == 2
+
+
+def test_prepare_fails_if_economic_viewer_changes_after_verification(
+    tmp_path, monkeypatch,
+):
+    viewer_manifest = tmp_path / corporate_actions.VIEWER_MANIFEST_RELATIVE_PATH
+    _write_json(viewer_manifest, {})
+    source = b"<html>attachment</html>"
+    economic = b"<html>economic</html>"
+    source_path = tmp_path / "viewer/source.html"
+    economic_path = tmp_path / "viewer/economic.html"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(source)
+    economic_path.write_bytes(economic)
+    evidence = SimpleNamespace(
+        receipt_no="20260701000001",
+        revision_root_receipt_no="20260701000001",
+        economic_body_receipt_no="20260630000001",
+        family_receipt_nos=("20260701000001", "20260630000001"),
+        official_family_order=("20260630000001", "20260701000001"),
+        attachment_keys=(),
+        main_path="viewer/source.html",
+        main_content_length=len(source),
+        main_sha256=hashlib.sha256(source).hexdigest(),
+        viewer_path="viewer/source.html",
+        viewer_content_length=len(source),
+        viewer_sha256=hashlib.sha256(source).hexdigest(),
+        economic_viewer_path="viewer/economic.html",
+        economic_viewer_content_length=len(economic),
+        economic_viewer_sha256=hashlib.sha256(economic).hexdigest(),
+        economic_main_path="viewer/economic.html",
+        economic_main_content_length=len(economic),
+        economic_main_sha256=hashlib.sha256(economic).hexdigest(),
+    )
+
+    def fake_verify(_base, *, required_start, required_end):
+        del required_start, required_end
+        economic_path.write_bytes(b"<html>tampered economic</html>")
+        return SimpleNamespace(
+            manifest_path=str(viewer_manifest.resolve()),
+            manifest_sha256=hashlib.sha256(
+                viewer_manifest.read_bytes(),
+            ).hexdigest(),
+            dependency_probes=(),
+            receipts=(evidence,),
+        )
+
+    monkeypatch.setattr(
+        corporate_actions, "verify_viewer_corrections", fake_verify,
+    )
+    with pytest.raises(RuntimeError, match="changed after verification"):
+        corporate_actions.prepare(
+            str(tmp_path),
+            coverage_start=date(2026, 7, 1),
+            coverage_end=date(2026, 7, 1),
+        )
+
+
+def test_prepare_fails_if_viewer_manifest_changes_mid_invocation(
+    tmp_path, monkeypatch,
+):
+    viewer_manifest = tmp_path / corporate_actions.VIEWER_MANIFEST_RELATIVE_PATH
+    _write_json(viewer_manifest, {})
+
+    def fake_verify(_base, *, required_start, required_end):
+        del required_start, required_end
+        return SimpleNamespace(
+            manifest_path=str(viewer_manifest.resolve()),
+            manifest_sha256=hashlib.sha256(
+                viewer_manifest.read_bytes(),
+            ).hexdigest(),
+            dependency_probes=(),
+            receipts=(),
+        )
+
+    def mutate_manifest(_base, *, include_audit=False):
+        _write_json(viewer_manifest, {"mutated": True})
+        result = []
+        return (result, {}) if include_audit else result
+
+    monkeypatch.setattr(
+        corporate_actions, "verify_viewer_corrections", fake_verify,
+    )
+    monkeypatch.setattr(corporate_actions, "_disclosure_rows", mutate_manifest)
+    with pytest.raises(RuntimeError, match="changed during prepare"):
+        corporate_actions.prepare(
+            str(tmp_path),
+            coverage_start=date(2026, 7, 1),
+            coverage_end=date(2026, 7, 1),
+        )
+
+
+def test_prepare_fails_if_dependency_probe_changes_mid_invocation(
+    tmp_path, monkeypatch,
+):
+    viewer_manifest = tmp_path / corporate_actions.VIEWER_MANIFEST_RELATIVE_PATH
+    _write_json(viewer_manifest, {})
+    probe_body = b"<html>dependency probe</html>"
+    probe_path = tmp_path / "viewer/probe.html"
+    probe_path.parent.mkdir(parents=True, exist_ok=True)
+    probe_path.write_bytes(probe_body)
+    probe = SimpleNamespace(
+        main_path="viewer/probe.html",
+        main_content_length=len(probe_body),
+        main_sha256=hashlib.sha256(probe_body).hexdigest(),
+    )
+
+    def fake_verify(_base, *, required_start, required_end):
+        del required_start, required_end
+        return SimpleNamespace(
+            manifest_path=str(viewer_manifest.resolve()),
+            manifest_sha256=hashlib.sha256(
+                viewer_manifest.read_bytes(),
+            ).hexdigest(),
+            dependency_probes=(probe,),
+            receipts=(),
+        )
+
+    def mutate_probe(_base, *, include_audit=False):
+        probe_path.write_bytes(b"<html>mutated dependency probe</html>")
+        result = []
+        return (result, {}) if include_audit else result
+
+    monkeypatch.setattr(
+        corporate_actions, "verify_viewer_corrections", fake_verify,
+    )
+    monkeypatch.setattr(corporate_actions, "_disclosure_rows", mutate_probe)
+    with pytest.raises(RuntimeError, match="evidence changed during prepare"):
+        corporate_actions.prepare(
+            str(tmp_path),
+            coverage_start=date(2026, 7, 1),
+            coverage_end=date(2026, 7, 1),
+        )
+
+
+def test_prepare_fails_if_support_body_changes_mid_invocation(
+    tmp_path, monkeypatch,
+):
+    support_manifest = (
+        tmp_path / corporate_actions.SUPPORT_FAMILY_MANIFEST_RELATIVE_PATH
+    )
+    _write_json(support_manifest, {})
+    body = b"support body"
+    body_path = tmp_path / "support/body.html"
+    body_path.parent.mkdir(parents=True, exist_ok=True)
+    body_path.write_bytes(body)
+    for marker in (
+        "structured_complete_v3.json", "documents_complete_v5.json",
+    ):
+        (body_path.parent / marker).write_bytes(b"{}")
+    digest = hashlib.sha256(body).hexdigest()
+    source = SimpleNamespace(
+        receipt_no="20260701000001",
+        main_path="support/body.html",
+        main_content_length=len(body),
+        main_sha256=digest,
+        body_path="support/body.html",
+        body_content_length=len(body),
+        body_sha256=digest,
+        disclosure_path="support/body.html",
+        disclosure_content_length=len(body),
+        disclosure_sha256=digest,
+        disclosure_manifest_path="support/body.html",
+        disclosure_manifest_sha256=digest,
+        structured_path=None,
+        structured_content_length=None,
+        structured_sha256=None,
+    )
+    entry = SimpleNamespace(
+        root_receipt_no=source.receipt_no,
+        terminal_receipt_no=source.receipt_no,
+        terminal_economic_receipt_no=source.receipt_no,
+        ordered_family_receipts=(source.receipt_no,),
+        sources=(source,),
+    )
+
+    def fake_support(_base, *, required_start, required_end):
+        del required_start, required_end
+        return SimpleNamespace(
+            manifest_path=str(support_manifest.resolve()),
+            manifest_sha256=hashlib.sha256(
+                support_manifest.read_bytes(),
+            ).hexdigest(),
+            entries=(entry,),
+        )
+
+    def mutate_support(_base, *, include_audit=False):
+        body_path.write_bytes(b"mutated support body")
+        result = []
+        return (result, {}) if include_audit else result
+
+    monkeypatch.setattr(
+        corporate_actions, "verify_support_action_families", fake_support,
+    )
+    monkeypatch.setattr(corporate_actions, "_disclosure_rows", mutate_support)
+    with pytest.raises(
+        RuntimeError, match="support-family evidence changed during prepare",
+    ):
+        corporate_actions.prepare(
+            str(tmp_path),
+            coverage_start=date(2026, 7, 1),
+            coverage_end=date(2026, 7, 1),
+        )
+
+
+def test_prepare_rejects_symlinked_evidence_path(
+    tmp_path, monkeypatch,
+):
+    viewer_manifest = tmp_path / corporate_actions.VIEWER_MANIFEST_RELATIVE_PATH
+    _write_json(viewer_manifest, {})
+    actual = b"viewer body"
+    actual_path = tmp_path / "viewer/actual.html"
+    link_path = tmp_path / "viewer/link.html"
+    actual_path.parent.mkdir(parents=True, exist_ok=True)
+    actual_path.write_bytes(actual)
+    link_path.symlink_to(actual_path.name)
+    digest = hashlib.sha256(actual).hexdigest()
+    evidence = SimpleNamespace(
+        receipt_no="20260701000001",
+        revision_root_receipt_no="20260701000001",
+        economic_body_receipt_no="20260701000001",
+        family_receipt_nos=("20260701000001",),
+        official_family_order=("20260701000001",),
+        attachment_keys=(),
+        main_path="viewer/link.html",
+        main_content_length=len(actual),
+        main_sha256=digest,
+        viewer_path="viewer/link.html",
+        viewer_content_length=len(actual),
+        viewer_sha256=digest,
+        economic_main_path="viewer/link.html",
+        economic_main_content_length=len(actual),
+        economic_main_sha256=digest,
+        economic_viewer_path="viewer/link.html",
+        economic_viewer_content_length=len(actual),
+        economic_viewer_sha256=digest,
+    )
+
+    def fake_verify(_base, *, required_start, required_end):
+        del required_start, required_end
+        return SimpleNamespace(
+            manifest_path=str(viewer_manifest.resolve()),
+            manifest_sha256=hashlib.sha256(
+                viewer_manifest.read_bytes(),
+            ).hexdigest(),
+            dependency_probes=(),
+            receipts=(evidence,),
+        )
+
+    monkeypatch.setattr(
+        corporate_actions, "verify_viewer_corrections", fake_verify,
+    )
+    with pytest.raises(RuntimeError, match="symlinked evidence path"):
+        corporate_actions.prepare(
+            str(tmp_path),
+            coverage_start=date(2026, 7, 1),
+            coverage_end=date(2026, 7, 1),
+        )
+
+
+def test_scoped_prepare_requires_paired_valid_coverage(tmp_path):
+    with pytest.raises(ValueError, match="provided together"):
+        corporate_actions.prepare(
+            str(tmp_path), coverage_start=date(2015, 1, 1),
+        )
+    with pytest.raises(ValueError, match="precedes"):
+        corporate_actions.prepare(
+            str(tmp_path),
+            coverage_start=date(2015, 1, 2),
+            coverage_end=date(2015, 1, 1),
+        )
+
+
+def test_every_production_corporate_action_consumer_declares_exact_coverage():
+    pipeline_root = Path(__file__).parents[2] / "pipeline"
+    violations = []
+    for path in sorted(pipeline_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "prepare"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "corporate_actions"
+            ):
+                continue
+            keywords = {item.arg for item in node.keywords}
+            if not {"coverage_start", "coverage_end"}.issubset(keywords):
+                violations.append(
+                    f"{path.relative_to(pipeline_root.parent)}:{node.lineno}"
+                )
+    assert violations == []
 
 
 def test_prepare_normalizes_structured_factor_and_exchange_notice(tmp_path):

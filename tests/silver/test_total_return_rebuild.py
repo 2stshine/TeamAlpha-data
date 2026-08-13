@@ -310,7 +310,7 @@ def test_local_action_snapshot_filters_issuer_and_reports_unmapped(
         },
     ])
 
-    def fake_prepare(base):
+    def fake_prepare(base, **_kwargs):
         assert base == str(tmp_path.resolve())
         return candidates, {}
 
@@ -456,10 +456,12 @@ def test_local_preview_fully_binds_nonempty_parent_and_child_evidence(
         rebuild, "verify_snapshot_manifest", lambda *args, **kwargs: verified_snapshot,
     )
     monkeypatch.setattr(
-        rebuild, "verify_source_evidence_manifest", lambda *_: scale_evidence,
+        rebuild, "verify_source_evidence_manifest",
+        lambda *_, **_kwargs: scale_evidence,
     )
     monkeypatch.setattr(
-        rebuild.corporate_actions, "prepare", lambda *_: (candidates, {}),
+        rebuild.corporate_actions, "prepare",
+        lambda *_, **_kwargs: (candidates, {}),
     )
     monkeypatch.setattr(
         rebuild,
@@ -633,6 +635,34 @@ def test_cli_is_dry_run_unless_apply_is_explicit():
     assert local.actions_base == "/tmp/actions"
     with pytest.raises(SystemExit):
         parse_args(["--apply", "--actions-base", "/tmp/actions"])
+
+
+def test_cli_help_declares_direct_apply_disabled(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--help"])
+
+    help_text = capsys.readouterr().out
+    assert "standalone apply는 비활성화됨" in help_text
+    assert "closed orchestrator 전용" in help_text
+    assert "Direct ``--apply`` is disabled" in rebuild.__doc__
+    assert "uv run python -m pipeline.silver.total_return_rebuild --apply" not in (
+        rebuild.__doc__
+    )
+
+
+def test_direct_apply_cli_is_disabled_in_favor_of_closed_orchestrator(monkeypatch):
+    monkeypatch.setattr(
+        rebuild, "parse_args", lambda: SimpleNamespace(
+            apply=True, batch_size=100, max_dividend_yield=1.0,
+            actions_base=None,
+        ),
+    )
+    monkeypatch.setattr(
+        rebuild, "run", lambda **kwargs: pytest.fail("unsafe apply reached"),
+    )
+
+    with pytest.raises(RuntimeError, match="direct total-return --apply"):
+        rebuild.main()
 
 
 def test_local_actions_cannot_reach_apply_or_open_connection(monkeypatch):

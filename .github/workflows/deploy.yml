@@ -31,6 +31,12 @@ env:
   SCHEDULE_EXPRESSION: "cron(30 8 ? * TUE-SAT *)"
   SCHEDULE_TIMEZONE: Asia/Seoul
   FMP_API_SECRET_ARN: ${{ vars.FMP_API_SECRET_ARN }}
+  # The closed daily path downloads the complete evidence snapshot and runs a
+  # full-history v3 return rebuild.  Start from the already established KRX
+  # rebuild envelope; right-size only after a measured production soak.
+  DAILY_CPU: '8192'
+  DAILY_MEMORY: '49152'
+  DAILY_EPHEMERAL_GIB: '120'
 
 jobs:
   test:
@@ -82,6 +88,21 @@ jobs:
             echo "CONTAINER_NAME=${CONTAINER_NAME}"
             echo "SCHEDULE_NAME=${SCHEDULE_NAME}"
           } >> "${GITHUB_ENV}"
+
+      - name: Require daily Scheduler to be disabled
+        run: |
+          set -euo pipefail
+
+          CURRENT_SCHEDULE_STATE="$(
+            aws scheduler get-schedule \
+              --name "${SCHEDULE_NAME}" \
+              --query State \
+              --output text
+          )"
+          [[ "${CURRENT_SCHEDULE_STATE}" == "DISABLED" ]] || {
+            echo "Refusing deploy while daily Scheduler is ${CURRENT_SCHEDULE_STATE}. Disable it before replacing the task revision." >&2
+            exit 1
+          }
 
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
@@ -144,6 +165,9 @@ jobs:
             --arg image "${IMAGE_URI}" \
             --arg container "${CONTAINER_NAME}" \
             --arg fmp_secret "${FMP_API_SECRET_ARN}" \
+            --arg task_cpu "${DAILY_CPU}" \
+            --arg task_memory "${DAILY_MEMORY}" \
+            --argjson ephemeral_gib "${DAILY_EPHEMERAL_GIB}" \
             '
             {
               family,
@@ -164,10 +188,15 @@ jobs:
               inferenceAccelerators
             }
             | with_entries(select(.value != null and .value != [] and .value != {}))
+            | .cpu = $task_cpu
+            | .memory = $task_memory
+            | .ephemeralStorage = {"sizeInGiB": $ephemeral_gib}
             | .containerDefinitions |= map(
                 if .name == $container then
                   .image = $image
                   | .entryPoint = ["uv", "run", "python", "-m", "pipeline.daily_full"]
+                  | .stopTimeout = 120
+                  | del(.cpu, .memory, .memoryReservation)
                   | del(.command)
                   | if ($fmp_secret | length) > 0 then
                       .secrets = (
@@ -190,6 +219,19 @@ jobs:
             | any(.name == "FMP_API_KEY" and (.valueFrom | length) > 0)
             ' new-task-definition.json > /dev/null || {
               echo "FMP_API_KEY secret is missing. Set FMP_API_SECRET_ARN or update the ECS task definition." >&2
+              exit 1
+            }
+
+          jq -e \
+            --arg cpu "${DAILY_CPU}" \
+            --arg memory "${DAILY_MEMORY}" \
+            --argjson ephemeral "${DAILY_EPHEMERAL_GIB}" \
+            '
+            .cpu == $cpu
+            and .memory == $memory
+            and .ephemeralStorage.sizeInGiB == $ephemeral
+            ' new-task-definition.json > /dev/null || {
+              echo "Closed daily task resource envelope is incomplete." >&2
               exit 1
             }
 
@@ -217,15 +259,28 @@ jobs:
           SCHEDULE_GROUP="$(
             jq -r '.GroupName // "default"' current-schedule.json
           )"
-          [[ "${CURRENT_SCHEDULE_STATE}" =~ ^(ENABLED|DISABLED)$ ]] || {
-            echo "Unexpected Scheduler state: ${CURRENT_SCHEDULE_STATE}" >&2
+          [[ "${CURRENT_SCHEDULE_STATE}" == "DISABLED" ]] || {
+            echo "Scheduler changed during deploy: ${CURRENT_SCHEDULE_STATE}. Refusing target replacement." >&2
             exit 1
           }
 
           jq \
             --arg task_definition_arn "${TASK_DEFINITION_ARN}" \
-            '.EcsParameters.TaskDefinitionArn = $task_definition_arn' \
+            '.EcsParameters.TaskDefinitionArn = $task_definition_arn
+             | .EcsParameters.TaskCount = 1
+             | .RetryPolicy = {
+                 "MaximumEventAgeInSeconds": 86400,
+                 "MaximumRetryAttempts": 0
+               }' \
             current-schedule-target.json > new-schedule-target.json
+
+          jq -e '
+            .EcsParameters.TaskCount == 1
+            and .RetryPolicy.MaximumRetryAttempts == 0
+          ' new-schedule-target.json > /dev/null || {
+            echo "Daily Scheduler must launch one task with no Scheduler retry overlap." >&2
+            exit 1
+          }
 
           aws scheduler update-schedule \
             --name "${SCHEDULE_NAME}" \
@@ -234,7 +289,7 @@ jobs:
             --schedule-expression-timezone "${SCHEDULE_TIMEZONE}" \
             --flexible-time-window '{"Mode":"OFF"}' \
             --target file://new-schedule-target.json \
-            --state "${CURRENT_SCHEDULE_STATE}"
+            --state DISABLED
 
       - name: Show deployed version
         run: |

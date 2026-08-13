@@ -1,4 +1,5 @@
 from datetime import date
+import math
 from uuid import uuid4
 
 import pandas as pd
@@ -10,6 +11,7 @@ from pipeline.silver.total_returns import (
     canonicalize_cash_dividends,
     classify_cash_dividend_revisions,
     resolve_dividend_ex_dates,
+    stored_price_factor_interval,
 )
 
 
@@ -297,6 +299,57 @@ def test_four_decimal_rounding_does_not_fake_a_scale_change():
     _, events = apply_dividends_to_prices(prices, dividends)
 
     assert events.iloc[0]["application_status"] == "applied"
+
+
+def test_stored_price_factor_interval_admits_actual_038620_rounding_case():
+    low, high = stored_price_factor_interval(
+        previous_close=1575.0,
+        previous_adj_close=4550.9656,
+        applied_close=1460.0,
+        applied_adj_close=4400.2714,
+    )
+    frozen_source_factor = 0.9587301532470918
+    krx_reference_factor = 1510.0 / 1575.0
+
+    assert abs(krx_reference_factor - frozen_source_factor) > 5e-13
+    assert low <= frozen_source_factor <= high
+    assert low <= krx_reference_factor <= high
+
+
+def test_stored_price_factor_interval_has_closed_exact_boundaries():
+    low, high = stored_price_factor_interval(
+        previous_close=1575.0,
+        previous_adj_close=4550.9656,
+        applied_close=1460.0,
+        applied_adj_close=4400.2714,
+    )
+
+    assert low <= low <= high
+    assert low <= high <= high
+    assert not low <= math.nextafter(low, -math.inf) <= high
+    assert not low <= math.nextafter(high, math.inf) <= high
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("previous_close", 0.0),
+        ("previous_adj_close", math.nan),
+        ("applied_close", math.inf),
+        ("applied_adj_close", -1.0),
+    ],
+)
+def test_stored_price_factor_interval_rejects_invalid_inputs(field, value):
+    inputs = {
+        "previous_close": 1575.0,
+        "previous_adj_close": 4550.9656,
+        "applied_close": 1460.0,
+        "applied_adj_close": 4400.2714,
+    }
+    inputs[field] = value
+
+    with pytest.raises(RuntimeError, match="finite and positive"):
+        stored_price_factor_interval(**inputs)
 
 
 def test_two_parts_per_million_scale_jump_is_not_hidden_as_stable():

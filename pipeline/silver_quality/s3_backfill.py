@@ -1,7 +1,9 @@
-"""S3 candidate 기반 최초 Silver backfill.
+"""Legacy S3-candidate Silver backfill (direct CLI disabled).
 
 Bronze 전체를 ECS에서 검사하고 통과 후보를 S3 Parquet으로 고정한다.
 RDS에는 quality_stage를 누적하지 않고 최종 Silver만 bounded transaction으로 적재한다.
+The retained implementation does not close the derived total-return contract,
+so ``main`` fails before argument parsing, base resolution, S3, or DB access.
 """
 from __future__ import annotations
 
@@ -30,6 +32,12 @@ from pipeline.silver_quality.backfill import (
 from pipeline.silver_quality.candidate_store import CandidatePart, CandidateStore
 from pipeline.silver_quality.models import CandidateBundle, QualityGateError
 from pipeline.silver_quality.runner import assert_publishable, evaluate, print_summary
+
+
+DIRECT_CLI_DISABLED_MESSAGE = (
+    "direct S3 Silver quality backfill CLI is disabled: it can leave the "
+    "KRX total-return contract BUILDING without closed recertification"
+)
 
 
 def _store_for(run_id: UUID) -> CandidateStore:
@@ -483,6 +491,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Reject the unsafe direct write path before parsing or external access."""
+    raise RuntimeError(DIRECT_CLI_DISABLED_MESSAGE)
+
+
+def _unsafe_legacy_main() -> None:
+    """Retained for a future closed orchestrator; never dispatch directly."""
     arguments = parse_args()
     run(arguments.src, arguments.resume)
+
+
+if __name__ == "__main__":
+    main()

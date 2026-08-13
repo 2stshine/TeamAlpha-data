@@ -1,8 +1,10 @@
-"""ECS one-off Silver rebuild from an immutable Bronze manifest.
+"""Disabled legacy ECS one-off Silver rebuild implementation.
 
 The task downloads only objects captured in the cutoff manifest, verifies that
 their S3 ETag and size have not changed, atomically clears legacy Silver while
 applying the DQ migration, then runs the normal staged backfill and final audit.
+That sequence does not restore all FMP/DART source-scoped data or close the v3
+return contract, so :func:`main` fails before S3/RDS access.
 """
 from __future__ import annotations
 
@@ -232,6 +234,15 @@ def _prepare_rds(*, s3_candidate_mode: bool, resume: bool) -> None:
 
 
 def main() -> None:
+    raise RuntimeError(
+        "destructive ECS Silver backfill is disabled: it truncates shared "
+        "KRX/FMP/DART data without the authenticated fundamental reload and "
+        "closed total-return recertification workflow"
+    )
+
+
+def _unsafe_legacy_main() -> None:
+    """Retained for forensic reference; never dispatch from an entrypoint."""
     root = Path(os.environ.get("BACKFILL_DATA_ROOT", "/app/data"))
     fingerprint = _sync_cutoff(root)
     print(f"[ecs-backfill] cutoff verified fingerprint={fingerprint}", flush=True)

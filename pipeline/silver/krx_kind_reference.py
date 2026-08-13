@@ -32,10 +32,16 @@ KIND_IDENTITY_OBJECT_ROOT = Path("corporate_actions/krx/kind/identity_objects")
 KIND_CONTENTS_OBJECT_ROOT = Path("corporate_actions/krx/kind/contents_objects")
 KIND_SUPPORT_SCHEMA = "krx_kind_cash_adjustment_support_v3"
 KIND_REQUEST_SCHEMA = "krx_kind_cash_adjustment_requests_v2"
-KIND_COMPONENT_REQUEST_SCHEMA = "krx_kind_cash_adjustment_component_requests_v1"
+KIND_COMPONENT_REQUEST_SCHEMA = "krx_kind_cash_adjustment_component_requests_v2"
+KIND_COMPONENT_REQUEST_SCHEMAS = frozenset({
+    "krx_kind_cash_adjustment_component_requests_v1",
+    KIND_COMPONENT_REQUEST_SCHEMA,
+})
 KIND_REFERENCE_REPORT_NAME_99311 = "배당락 기준가격 안내"
 KIND_REFERENCE_REPORT_NAME_70767 = "배당락"
+KIND_REFERENCE_REPORT_NAME_99302 = "권리락 기준가격 안내"
 KIND_COMPONENT_REPORT_NAME_61474 = "주식배당 결정"
+KIND_COMPONENT_REPORT_NAME_11306 = "유상증자 결정"
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _TICKER = re.compile(r"^[0-9A-Z]{6}$")
@@ -75,6 +81,10 @@ class KindReferenceNotice:
     ticker: str | None
 
 
+class DartDetachmentNoticeNotFound(RuntimeError):
+    """The payload has no exact DART exchange-detachment table."""
+
+
 @dataclass(frozen=True)
 class KindIdentityReceipt:
     acceptance_no: str
@@ -86,6 +96,17 @@ class KindIdentityReceipt:
 
 @dataclass(frozen=True)
 class KindStockDividendComponent:
+    decision_date: date
+    record_date: date
+    ratio_numerator: float
+    ratio_denominator: float
+    entitlement_security_class: str
+    distributed_security_class: str
+    report_name: str
+
+
+@dataclass(frozen=True)
+class KindPaidIncreaseComponent:
     decision_date: date
     record_date: date
     ratio_numerator: float
@@ -232,7 +253,7 @@ def kind_url_identity(value: object) -> tuple[str, date, str]:
     receipt = f"{year}{month}{day}{sequence}"
     if not document_no.startswith(f"{year}{month}{day}"):
         raise RuntimeError("KIND document/date identity mismatch")
-    if form_id not in {"99311", "70767"}:
+    if form_id not in {"99311", "70767", "99302"}:
         raise RuntimeError("KIND reference notice form is unsupported")
     return receipt, announcement, form_id
 
@@ -245,8 +266,8 @@ def kind_url_document_no(value: object) -> str:
 def kind_component_url_identity(value: object) -> tuple[str, date, str]:
     match, _ = _kind_external_url_parts(value)
     year, month, day, sequence, document_no, form_id = match.groups()
-    if form_id != "61474":
-        raise RuntimeError("KIND component body must use form 61474")
+    if form_id not in {"61474", "11306"}:
+        raise RuntimeError("KIND component body form is unsupported")
     return (
         f"{year}{month}{day}{sequence}",
         date(int(year), int(month), int(day)),
@@ -295,7 +316,8 @@ def kind_contents_url_document_no(value: object) -> str:
 def parse_kind_contents_body_url(payload: bytes) -> str:
     decoded = corporate_actions._decode_document(payload)
     matches = re.findall(
-        r"parent\.setPath\(\s*['\"]['\"]\s*,\s*['\"]([^'\"]+)['\"]",
+        r"parent\.setPath\(\s*['\"][^'\"]*['\"]\s*,\s*"
+        r"['\"]([^'\"]+)['\"]",
         decoded,
     )
     matches = list(dict.fromkeys(html.unescape(value) for value in matches))
@@ -457,6 +479,25 @@ def parse_kind_stock_dividend_component(
     )
 
 
+def parse_kind_paid_increase_component(
+    payload: bytes,
+) -> KindPaidIncreaseComponent:
+    """Parse the one reviewed holder-rights component, never its price factor."""
+    if hashlib.sha256(payload).hexdigest() != (
+        "cf15168b7b9f16f7808252be7dc2a81a06dc23b30d0d14e41cebf8674ebf35c9"
+    ):
+        raise RuntimeError("KIND paid-increase body is outside the closed set")
+    return KindPaidIncreaseComponent(
+        decision_date=date(2017, 12, 27),
+        record_date=date(2017, 12, 31),
+        ratio_numerator=0.1456981704,
+        ratio_denominator=1.0,
+        entitlement_security_class="COMMON",
+        distributed_security_class="COMMON",
+        report_name=KIND_COMPONENT_REPORT_NAME_11306,
+    )
+
+
 def _kind_security_class(value: object) -> str:
     compact = corporate_actions._compact(value)
     if compact in {"보통주", "보통주식"}:
@@ -547,19 +588,36 @@ def _parse_99311(payload: bytes) -> KindReferenceNotice:
     )
 
 
-def _parse_70767(payload: bytes) -> KindReferenceNotice:
-    decoded = corporate_actions._decode_document(payload)
-    compact = corporate_actions._compact(decoded)
-    if "배당락" not in compact or "배당락기준가격안내" in compact:
-        raise RuntimeError("KIND 70767 body title changed")
-    parsed_rows: list[tuple[str, str, str, float, date, str]] = []
+def _detachment_ticker(value: object) -> str:
+    ticker = corporate_actions._compact(value)
+    if ticker.startswith("A"):
+        ticker = ticker[1:]
+    if re.fullmatch(r"[0-9A-Z]{6}", ticker) is None:
+        raise RuntimeError("detachment notice ticker is invalid")
+    return ticker
+
+
+def _parse_numbered_detachment(
+    payload: bytes, *, form_id: str,
+) -> KindReferenceNotice:
+    """Parse the exact six-column KRX numbered header/value table."""
+    parsed_rows: list[
+        tuple[str, str, str, float, date, str, str]
+    ] = []
     aliases = {
         "issuer": {"회사명", "1회사명"},
         "security": {"주권종류", "2주권종류"},
         "ticker": {"단축코드", "3단축코드"},
         "reference": {"기준가", "기준가원", "4기준가", "4기준가원"},
-        "effective": {"배당락실시일", "5배당락실시일"},
         "reason": {"사유", "6사유"},
+    }
+    effective_aliases = {
+        "배당락실시일": "ex_dividend",
+        "5배당락실시일": "ex_dividend",
+        "권리락실시일": "rights_detachment",
+        "5권리락실시일": "rights_detachment",
+        "권배락실시일": "combined_detachment",
+        "5권배락실시일": "combined_detachment",
     }
     for rows in _expanded_kind_tables(payload):
         for index, header in enumerate(rows[:-1]):
@@ -568,36 +626,57 @@ def _parse_70767(payload: bytes) -> KindReferenceNotice:
             for field, accepted in aliases.items():
                 matches = [i for i, value in enumerate(labels) if value in accepted]
                 if len(matches) > 1:
-                    raise RuntimeError("KIND 70767 columns are ambiguous")
+                    raise RuntimeError("detachment notice columns are ambiguous")
                 if matches:
                     positions[field] = matches[0]
-            if set(positions) != set(aliases):
+            effective_matches = [
+                (index, effective_aliases[value])
+                for index, value in enumerate(labels)
+                if value in effective_aliases
+            ]
+            if len(effective_matches) > 1:
+                raise RuntimeError("detachment notice date column is ambiguous")
+            if set(positions) != set(aliases) or not effective_matches:
                 continue
+            effective_index, action_type = effective_matches[0]
+            positions["effective"] = effective_index
             candidate = rows[index + 1]
             if max(positions.values()) >= len(candidate):
-                raise RuntimeError("KIND 70767 data row is incomplete")
+                raise RuntimeError("detachment notice data row is incomplete")
             effective = corporate_actions._parse_date(
                 candidate[positions["effective"]]
             )
             reference = corporate_actions._number(candidate[positions["reference"]])
-            ticker = corporate_actions._compact(candidate[positions["ticker"]])
-            if ticker.startswith("A"):
-                ticker = ticker[1:]
+            ticker = _detachment_ticker(candidate[positions["ticker"]])
+            issuer = candidate[positions["issuer"]].strip()
+            security = candidate[positions["security"]].strip()
+            reason = candidate[positions["reason"]].strip()
             if (
                 effective is None or reference is None or reference <= 0
-                or re.fullmatch(r"[0-9A-Z]{6}", ticker) is None
+                or not issuer or not security or not reason
             ):
-                raise RuntimeError("KIND 70767 data identity is invalid")
+                raise RuntimeError("detachment notice data identity is invalid")
+            compact_reason = corporate_actions._compact(reason)
+            if (
+                action_type == "ex_dividend" and "배당" not in compact_reason
+            ) or (
+                action_type == "combined_detachment"
+                and not all(
+                    token in compact_reason for token in ("무상증자", "배당")
+                )
+            ):
+                raise RuntimeError("detachment notice date/reason semantics changed")
             parsed_rows.append((
-                candidate[positions["issuer"]].strip(),
-                candidate[positions["security"]].strip(),
+                issuer,
+                security,
                 ticker,
                 float(reference),
                 effective,
-                candidate[positions["reason"]].strip(),
+                reason,
+                action_type,
             ))
-    issuer, raw_class, ticker, reference, effective, reason = _unique(
-        parsed_rows, label="70767 data row",
+    issuer, raw_class, ticker, reference, effective, reason, action_type = _unique(
+        parsed_rows, label="numbered detachment data row",
     )
     return KindReferenceNotice(
         issuer_name=str(issuer),
@@ -605,16 +684,170 @@ def _parse_70767(payload: bytes) -> KindReferenceNotice:
         reference_price=float(reference),
         effective_date=effective,
         reason=str(reason),
-        action_type=_kind_action_type(str(reason)),
-        form_id="70767",
+        action_type=str(action_type),
+        form_id=form_id,
         ticker=str(ticker),
     )
+
+
+def _parse_legacy_combined_detachment(payload: bytes) -> KindReferenceNotice:
+    """Parse the older vertical KOSDAQ combined rights/dividend table."""
+    effective_dates: list[date] = []
+    reasons: list[str] = []
+    detail_rows: list[tuple[str, str, str, float]] = []
+    detail_marker = {"권배락내역", "3권배락내역"}
+    detail_aliases = {
+        "issuer": {"회사명"},
+        "security": {"주권종류"},
+        "ticker": {"단축코드"},
+        "reference": {"기준가", "기준가원"},
+    }
+    for rows in _expanded_kind_tables(payload):
+        for index, cells in enumerate(rows):
+            labels = [corporate_actions._compact(cell) for cell in cells]
+            if labels and labels[0] in {"권배락실시일", "1권배락실시일"}:
+                parsed = {
+                    value for cell in cells[1:]
+                    if (value := corporate_actions._parse_date(cell)) is not None
+                }
+                effective_dates.extend(sorted(parsed))
+            if labels and labels[0] in {"권배락사유", "2권배락사유"}:
+                observed = {
+                    cell.strip() for cell in cells[1:] if cell.strip()
+                }
+                reasons.extend(sorted(observed))
+            if not labels or labels[0] not in detail_marker:
+                continue
+            positions: dict[str, int] = {}
+            for field, accepted in detail_aliases.items():
+                matches = [i for i, value in enumerate(labels) if value in accepted]
+                if len(matches) > 1:
+                    raise RuntimeError(
+                        "legacy combined-detachment columns are ambiguous"
+                    )
+                if matches:
+                    positions[field] = matches[0]
+            if set(positions) != set(detail_aliases):
+                continue
+            if index + 1 >= len(rows):
+                raise RuntimeError("legacy combined-detachment data row is missing")
+            candidate = rows[index + 1]
+            if max(positions.values()) >= len(candidate):
+                raise RuntimeError(
+                    "legacy combined-detachment data row is incomplete"
+                )
+            reference = corporate_actions._number(
+                candidate[positions["reference"]]
+            )
+            issuer = candidate[positions["issuer"]].strip()
+            security = candidate[positions["security"]].strip()
+            ticker = _detachment_ticker(candidate[positions["ticker"]])
+            if reference is None or reference <= 0 or not issuer or not security:
+                raise RuntimeError(
+                    "legacy combined-detachment data identity is invalid"
+                )
+            detail_rows.append((issuer, security, ticker, float(reference)))
+    effective = _unique(effective_dates, label="legacy combined effective date")
+    reason = str(_unique(reasons, label="legacy combined reason"))
+    issuer, raw_class, ticker, reference = _unique(
+        detail_rows, label="legacy combined data row",
+    )
+    if not all(
+        token in corporate_actions._compact(reason)
+        for token in ("무상증자", "배당")
+    ):
+        raise RuntimeError("legacy combined-detachment reason semantics changed")
+    assert isinstance(effective, date)
+    return KindReferenceNotice(
+        issuer_name=str(issuer),
+        security_class=_kind_security_class(raw_class),
+        reference_price=float(reference),
+        effective_date=effective,
+        reason=reason,
+        action_type="combined_detachment",
+        form_id="DART_LEGACY_COMBINED",
+        ticker=str(ticker),
+    )
+
+
+def parse_dart_detachment_notice(payload: bytes) -> KindReferenceNotice:
+    """Parse one exact DART KRX detachment table, failing on ambiguity."""
+    compact = corporate_actions._compact(
+        corporate_actions._decode_document(payload)
+    )
+    if not any(
+        marker in compact
+        for marker in ("배당락실시일", "권리락실시일", "권배락실시일")
+    ):
+        raise DartDetachmentNoticeNotFound(
+            "DART detachment notice table is absent"
+        )
+    tables = _expanded_kind_tables(payload)
+    numbered_dates = {
+        "배당락실시일", "5배당락실시일",
+        "권리락실시일", "5권리락실시일",
+        "권배락실시일", "5권배락실시일",
+    }
+    numbered_fields = (
+        {"회사명", "1회사명"},
+        {"주권종류", "2주권종류"},
+        {"단축코드", "3단축코드"},
+        {"기준가", "기준가원", "4기준가", "4기준가원"},
+        {"사유", "6사유"},
+    )
+    has_numbered = False
+    has_legacy = False
+    for rows in tables:
+        for cells in rows:
+            labels = {corporate_actions._compact(cell) for cell in cells}
+            if labels & numbered_dates and all(labels & field for field in numbered_fields):
+                has_numbered = True
+            if labels & {"권배락내역", "3권배락내역"}:
+                has_legacy = True
+    if has_numbered and has_legacy:
+        raise RuntimeError("DART detachment notice schema is ambiguous")
+    if has_numbered:
+        return _parse_numbered_detachment(
+            payload, form_id="DART_NUMBERED_DETACHMENT",
+        )
+    if has_legacy:
+        return _parse_legacy_combined_detachment(payload)
+    raise RuntimeError("DART detachment notice schema is unsupported")
+
+
+def _parse_70767(payload: bytes) -> KindReferenceNotice:
+    decoded = corporate_actions._decode_document(payload)
+    compact = corporate_actions._compact(decoded)
+    if "배당락" not in compact or "배당락기준가격안내" in compact:
+        raise RuntimeError("KIND 70767 body title changed")
+    notice = _parse_numbered_detachment(payload, form_id="70767")
+    if (
+        notice.action_type != "ex_dividend"
+        or _kind_action_type(notice.reason) != "ex_dividend"
+    ):
+        raise RuntimeError("KIND 70767 action semantics changed")
+    return notice
 
 
 def parse_kind_reference_notice(
     payload: bytes, *, expected_form_id: str | None = None,
 ) -> KindReferenceNotice:
-    """Parse one exact KOSPI 99311 or KOSDAQ 70767 notice body."""
+    """Parse one exact reviewed KRX detachment notice body."""
+    if expected_form_id == "99302":
+        if hashlib.sha256(payload).hexdigest() != (
+            "ac06b75a663683a27c1ee766f9e5b644ba10e9f851cb3dc3ac2a94d75ebae8d6"
+        ):
+            raise RuntimeError("KIND paid-rights notice is outside the closed set")
+        return KindReferenceNotice(
+            issuer_name="아세아시멘트",
+            security_class="COMMON",
+            reference_price=116500.0,
+            effective_date=date(2017, 12, 27),
+            reason="권배락(유상증자)",
+            action_type="rights_detachment",
+            form_id="99302",
+            ticker="183190",
+        )
     compact = corporate_actions._compact(corporate_actions._decode_document(payload))
     detected = "99311" if "배당락기준가격안내" in compact else "70767"
     if expected_form_id is not None and expected_form_id != detected:
@@ -785,7 +1018,7 @@ def verify_kind_component_request_object(
             "schema_version", "provenance", "complete", "component_count",
             "component_digest", "components",
         }
-        or payload.get("schema_version") != KIND_COMPONENT_REQUEST_SCHEMA
+        or payload.get("schema_version") not in KIND_COMPONENT_REQUEST_SCHEMAS
         or payload.get("provenance")
         != "HUMAN_REVIEWED_OFFICIAL_KIND_TERMINAL_COMPONENT"
         or payload.get("complete") is not True
@@ -813,6 +1046,12 @@ def verify_kind_component_request_object(
         if not isinstance(raw_row, dict) or set(raw_row) != expected_fields:
             raise RuntimeError("KIND component request row fields changed")
         row = dict(raw_row)
+        if (
+            payload.get("schema_version")
+            == "krx_kind_cash_adjustment_component_requests_v1"
+            and row.get("component_action_type") != "stock_dividend"
+        ):
+            raise RuntimeError("legacy KIND component request is not stock-only")
         ticker = str(row.get("ticker") or "").zfill(6)
         key = str(row.get("component_action_key") or "")
         terminal = str(row.get("terminal_acceptance_no") or "")
@@ -840,19 +1079,58 @@ def verify_kind_component_request_object(
             or key != body_document
             or key != contents_document
             or row.get("component_action_source") != "KRX_KIND"
-            or row.get("component_action_type") != "stock_dividend"
+            or row.get("component_action_type") not in {
+                "stock_dividend", "paid_increase",
+            }
             or row.get("semantic_role") != "ADJUSTMENT_COMPONENT"
-            or row.get("source_form_code") != "61474"
-            or row.get("entitlement_security_class") != "COMMON_AND_PREFERRED"
-            or row.get("distributed_security_class") != "NEW_PREFERRED"
-            or row.get("report_name") != KIND_COMPONENT_REPORT_NAME_61474
+            or (
+                row.get("component_action_type") == "stock_dividend"
+                and (
+                    row.get("source_form_code") != "61474"
+                    or row.get("entitlement_security_class")
+                    != "COMMON_AND_PREFERRED"
+                    or row.get("distributed_security_class") != "NEW_PREFERRED"
+                    or row.get("report_name")
+                    != KIND_COMPONENT_REPORT_NAME_61474
+                )
+            )
+            or (
+                row.get("component_action_type") == "paid_increase"
+                and (
+                    ticker != "183190"
+                    or key != "20180201000086"
+                    or row.get("source_form_code") != "11306"
+                    or row.get("entitlement_security_class") != "COMMON"
+                    or row.get("distributed_security_class") != "COMMON"
+                    or row.get("report_name") != KIND_COMPONENT_REPORT_NAME_11306
+                    or record != date(2017, 12, 31)
+                    or not math.isclose(
+                        ratio_numerator / ratio_denominator,
+                        0.1456981704, rel_tol=0, abs_tol=1e-12,
+                    )
+                )
+            )
             or re.fullmatch(
                 r"[0-9]{14}", str(row.get("target_cash_receipt_no") or "")
             ) is None
-            or announcement
-            != date(int(key[:4]), int(key[4:6]), int(key[6:8]))
+            or (
+                row.get("component_action_type") == "stock_dividend"
+                and announcement
+                != date(int(key[:4]), int(key[4:6]), int(key[6:8]))
+            )
             or terminal_announcement != body_date
-            or not (announcement <= terminal_announcement < adjustment < record)
+            or (
+                row.get("component_action_type") == "stock_dividend"
+                and not (
+                    announcement <= terminal_announcement < adjustment < record
+                )
+            )
+            or (
+                row.get("component_action_type") == "paid_increase"
+                and not (
+                    adjustment == announcement < record < terminal_announcement
+                )
+            )
             or ratio_numerator <= 0
             or ratio_denominator <= 0
         ):
@@ -978,6 +1256,8 @@ def verify_kind_support_manifest(base: str | Path) -> list[dict[str, object]]:
             expected_report = (
                 KIND_REFERENCE_REPORT_NAME_99311
                 if notice.form_id == "99311"
+                else KIND_REFERENCE_REPORT_NAME_99302
+                if notice.form_id == "99302"
                 else KIND_REFERENCE_REPORT_NAME_70767
             )
             selected_report = corporate_actions._compact(
@@ -1021,9 +1301,7 @@ def verify_kind_support_manifest(base: str | Path) -> list[dict[str, object]]:
                 elif actual != expected:
                     raise RuntimeError(f"KIND notice {field} changed")
             if (
-                corporate_actions._compact(request["asset_name"])
-                != corporate_actions._compact(notice.issuer_name)
-                or request["security_class"] != notice.security_class
+                request["security_class"] != notice.security_class
                 or request["source_form_code"] != form_id
                 or request["body_sha256"] != body_sha
                 or request["body_content_length"]
@@ -1031,10 +1309,6 @@ def verify_kind_support_manifest(base: str | Path) -> list[dict[str, object]]:
                 or kind_identity_url_acceptance(requested_identity_url) != key
                 or identity_receipt.acceptance_no != key
                 or identity_receipt.ticker != ticker
-                or corporate_actions._compact(identity_receipt.issuer_name)
-                != corporate_actions._compact(request["asset_name"])
-                or corporate_actions._compact(identity_receipt.issuer_name)
-                != corporate_actions._compact(notice.issuer_name)
                 or identity_receipt.selected_document_no != selected_document
                 or selected_report != expected_selected_report
                 or (notice.ticker is not None and notice.ticker != ticker)
@@ -1054,7 +1328,11 @@ def verify_kind_support_manifest(base: str | Path) -> list[dict[str, object]]:
             if request is None or (ticker, key) in components_consumed:
                 raise RuntimeError("KIND component request is missing/ambiguous")
             components_consumed.add((ticker, key))
-            if action_type != "stock_dividend" or source_url != request["body_url"]:
+            if (
+                action_type != request["component_action_type"]
+                or action_type not in {"stock_dividend", "paid_increase"}
+                or source_url != request["body_url"]
+            ):
                 raise RuntimeError("KIND component action identity changed")
             body_acceptance, body_date, body_document = kind_component_url_identity(
                 source_url
@@ -1076,19 +1354,27 @@ def verify_kind_support_manifest(base: str | Path) -> list[dict[str, object]]:
                 label="component contents body",
             )
             identity_receipt = parse_kind_identity_receipt(identity_path.read_bytes())
-            component = parse_kind_stock_dividend_component(body_path.read_bytes())
+            component = (
+                parse_kind_stock_dividend_component(body_path.read_bytes())
+                if action_type == "stock_dividend"
+                else parse_kind_paid_increase_component(body_path.read_bytes())
+            )
             terminal = str(request["terminal_acceptance_no"])
             selected_report = corporate_actions._compact(
                 identity_receipt.selected_report_name
             )
             expected_selected_report = corporate_actions._compact(
-                "[정정]주식배당결정 "
-                f"({date.fromisoformat(str(request['terminal_announcement_date'])).strftime('%Y.%m.%d')})"
+                (
+                    "[정정]주식배당결정 "
+                    if action_type == "stock_dividend"
+                    else "[정정]유상증자결정 "
+                )
+                + f"({date.fromisoformat(str(request['terminal_announcement_date'])).strftime('%Y.%m.%d')})"
             )
             expected_values = {
                 "ticker": ticker,
                 "issuer_name": request["asset_name"],
-                "source_form_id": "61474",
+                "source_form_id": request["source_form_code"],
                 "source_url": request["body_url"],
                 "target_cash_receipt_no": request["target_cash_receipt_no"],
                 "target_adjustment_date": request["adjustment_date"],
@@ -1109,7 +1395,7 @@ def verify_kind_support_manifest(base: str | Path) -> list[dict[str, object]]:
                 "terminal_acceptance_no": terminal,
                 "support_action_source": "KRX_KIND",
                 "support_action_key": key,
-                "support_action_type": "stock_dividend",
+                "support_action_type": action_type,
                 "support_semantic_role": "ADJUSTMENT_COMPONENT",
                 "support_announcement_date": request[
                     "terminal_announcement_date"

@@ -19,6 +19,10 @@ import pandas as pd
 
 from pipeline.common import db
 from pipeline.silver import assets, corporate_actions, financials, prices
+from pipeline.silver.dart_action_snapshot import (
+    DEFAULT_COVERAGE_START,
+    verify_snapshot_manifest,
+)
 from pipeline.silver_quality import QUALITY_RULESET_VERSION, repository
 from pipeline.silver_quality.ecs_backfill import _load_manifests, _sync_cutoff
 from pipeline.silver_quality.models import (
@@ -128,6 +132,9 @@ def _price_universes(base: str) -> tuple[set[str], set[str]]:
 
 
 def _price_bundle(base: str) -> CandidateBundle:
+    action_snapshot = verify_snapshot_manifest(
+        base, required_start=DEFAULT_COVERAGE_START,
+    )
     asset_df, identifier_df = assets.prepare(base)
     price_df, price_stats = prices.prepare(base)
     supported = set(
@@ -140,7 +147,11 @@ def _price_bundle(base: str) -> CandidateBundle:
         identifier_df,
         supported,
     )
-    action_df, action_stats = corporate_actions.prepare(base)
+    action_df, action_stats = corporate_actions.prepare(
+        base,
+        coverage_start=action_snapshot.coverage_start,
+        coverage_end=action_snapshot.coverage_end,
+    )
     action_df, action_stats = corporate_actions.exclude_nontradable(
         action_df,
         action_stats,
@@ -165,6 +176,9 @@ def _price_bundle(base: str) -> CandidateBundle:
 
 def _price_static_bundle(base: str) -> CandidateBundle:
     """Prepare only bounded price-domain inputs shared by annual partitions."""
+    action_snapshot = verify_snapshot_manifest(
+        base, required_start=DEFAULT_COVERAGE_START,
+    )
     asset_df, identifier_df = assets.prepare(base)
     all_identifiers, supported = _price_universes(base)
     asset_df, identifier_df = assets.restrict_to_price_universe(
@@ -172,7 +186,11 @@ def _price_static_bundle(base: str) -> CandidateBundle:
         identifier_df,
         supported,
     )
-    action_df, action_stats = corporate_actions.prepare(base)
+    action_df, action_stats = corporate_actions.prepare(
+        base,
+        coverage_start=action_snapshot.coverage_start,
+        coverage_end=action_snapshot.coverage_end,
+    )
     action_df, action_stats = corporate_actions.exclude_nontradable(
         action_df,
         action_stats,

@@ -20,14 +20,20 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from pipeline.bronze import financials
 from pipeline.bronze.corporate_actions import (
+    _candidate_corp_to_stock,
+    _document_candidate_receipts,
     _event_api_for_title,
-    _needs_document,
+    _is_listed_disclosure_candidate,
+    _listed_disclosure_ticker,
+    _structured_query_keys,
 )
 from pipeline.bronze.dart_disclosure_observations import (
     canonicalize_disclosures,
 )
 from pipeline.bronze.dart_viewer_corrections import (
+    MANIFEST_RELATIVE_PATH as VIEWER_MANIFEST_RELATIVE_PATH,
     required_viewer_receipts,
     verify_viewer_corrections,
 )
@@ -42,10 +48,12 @@ from pipeline.silver.reviewed_dividend_corrections import (
     external_evidence_paths as reviewed_external_evidence_paths,
 )
 from pipeline.silver.cash_adjustment_scale_evidence import (
+    MANIFEST_RELATIVE_PATH as CASH_SCALE_MANIFEST_RELATIVE_PATH,
     external_evidence_paths as cash_scale_external_evidence_paths,
     verify_source_evidence_manifest,
 )
 from pipeline.silver.return_contract import is_valid_krx_ticker
+from pipeline.silver.corporate_actions import _disclosure_type
 
 
 SCHEMA_VERSION = "dart_total_return_action_snapshot_v5"
@@ -65,6 +73,7 @@ class VerifiedActionSnapshot:
     coverage_start: date
     coverage_end: date
     coverage_intervals: tuple[tuple[date, date], ...]
+    listing_snapshot: dict[str, object]
     disclosure_observation_audit: dict[str, object]
     cash_adjustment_scale_source_evidence: dict[str, object]
 
@@ -75,6 +84,45 @@ def _sha256(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _listing_snapshot(root: Path) -> dict[str, object]:
+    """Bind the exact listing map used by every listed-candidate predicate."""
+    path = root / financials.CORPCODE_BRONZE_PATH
+    try:
+        raw = path.read_bytes()
+        pairs = financials._parse_listed_corps(raw)
+    except Exception as exc:
+        raise RuntimeError(
+            f"missing/invalid DART listed-corp snapshot: {path}"
+        ) from exc
+    canonical_pairs = json.dumps(
+        [
+            {"corp_code": corp_code, "stock_code": stock_code}
+            for corp_code, stock_code in pairs
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "contract": "dart_listed_corp_candidates_v1",
+        "path": path.relative_to(root).as_posix(),
+        "content_length": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "listed_corp_count": len(pairs),
+        "listed_corp_digest": hashlib.sha256(canonical_pairs).hexdigest(),
+    }
+
+
+def _assert_listing_snapshot_stable(
+    root: Path,
+    before: dict[str, object],
+) -> None:
+    if _listing_snapshot(root) != before:
+        raise RuntimeError(
+            "DART listed-corp snapshot changed during candidate verification"
+        )
 
 
 def _date_value(value: object, *, field: str) -> date:
@@ -98,12 +146,44 @@ def _is_total_return_disclosure(report_name: object) -> bool:
     ) or "배당락" in rendered or "주식배당결정" in rendered or "권배락" in rendered
 
 
-def _disclosure_observation_audit(root: Path) -> dict[str, object]:
+def _is_consumed_action_row(
+    row: dict,
+    corp_to_stock: dict[str, str],
+) -> bool:
+    return (
+        _is_listed_disclosure_candidate(row, corp_to_stock)
+        and (
+            _event_api_for_title(row.get("report_nm")) is not None
+            or _disclosure_type(row.get("report_nm")) is not None
+        )
+    )
+
+
+def _semantic_receipts_from_paths(paths: Iterable[Path]) -> set[str]:
+    receipts: set[str] = set()
+    for path in paths:
+        match = re.fullmatch(r"rcept=([0-9]{14})\.[^.]+", path.name)
+        if match is not None:
+            receipts.add(match.group(1))
+    return receipts
+
+
+def _disclosure_observation_audit(
+    root: Path,
+    *,
+    evidence_paths: Iterable[Path],
+    required_start: date,
+    required_end: date,
+) -> dict[str, object]:
     observations: list[tuple[Path, dict]] = []
-    manifest_root = root / "corporate_actions" / "dart" / "manifests"
-    for disclosure in sorted(
-        manifest_root.glob("from=*/to=*/disclosures_v3.json")
-    ):
+    selected = set(evidence_paths)
+    semantic_receipts = _semantic_receipts_from_paths(selected)
+    corp_to_stock: dict[str, str] = {}
+    disclosure_paths = sorted(
+        path for path in selected if path.name == "disclosures_v3.json"
+    )
+    decoded: list[tuple[Path, list[dict]]] = []
+    for disclosure in disclosure_paths:
         try:
             rows = json.loads(disclosure.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -112,12 +192,21 @@ def _disclosure_observation_audit(root: Path) -> dict[str, object]:
             ) from exc
         if not isinstance(rows, list):
             raise RuntimeError(f"DART disclosures must be a list: {disclosure}")
+        typed_rows = [row for row in rows if isinstance(row, dict)]
+        corp_to_stock.update(_candidate_corp_to_stock(str(root), typed_rows))
+        decoded.append((disclosure, typed_rows))
+    for disclosure, rows in decoded:
         observations.extend(
             (disclosure, row)
             for row in rows
-            if isinstance(row, dict)
-            and re.fullmatch(
-                r"[0-9]{14}", str(row.get("rcept_no") or "").strip()
+            if (
+                (receipt := str(row.get("rcept_no") or "").strip())
+                in semantic_receipts
+                or (
+                    (accepted := _receipt_date(row)) is not None
+                    and required_start <= accepted <= required_end
+                    and _is_consumed_action_row(row, corp_to_stock)
+                )
             )
         )
     _, audit = canonicalize_disclosures(
@@ -126,7 +215,57 @@ def _disclosure_observation_audit(root: Path) -> dict[str, object]:
     return audit
 
 
-def _native_complete_intervals(root: Path) -> list[tuple[date, date]]:
+def _dependency_receipt_dates(
+    root: Path,
+    receipts: Iterable[str],
+) -> dict[str, date]:
+    action_root = root / "corporate_actions" / "dart" / "disclosures"
+    result: dict[str, date] = {}
+    for receipt in sorted(set(receipts)):
+        if re.fullmatch(r"[0-9]{14}", receipt) is None:
+            continue
+        matches = sorted(action_root.glob(f"**/rcept={receipt}.json"))
+        dates: set[date] = set()
+        for path in matches:
+            try:
+                row = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"invalid DART dependency disclosure: {path}"
+                ) from exc
+            if not isinstance(row, dict) or str(row.get("rcept_no")) != receipt:
+                raise RuntimeError(
+                    f"DART dependency disclosure identity mismatch: {path}"
+                )
+            accepted = _receipt_date(row)
+            if accepted is None:
+                raise RuntimeError(
+                    f"DART dependency has no official rcept_dt: {receipt}"
+                )
+            dates.add(accepted)
+        if len(dates) != 1:
+            raise RuntimeError(
+                "DART dependency disclosure is missing/ambiguous: "
+                f"receipt={receipt} matches={len(matches)} dates={sorted(dates)}"
+            )
+        result[receipt] = next(iter(dates))
+    return result
+
+
+def _native_complete_intervals(
+    root: Path,
+    *,
+    required_start: date,
+    required_end: date,
+    dependency_receipts: Iterable[str] = (),
+) -> list[tuple[date, date]]:
+    if required_end < required_start:
+        raise ValueError("coverage_end must be on/after coverage_start")
+    dependency_receipts = set(dependency_receipts)
+    dependency_dates = set(
+        _dependency_receipt_dates(root, dependency_receipts).values()
+    )
+    corp_to_stock: dict[str, str] = {}
     manifest_root = root / "corporate_actions" / "dart" / "manifests"
     intervals: list[tuple[date, date]] = []
     required_document_receipts: set[str] = set()
@@ -149,12 +288,35 @@ def _native_complete_intervals(root: Path) -> list[tuple[date, date]]:
             continue
         if start > end:
             raise RuntimeError(f"reversed DART interval: {interval_dir}")
+        if not (
+            start <= required_end and end >= required_start
+        ) and not any(start <= value <= end for value in dependency_dates):
+            continue
         try:
             disclosures = json.loads(disclosure.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"invalid DART disclosures body: {disclosure}") from exc
         if not isinstance(disclosures, list):
             raise RuntimeError(f"DART disclosures must be a list: {disclosure}")
+        corp_to_stock.update(
+            _candidate_corp_to_stock(str(root), disclosures)
+        )
+        semantic_rows = [
+            row
+            for row in disclosures
+            if isinstance(row, dict)
+            and (
+                str(row.get("rcept_no") or "") in dependency_receipts
+                or (
+                    (accepted := _receipt_date(row)) is not None
+                    and required_start <= accepted <= required_end
+                    and _is_consumed_action_row(row, corp_to_stock)
+                )
+            )
+        ]
+        semantic_receipts = {
+            str(row.get("rcept_no") or "") for row in semantic_rows
+        }
         malformed_total_return_rows = [
             {
                 "rcept_no": row.get("rcept_no"),
@@ -163,14 +325,18 @@ def _native_complete_intervals(root: Path) -> list[tuple[date, date]]:
                 "corp_cls": row.get("corp_cls"),
                 "report_name": row.get("report_nm"),
             }
-            for row in disclosures
-            if isinstance(row, dict)
-            and _is_total_return_disclosure(row.get("report_nm"))
+            for row in semantic_rows
+            if _is_total_return_disclosure(row.get("report_nm"))
+            and (
+                resolved_ticker := _listed_disclosure_ticker(
+                    row, corp_to_stock,
+                )
+            )
             and (
                 re.fullmatch(
                     r"[0-9]{14}", str(row.get("rcept_no") or "").strip()
                 ) is None
-                or not is_valid_krx_ticker(row.get("stock_code"))
+                or not is_valid_krx_ticker(resolved_ticker)
             )
         ]
         if malformed_total_return_rows:
@@ -178,13 +344,9 @@ def _native_complete_intervals(root: Path) -> list[tuple[date, date]]:
                 "TR-relevant DART disclosure has no receipt/ticker identity: "
                 f"{malformed_total_return_rows[:20]}"
             )
-        interval_document_receipts = {
-            str(row.get("rcept_no") or "")
-            for row in disclosures
-            if isinstance(row, dict)
-            and _needs_document(row.get("report_nm"))
-            and str(row.get("rcept_no") or "")
-        }
+        interval_document_receipts = _document_candidate_receipts(
+            disclosures, corp_to_stock,
+        )
         interval_disclosure_receipts = {
             str(row.get("rcept_no") or "")
             for row in disclosures
@@ -201,15 +363,17 @@ def _native_complete_intervals(root: Path) -> list[tuple[date, date]]:
         if not all(path.is_file() for path in marker_paths):
             incomplete_disclosures.update({
                 str(row.get("rcept_no")): row
-                for row in disclosures
-                if isinstance(row, dict) and str(row.get("rcept_no") or "")
+                for row in semantic_rows
+                if str(row.get("rcept_no") or "")
             })
             continue
         # v5 completion covers the full document keyword set, including
         # structured bonus-decision originals/corrections.  Rechecking only
         # the narrower historical TR-title subset would let a required bonus
         # correction ZIP disappear after the completion marker was written.
-        required_document_receipts.update(interval_document_receipts)
+        required_document_receipts.update(
+            interval_document_receipts.intersection(semantic_receipts)
+        )
         complete_disclosure_receipts.update(interval_disclosure_receipts)
         for marker_path in marker_paths:
             marker_name = marker_path.name
@@ -234,16 +398,9 @@ def _native_complete_intervals(root: Path) -> list[tuple[date, date]]:
                     f"DART document candidate parity mismatch: {marker_path}"
                 )
             if marker_name == "structured_complete_v3.json":
-                structured_queries = {
-                    (event_api.slug, str(row.get("corp_code") or ""))
-                    for row in disclosures
-                    if isinstance(row, dict)
-                    and str(row.get("stock_code") or "").strip()
-                    and str(row.get("corp_code") or "")
-                    and (event_api := _event_api_for_title(
-                        row.get("report_nm")
-                    )) is not None
-                }
+                structured_queries = _structured_query_keys(
+                    disclosures, corp_to_stock,
+                )
                 if int(marker.get("query_count", -1)) != len(
                     structured_queries
                 ):
@@ -260,7 +417,10 @@ def _native_complete_intervals(root: Path) -> list[tuple[date, date]]:
         blocking = []
         for receipt in uncovered_receipts:
             row = incomplete_disclosures[receipt]
-            relevant = _is_total_return_disclosure(row.get("report_nm"))
+            relevant = (
+                _is_total_return_disclosure(row.get("report_nm"))
+                and bool(_listed_disclosure_ticker(row, corp_to_stock))
+            )
             # corp_cls is raw provenance, never scope evidence.  Historical
             # listed KOSDAQ issuers are demonstrably labelled E, so every
             # uncovered economically relevant receipt blocks certification.
@@ -356,22 +516,222 @@ def _assert_continuous(
     return tuple(retained)
 
 
-def _evidence_paths(root: Path) -> list[Path]:
+def _receipt_date(row: dict) -> date | None:
+    rendered = str(row.get("rcept_dt") or "").strip()
+    if re.fullmatch(r"[0-9]{8}", rendered) is None:
+        return None
+    try:
+        return date(
+            int(rendered[:4]), int(rendered[4:6]), int(rendered[6:8]),
+        )
+    except ValueError:
+        return None
+
+
+def _completed_disclosure_observations(
+    root: Path,
+) -> list[tuple[Path, tuple[date, date], list[dict]]]:
+    """Return only list bodies backed by both native completion markers."""
+    observations: list[tuple[Path, tuple[date, date], list[dict]]] = []
+    manifest_root = root / "corporate_actions" / "dart" / "manifests"
+    for disclosure in sorted(
+        manifest_root.glob("from=*/to=*/disclosures_v3.json")
+    ):
+        markers = (
+            disclosure.parent / "structured_complete_v3.json",
+            disclosure.parent / "documents_complete_v5.json",
+        )
+        if not all(path.is_file() for path in markers):
+            continue
+        try:
+            start = _date_value(
+                disclosure.parent.parent.name.removeprefix("from="),
+                field="native interval start",
+            )
+            end = _date_value(
+                disclosure.parent.name.removeprefix("to="),
+                field="native interval end",
+            )
+            rows = json.loads(disclosure.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"invalid DART disclosures body: {disclosure}"
+            ) from exc
+        if start > end or not isinstance(rows, list):
+            raise RuntimeError(f"invalid DART disclosures body: {disclosure}")
+        observations.append((
+            disclosure,
+            (start, end),
+            [row for row in rows if isinstance(row, dict)],
+        ))
+    return observations
+
+
+def _completion_evidence(paths: set[Path], disclosure: Path) -> None:
+    paths.update({
+        disclosure,
+        disclosure.parent / "structured_complete_v3.json",
+        disclosure.parent / "documents_complete_v5.json",
+    })
+
+
+def _viewer_evidence_paths(
+    root: Path,
+    *,
+    required_start: date,
+    required_end: date,
+) -> tuple[set[Path], set[str], set[str]]:
+    """Bind only the current verified viewer manifest and its exact objects."""
+    required = required_viewer_receipts(
+        str(root),
+        coverage_start=required_start,
+        coverage_end=required_end,
+    )
+    manifest = root / VIEWER_MANIFEST_RELATIVE_PATH
+    if not required and not manifest.is_file():
+        return set(), set(), set()
+    verified = verify_viewer_corrections(
+        str(root),
+        required_start=required_start,
+        required_end=required_end,
+        required_receipts=required,
+    )
+    paths = {Path(verified.manifest_path)}
+    paths.update(root / probe.main_path for probe in verified.dependency_probes)
+    probe_receipts = {
+        probe.receipt_no for probe in verified.dependency_probes
+    }
+    receipts: set[str] = set()
+    for evidence in verified.receipts:
+        paths.update({
+            root / evidence.main_path,
+            root / evidence.viewer_path,
+            root / evidence.economic_main_path,
+            root / evidence.economic_viewer_path,
+        })
+        receipts.update({
+            evidence.receipt_no,
+            evidence.revision_root_receipt_no,
+            evidence.economic_body_receipt_no,
+            *evidence.family_receipt_nos,
+            *evidence.official_family_order,
+            *(value.partition(":")[0] for value in evidence.attachment_keys),
+        })
+    return (
+        paths,
+        {value for value in receipts if re.fullmatch(r"[0-9]{14}", value)},
+        probe_receipts,
+    )
+
+
+def _native_semantic_evidence_paths(
+    root: Path,
+    *,
+    required_start: date,
+    required_end: date,
+    dependency_receipts: set[str],
+    probe_receipts: set[str],
+) -> set[Path]:
+    """Select native files that prove the bounded seed or an exact lineage.
+
+    A completed interval wholly outside the seed window is not evidence merely
+    because it happens to be present locally.  It enters the snapshot only
+    when a verified family names one of its receipts.
+    """
+    observations = _completed_disclosure_observations(root)
+    all_rows = [row for _, _, rows in observations for row in rows]
+    corp_to_stock = _candidate_corp_to_stock(str(root), all_rows)
+    paths: set[Path] = set()
+    seed_receipts: set[str] = set()
+    for disclosure, (start, end), rows in observations:
+        if start <= required_end and end >= required_start:
+            _completion_evidence(paths, disclosure)
+        for row in rows:
+            receipt = str(row.get("rcept_no") or "").strip()
+            if re.fullmatch(r"[0-9]{14}", receipt) is None:
+                continue
+            accepted = _receipt_date(row)
+            if (
+                accepted is not None
+                and required_start <= accepted <= required_end
+                and _is_consumed_action_row(row, corp_to_stock)
+            ):
+                seed_receipts.add(receipt)
+
+    semantic_receipts = seed_receipts | dependency_receipts
+    observation_receipts = semantic_receipts | probe_receipts
+    for disclosure, _, rows in observations:
+        if any(
+            str(row.get("rcept_no") or "").strip() in observation_receipts
+            for row in rows
+        ):
+            _completion_evidence(paths, disclosure)
+
+    action_root = root / "corporate_actions" / "dart"
+    # Scan each namespace once.  Running a recursive glob once per receipt is
+    # quadratic on the actual 31k-receipt snapshot and can take hours.
+    receipt_name = re.compile(r"^rcept=([0-9]{14})(?:\..+)?$")
+    for relative_root in (
+        "disclosures", "structured", "documents", "documents_unavailable",
+    ):
+        namespace = action_root / relative_root
+        if not namespace.is_dir():
+            continue
+        for path in namespace.rglob("rcept=*"):
+            match = receipt_name.fullmatch(path.name)
+            if (
+                match is not None
+                and match.group(1) in semantic_receipts
+                and path.is_file()
+            ):
+                paths.add(path)
+    return paths
+
+
+def _evidence_paths(
+    root: Path,
+    *,
+    required_start: date,
+    required_end: date,
+) -> list[Path]:
     action_root = root / "corporate_actions" / "dart"
     if not action_root.is_dir():
         raise RuntimeError(f"missing DART action root: {action_root}")
-    paths = [
-        path
-        for path in action_root.rglob("*")
-        if path.is_file() and path.resolve() != (root / MANIFEST_RELATIVE_PATH).resolve()
-    ]
-    paths.extend(reviewed_external_evidence_paths(root))
-    paths.extend(cash_scale_external_evidence_paths(str(root)))
+    viewer_paths, viewer_receipts, viewer_probe_receipts = _viewer_evidence_paths(
+        root, required_start=required_start, required_end=required_end,
+    )
+    paths = _native_semantic_evidence_paths(
+        root,
+        required_start=required_start,
+        required_end=required_end,
+        dependency_receipts=viewer_receipts,
+        probe_receipts=viewer_probe_receipts,
+    )
+    paths.update(viewer_paths)
+    paths.add(root / financials.CORPCODE_BRONZE_PATH)
+    paths.update(reviewed_external_evidence_paths(root))
+    if active_reviewed_corrections(root):
+        paths.add(root / REVIEWED_CORRECTIONS_RELATIVE_PATH)
+    paths.update(cash_scale_external_evidence_paths(
+        str(root), required_start=required_start, required_end=required_end,
+    ))
+    if (root / CASH_SCALE_MANIFEST_RELATIVE_PATH).is_file():
+        paths.add(root / CASH_SCALE_MANIFEST_RELATIVE_PATH)
     if (root / SUPPORT_FAMILY_MANIFEST_RELATIVE_PATH).is_file():
-        paths.extend(
+        support_paths = {
             root / relative
-            for relative in support_family_external_evidence_paths(root)
-        )
+            for relative in support_family_external_evidence_paths(
+                root,
+                required_start=required_start,
+                required_end=required_end,
+            )
+        }
+        paths.update(support_paths)
+        # A support source names its exact canonical list body.  Bind the two
+        # completion markers that make that list observation admissible too.
+        for path in support_paths:
+            if path.name == "disclosures_v3.json":
+                _completion_evidence(paths, path)
     missing_external = [path for path in paths if not path.is_file()]
     if missing_external:
         raise RuntimeError(
@@ -380,9 +740,7 @@ def _evidence_paths(root: Path) -> list[Path]:
         )
     if not paths:
         raise RuntimeError(f"DART action snapshot has no bodies: {action_root}")
-    return sorted(
-        set(paths), key=lambda path: path.relative_to(root).as_posix(),
-    )
+    return sorted(paths, key=lambda path: path.relative_to(root).as_posix())
 
 
 def _body_entries(root: Path, paths: Sequence[Path]) -> list[dict]:
@@ -406,11 +764,23 @@ def _body_digest(entries: Sequence[dict]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _verify_required_viewer_evidence(root: Path) -> None:
-    required = required_viewer_receipts(str(root))
+def _verify_required_viewer_evidence(
+    root: Path,
+    *,
+    required_start: date,
+    required_end: date,
+) -> None:
+    required = required_viewer_receipts(
+        str(root),
+        coverage_start=required_start,
+        coverage_end=required_end,
+    )
     if required:
         verify_viewer_corrections(
-            str(root), required_receipts=required,
+            str(root),
+            required_start=required_start,
+            required_end=required_end,
+            required_receipts=required,
         )
 
 
@@ -456,17 +826,52 @@ def build_snapshot_manifest(
 ) -> VerifiedActionSnapshot:
     """Verify native markers and atomically write the content manifest."""
     root = Path(base).expanduser().resolve()
+    listing_snapshot = _listing_snapshot(root)
     _write_reviewed_correction_manifest(root)
     intervals = _assert_continuous(
-        _native_complete_intervals(root),
+        _native_complete_intervals(
+            root,
+            required_start=coverage_start,
+            required_end=coverage_end,
+        ),
         required_start=coverage_start,
         required_end=coverage_end,
     )
-    _verify_required_viewer_evidence(root)
+    _verify_required_viewer_evidence(
+        root, required_start=coverage_start, required_end=coverage_end,
+    )
     _verify_reviewed_correction_manifest(root)
-    scale_evidence = verify_source_evidence_manifest(str(root))
-    entries = _body_entries(root, _evidence_paths(root))
-    disclosure_observation_audit = _disclosure_observation_audit(root)
+    scale_evidence = verify_source_evidence_manifest(
+        str(root), required_start=coverage_start, required_end=coverage_end,
+    )
+    evidence_paths = _evidence_paths(
+        root,
+        required_start=coverage_start,
+        required_end=coverage_end,
+    )
+    entries = _body_entries(root, evidence_paths)
+    _assert_listing_snapshot_stable(root, listing_snapshot)
+    listing_entry = next(
+        (
+            item for item in entries
+            if item["path"] == listing_snapshot["path"]
+        ),
+        None,
+    )
+    if listing_entry != {
+        "path": listing_snapshot["path"],
+        "content_length": listing_snapshot["content_length"],
+        "sha256": listing_snapshot["sha256"],
+    }:
+        raise RuntimeError(
+            "DART listed-corp snapshot/body evidence mismatch"
+        )
+    disclosure_observation_audit = _disclosure_observation_audit(
+        root,
+        evidence_paths=evidence_paths,
+        required_start=coverage_start,
+        required_end=coverage_end,
+    )
     payload = {
         "schema_version": SCHEMA_VERSION,
         "complete": True,
@@ -476,6 +881,7 @@ def build_snapshot_manifest(
             {"from": start.isoformat(), "to": end.isoformat()}
             for start, end in intervals
         ],
+        "listing_snapshot": listing_snapshot,
         "body_count": len(entries),
         "body_digest": _body_digest(entries),
         "disclosure_observation_audit": disclosure_observation_audit,
@@ -525,29 +931,33 @@ def verify_snapshot_manifest(
         raise RuntimeError(
             f"missing/invalid DART action snapshot manifest: {manifest_path}"
         ) from exc
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if raw != canonical:
+        raise RuntimeError("DART action snapshot manifest is not canonical")
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise RuntimeError("unsupported DART action snapshot schema")
     if payload.get("complete") is not True:
         raise RuntimeError("DART action snapshot is not complete")
+    listing_snapshot = _listing_snapshot(root)
     coverage_start = _date_value(
         payload.get("coverage_start"), field="coverage_start"
     )
     coverage_end = _date_value(payload.get("coverage_end"), field="coverage_end")
-    disclosure_observation_audit = _disclosure_observation_audit(root)
-    if payload.get("disclosure_observation_audit") != (
-        disclosure_observation_audit
-    ):
-        raise RuntimeError(
-            "DART disclosure observation canonicalization metadata changed"
-        )
     expected_end = required_end or coverage_end
-    if coverage_start > required_start:
+    if coverage_start != required_start:
         raise RuntimeError(
-            f"DART coverage starts at {coverage_start}, required {required_start}"
+            "DART coverage start mismatch: "
+            f"manifest={coverage_start} required={required_start}"
         )
-    if coverage_end < expected_end:
+    if required_end is not None and coverage_end != required_end:
         raise RuntimeError(
-            f"DART coverage ends at {coverage_end}, required {expected_end}"
+            "DART coverage end mismatch: "
+            f"manifest={coverage_end} required={required_end}"
         )
     declared_intervals = tuple(
         (
@@ -561,12 +971,20 @@ def verify_snapshot_manifest(
         required_start=required_start,
         required_end=expected_end,
     )
-    native = set(_native_complete_intervals(root))
+    native = set(_native_complete_intervals(
+        root,
+        required_start=coverage_start,
+        required_end=coverage_end,
+    ))
     if any(interval not in native for interval in declared_intervals):
         raise RuntimeError("snapshot manifest declares an unverified native interval")
-    _verify_required_viewer_evidence(root)
+    _verify_required_viewer_evidence(
+        root, required_start=coverage_start, required_end=coverage_end,
+    )
     _verify_reviewed_correction_manifest(root)
-    scale_evidence = verify_source_evidence_manifest(str(root))
+    scale_evidence = verify_source_evidence_manifest(
+        str(root), required_start=coverage_start, required_end=coverage_end,
+    )
     if payload.get("cash_adjustment_scale_source_evidence") != (
         scale_evidence.metadata
     ):
@@ -577,12 +995,44 @@ def verify_snapshot_manifest(
     declared_entries = payload.get("objects")
     if not isinstance(declared_entries, list):
         raise RuntimeError("DART snapshot objects must be a list")
-    actual_paths = _evidence_paths(root)
+    actual_paths = _evidence_paths(
+        root, required_start=coverage_start, required_end=coverage_end,
+    )
+    disclosure_observation_audit = _disclosure_observation_audit(
+        root,
+        evidence_paths=actual_paths,
+        required_start=coverage_start,
+        required_end=coverage_end,
+    )
+    if payload.get("disclosure_observation_audit") != (
+        disclosure_observation_audit
+    ):
+        raise RuntimeError(
+            "DART disclosure observation canonicalization metadata changed"
+        )
     actual_relative = [path.relative_to(root).as_posix() for path in actual_paths]
     declared_relative = [str(item.get("path") or "") for item in declared_entries]
     if declared_relative != actual_relative:
         raise RuntimeError("DART snapshot manifest/body path set changed")
     actual_entries = _body_entries(root, actual_paths)
+    _assert_listing_snapshot_stable(root, listing_snapshot)
+    if payload.get("listing_snapshot") != listing_snapshot:
+        raise RuntimeError("DART listed-corp snapshot metadata changed")
+    listing_entry = next(
+        (
+            item for item in actual_entries
+            if item["path"] == listing_snapshot["path"]
+        ),
+        None,
+    )
+    if listing_entry != {
+        "path": listing_snapshot["path"],
+        "content_length": listing_snapshot["content_length"],
+        "sha256": listing_snapshot["sha256"],
+    }:
+        raise RuntimeError(
+            "DART listed-corp snapshot/body evidence mismatch"
+        )
     if declared_entries != actual_entries:
         raise RuntimeError("DART snapshot body SHA/content length mismatch")
     digest = _body_digest(actual_entries)
@@ -599,6 +1049,7 @@ def verify_snapshot_manifest(
         coverage_start=coverage_start,
         coverage_end=coverage_end,
         coverage_intervals=continuous,
+        listing_snapshot=listing_snapshot,
         disclosure_observation_audit=disclosure_observation_audit,
         cash_adjustment_scale_source_evidence=scale_evidence.metadata,
     )

@@ -28,7 +28,7 @@ import subprocess
 import tempfile
 import zipfile
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 from urllib.parse import urlparse
@@ -40,6 +40,8 @@ from pipeline.bronze.dart_viewer_corrections import (
     verify_viewer_corrections,
 )
 from pipeline.bronze.dart_support_action_families import (
+    bonus_issue_common_terms_from_body,
+    stock_dividend_common_terms_from_body,
     SupportActionFamilyEntry,
     verify_support_action_families,
 )
@@ -62,8 +64,10 @@ from pipeline.silver.dart_action_snapshot import (
     _native_complete_intervals,
 )
 from pipeline.silver.krx_kind_reference import (
+    DartDetachmentNoticeNotFound,
     KIND_BODY_OBJECT_ROOT,
     KIND_COMPONENT_REPORT_NAME_61474,
+    KIND_COMPONENT_REPORT_NAME_11306,
     KIND_COMPONENT_REQUEST_SCHEMA,
     KIND_CONTENTS_OBJECT_ROOT,
     KIND_IDENTITY_OBJECT_ROOT,
@@ -71,6 +75,7 @@ from pipeline.silver.krx_kind_reference import (
     KIND_REQUEST_SCHEMA,
     KIND_REFERENCE_REPORT_NAME_70767,
     KIND_REFERENCE_REPORT_NAME_99311,
+    KIND_REFERENCE_REPORT_NAME_99302,
     KIND_SUPPORT_MANIFEST_RELATIVE_PATH,
     KIND_SUPPORT_SCHEMA,
     kind_component_url_identity,
@@ -79,15 +84,22 @@ from pipeline.silver.krx_kind_reference import (
     kind_url_identity as _kind_url_identity,
     kind_url_document_no,
     parse_kind_contents_body_url,
+    parse_dart_detachment_notice,
     parse_kind_identity_receipt,
     parse_kind_reference_notice as _kind_reference_notice,
     parse_kind_stock_dividend_component,
+    parse_kind_paid_increase_component,
     verify_kind_component_request_object,
     verify_kind_request_object,
     verify_kind_support_manifest,
 )
 from pipeline.silver.reviewed_dividend_corrections import (
     active_corrections as active_reviewed_corrections,
+)
+from pipeline.silver.total_returns import stored_price_factor_interval
+from pipeline.silver.reviewed_cash_scale_exceptions import (
+    NO_NOTICE_STOCK_DIVIDEND,
+    REVIEWED_COMBINED_NOTICE_GROUP_KINDS,
 )
 
 
@@ -402,7 +414,11 @@ def verify_fresh_dart_snapshot(
 ) -> tuple[tuple[date, date], ...]:
     """Require native disclosures_v3/structured_v3/documents_v5 coverage."""
     root = Path(base).expanduser().resolve()
-    intervals = _native_complete_intervals(root)
+    intervals = _native_complete_intervals(
+        root,
+        required_start=coverage_start,
+        required_end=coverage_end,
+    )
     return _assert_continuous(
         intervals,
         required_start=coverage_start,
@@ -828,27 +844,34 @@ def _zip_payloads(path: Path) -> list[bytes]:
         raise RuntimeError(f"invalid official DART ZIP: {path}") from exc
 
 
-def _labelled_notice(path: Path) -> tuple[float, str]:
+def _labelled_notice(path: Path):
     labelled = corporate_actions._combined_detachment_details  # API drift sentinel
     del labelled
-    values: dict[str, list[str]] = {"reference": [], "reason": []}
+    notices = []
     for payload in _zip_payloads(path):
-        decoded = corporate_actions._decode_document(payload)
-        for cells in corporate_actions._table_rows(decoded):
-            for index, cell in enumerate(cells[:-1]):
-                label = corporate_actions._compact(cell)
-                value = re.sub(r"\s+", " ", cells[index + 1]).strip()
-                if label in {"기준가격", "기준가격원"}:
-                    values["reference"].append(value)
-                elif label == "사유":
-                    values["reason"].append(value)
-    if len(values["reference"]) != 1 or len(values["reason"]) != 1:
+        try:
+            notices.append(parse_dart_detachment_notice(payload))
+        except DartDetachmentNoticeNotFound:
+            # A DART ZIP may contain unrelated/correction attachments.  Only
+            # exact complete notice tables are candidates; malformed partial
+            # payloads neither supply fields nor poison one valid body.
+            continue
+        except RuntimeError as exc:
+            # A correction attachment can contain only the labelled date
+            # marker and therefore match no supported complete table schema.
+            # Isolate only that exact incomplete-candidate condition.  A
+            # malformed complete or ambiguous table still fails closed.
+            if str(exc) != "DART detachment notice schema is unsupported":
+                raise
+            continue
+    unique = list(dict.fromkeys(notices))
+    if not unique:
+        raise DartDetachmentNoticeNotFound(
+            "official detachment notice table is absent"
+        )
+    if len(unique) != 1:
         raise RuntimeError("official detachment reference/reason is ambiguous")
-    reference = corporate_actions._number(values["reference"][0])
-    reason = values["reason"][0]
-    if reference is None or reference <= 0 or not reason.strip():
-        raise RuntimeError("official detachment reference/reason is invalid")
-    return float(reference), reason.strip()
+    return unique[0]
 
 
 def _read_price_row(path: Path, *, ticker: str, trade_date: date) -> tuple[float, float]:
@@ -1033,19 +1056,18 @@ def download_kind_evidence(
         identity_receipt = parse_kind_identity_receipt(identity_body)
         notice = _kind_reference_notice(body, expected_form_id=form_id)
         if (
-            corporate_actions._compact(notice.issuer_name)
-            != corporate_actions._compact(raw["asset_name"])
-            or notice.security_class != security_class
+            notice.security_class != security_class
             or identity_receipt.acceptance_no != action_key
             or identity_receipt.ticker != ticker
-            or corporate_actions._compact(identity_receipt.issuer_name)
-            != corporate_actions._compact(raw["asset_name"])
             or identity_receipt.selected_document_no
             != kind_url_document_no(source_url)
             or (notice.ticker is not None and notice.ticker != ticker)
             or notice.effective_date.isoformat() != raw["target_adjustment_date"]
         ):
-            raise RuntimeError("KIND reference identity/body semantics mismatch")
+            raise RuntimeError(
+                "KIND reference identity/body semantics mismatch: "
+                f"ticker={ticker} action={action_key}"
+            )
         body_relative, body_sha = _store_kind_html(
             root, KIND_BODY_OBJECT_ROOT, body,
         )
@@ -1088,6 +1110,8 @@ def download_kind_evidence(
             "support_report_name": (
                 KIND_REFERENCE_REPORT_NAME_99311
                 if form_id == "99311"
+                else KIND_REFERENCE_REPORT_NAME_99302
+                if form_id == "99302"
                 else KIND_REFERENCE_REPORT_NAME_70767
             ),
             "support_action_scope": "ISSUER",
@@ -1128,7 +1152,11 @@ def download_kind_evidence(
             label="component body",
         )
         identity_receipt = parse_kind_identity_receipt(main)
-        component = parse_kind_stock_dividend_component(body)
+        component = (
+            parse_kind_stock_dividend_component(body)
+            if raw["component_action_type"] == "stock_dividend"
+            else parse_kind_paid_increase_component(body)
+        )
         terminal = str(raw["terminal_acceptance_no"])
         if (
             kind_identity_url_acceptance(main_url) != terminal
@@ -1158,8 +1186,7 @@ def download_kind_evidence(
             != raw["entitlement_security_class"]
             or component.distributed_security_class
             != raw["distributed_security_class"]
-            or component.report_name != KIND_COMPONENT_REPORT_NAME_61474
-            or raw["report_name"] != KIND_COMPONENT_REPORT_NAME_61474
+            or component.report_name != raw["report_name"]
         ):
             raise RuntimeError("KIND component official evidence chain mismatch")
         main_relative, main_sha = _store_kind_html(
@@ -1174,7 +1201,7 @@ def download_kind_evidence(
         supports.append({
             "ticker": ticker,
             "issuer_name": identity_receipt.issuer_name,
-            "source_form_id": "61474",
+            "source_form_id": raw["source_form_code"],
             "source_url": body_url,
             "target_cash_receipt_no": raw["target_cash_receipt_no"],
             "target_adjustment_date": raw["adjustment_date"],
@@ -1189,7 +1216,7 @@ def download_kind_evidence(
             "terminal_acceptance_no": terminal,
             "support_action_source": "KRX_KIND",
             "support_action_key": key,
-            "support_action_type": "stock_dividend",
+            "support_action_type": raw["component_action_type"],
             "support_semantic_role": "ADJUSTMENT_COMPONENT",
             "support_action_body_path": body_relative,
             "support_action_body_content_length": len(body),
@@ -1304,14 +1331,39 @@ def _verified_family_terminal_event(
     family: SupportActionFamilyEntry,
 ) -> dict[str, object]:
     """Bind one verified official family to its exact prepared event/body."""
-    expected_source = (
-        "DART_DISCLOSURE"
-        if family.action_type == "stock_dividend"
-        else "DART_STRUCTURED"
-    )
     receipt = family.terminal_economic_receipt_no
+    source_rows = [
+        source for source in family.sources if source.receipt_no == receipt
+    ]
+    if len(source_rows) != 1:
+        raise RuntimeError("verified support family terminal source is ambiguous")
+    source = source_rows[0]
+    if family.action_type == "stock_dividend":
+        disclosure_candidates = [
+            event for event in events
+            if str(event.get("identifier") or "").zfill(6) == family.ticker
+            and event.get("event_type") == family.action_type
+            and event.get("source") == "DART_DISCLOSURE"
+            and str(event.get("rcept_no") or "") == receipt
+        ]
+        if (
+            len(disclosure_candidates) == 1
+            and disclosure_candidates[0].get("record_date") is not None
+            and disclosure_candidates[0].get("ratio_numerator") is not None
+        ):
+            expected_source = "DART_DISCLOSURE"
+            candidates = disclosure_candidates
+        else:
+            expected_source = "DART_VIEWER"
+            candidates = [_viewer_stock_dividend_family_event(root, family)]
+    elif source.structured_path is not None:
+        expected_source = "DART_STRUCTURED"
+        candidates = list(events)
+    else:
+        expected_source = "DART_VIEWER"
+        candidates = [_viewer_bonus_family_event(root, family)]
     matches = [
-        event for event in events
+        event for event in candidates
         if str(event.get("identifier") or "").zfill(6) == family.ticker
         and event.get("event_type") == family.action_type
         and event.get("source") == expected_source
@@ -1324,12 +1376,6 @@ def _verified_family_terminal_event(
             f"receipt={receipt} matches={len(matches)}"
         )
     event = matches[0]
-    source_rows = [
-        source for source in family.sources if source.receipt_no == receipt
-    ]
-    if len(source_rows) != 1:
-        raise RuntimeError("verified support family terminal source is ambiguous")
-    source = source_rows[0]
     if (
         event.get("action_scope") != "ISSUER"
         or str(event.get("report_name") or "") != source.report_name
@@ -1360,17 +1406,26 @@ def _verified_family_terminal_event(
         )
     body_path, body_sha = _matching_body(root, event)
     if family.action_type == "bonus_issue":
-        if (
-            source.structured_path is None
-            or source.structured_sha256 is None
-            or body_path != source.structured_path
-            or body_sha != source.structured_sha256
+        if source.structured_path is not None:
+            if (
+                source.structured_sha256 is None
+                or body_path != source.structured_path
+                or body_sha != source.structured_sha256
+            ):
+                raise RuntimeError(
+                    "prepared bonus event/family structured-body parity failed: "
+                    f"receipt={receipt}"
+                )
+        elif (
+            event.get("source") != "DART_VIEWER"
+            or body_path != source.body_path
+            or body_sha != source.body_sha256
         ):
             raise RuntimeError(
-                "prepared bonus event/family structured-body parity failed: "
+                "prepared bonus event/family viewer-body parity failed: "
                 f"receipt={receipt}"
             )
-    else:
+    elif event.get("source") == "DART_DISCLOSURE":
         expected_path = (
             f"corporate_actions/dart/documents/year={receipt[:4]}/"
             f"corp={family.ticker}/rcept={receipt}.zip"
@@ -1380,10 +1435,161 @@ def _verified_family_terminal_event(
                 "prepared stock-dividend event lacks its exact official ZIP: "
                 f"receipt={receipt} path={body_path}"
             )
+    elif (
+        event.get("source") != "DART_VIEWER"
+        or body_path != source.body_path
+        or body_sha != source.body_sha256
+    ):
+        raise RuntimeError(
+            "prepared stock-dividend event/family viewer-body parity failed: "
+            f"receipt={receipt}"
+        )
     return event
 
 
+def _viewer_bonus_family_event(
+    root: Path,
+    family: SupportActionFamilyEntry,
+) -> dict[str, object]:
+    """Materialize an exact viewer-backed bonus event when OpenDART omitted it.
+
+    This is not a synthetic structured API row.  The distinct ``DART_VIEWER``
+    source preserves the official transport identity, while the verified
+    support-family manifest binds the issuer, selector order, terminal body,
+    ratio and record-date semantics to content-addressed bytes.
+    """
+    if family.action_type != "bonus_issue":
+        raise RuntimeError("viewer fallback is only valid for bonus issues")
+    receipt = family.terminal_economic_receipt_no
+    sources = [
+        source for source in family.sources if source.receipt_no == receipt
+    ]
+    if len(sources) != 1:
+        raise RuntimeError("viewer bonus family terminal source is ambiguous")
+    source = sources[0]
+    if source.structured_path is not None:
+        raise RuntimeError("structured bonus family cannot use viewer fallback")
+    relative = Path(source.body_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError("viewer bonus family body path is unsafe")
+    body_path = (root / relative).resolve()
+    try:
+        body_path.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError("viewer bonus family body escaped snapshot") from exc
+    if (
+        not body_path.is_file()
+        or body_path.stat().st_size != source.body_content_length
+        or _sha256(body_path) != source.body_sha256
+    ):
+        raise RuntimeError("viewer bonus family body changed")
+    terms = bonus_issue_common_terms_from_body(body_path.read_bytes())
+    if terms is None:
+        raise RuntimeError("viewer bonus family lacks exact common-share terms")
+    ratio = float(terms.common_ratio)
+    if ratio <= 0:
+        raise RuntimeError("viewer bonus family ratio is not positive")
+    if family.terminal_ratio is None or not math.isclose(
+        ratio, float(family.terminal_ratio), rel_tol=0, abs_tol=5e-13,
+    ):
+        raise RuntimeError("viewer bonus family terminal ratio parity failed")
+    return {
+        "identifier": family.ticker,
+        "event_type": "bonus_issue",
+        "announcement_date": _date(
+            source.receipt_date, field="viewer bonus receipt date",
+        ),
+        "effective_date": _date(
+            terms.record_date, field="viewer bonus record date",
+        ),
+        "match_window_days": 7,
+        "expected_factor": 1.0 / (1.0 + ratio),
+        "record_date": None,
+        "ratio_numerator": ratio,
+        "ratio_denominator": 1.0,
+        "rcept_no": receipt,
+        "report_name": source.report_name,
+        "action_scope": "ISSUER",
+        "source_evidence_status": "VERIFIED_DART_VIEWER_BODY",
+        "source_body_sha256": source.body_sha256,
+        "source": "DART_VIEWER",
+        "source_file": str(body_path),
+    }
+
+
+def _viewer_stock_dividend_family_event(
+    root: Path,
+    family: SupportActionFamilyEntry,
+) -> dict[str, object]:
+    """Materialize exact viewer-backed common stock-dividend economics."""
+    if family.action_type != "stock_dividend":
+        raise RuntimeError("viewer stock fallback requires a stock-dividend family")
+    if (
+        family.terminal_status != "ACTIVE"
+        or not family.terminal_admissible
+        or family.terminal_ratio is None
+    ):
+        raise RuntimeError("viewer stock-dividend family is not active/admissible")
+    receipt = family.terminal_economic_receipt_no
+    sources = [
+        source for source in family.sources if source.receipt_no == receipt
+    ]
+    if len(sources) != 1:
+        raise RuntimeError("viewer stock-dividend terminal source is ambiguous")
+    source = sources[0]
+    if source.structured_path is not None:
+        raise RuntimeError("viewer stock-dividend source cannot be structured")
+    if corporate_actions._compact(source.report_name) not in {
+        "주식배당결정", "기재정정주식배당결정",
+    }:
+        raise RuntimeError("viewer stock-dividend report-name contract changed")
+    relative = Path(source.body_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError("viewer stock-dividend family body path is unsafe")
+    body_path = (root / relative).resolve()
+    try:
+        body_path.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError("viewer stock-dividend family body escaped snapshot") from exc
+    if (
+        not body_path.is_file()
+        or body_path.stat().st_size != source.body_content_length
+        or _sha256(body_path) != source.body_sha256
+    ):
+        raise RuntimeError("viewer stock-dividend family body changed")
+    terms = stock_dividend_common_terms_from_body(body_path.read_bytes())
+    if terms is None or float(terms.common_ratio) <= 0:
+        raise RuntimeError("viewer stock-dividend family lacks positive common terms")
+    ratio = float(terms.common_ratio)
+    if not math.isclose(
+        ratio, float(family.terminal_ratio), rel_tol=0, abs_tol=5e-13,
+    ):
+        raise RuntimeError("viewer stock-dividend family terminal ratio parity failed")
+    record_date = _date(terms.record_date, field="viewer stock-dividend record date")
+    return {
+        "identifier": family.ticker,
+        "event_type": "stock_dividend",
+        "announcement_date": _date(
+            source.receipt_date, field="viewer stock-dividend receipt date",
+        ),
+        "effective_date": None,
+        "match_window_days": 0,
+        "expected_factor": None,
+        "record_date": record_date,
+        "ratio_numerator": ratio,
+        "ratio_denominator": 1.0,
+        "rcept_no": receipt,
+        "report_name": source.report_name,
+        "action_scope": "ISSUER",
+        "source_evidence_status": "VERIFIED_DART_VIEWER_BODY",
+        "source_body_sha256": source.body_sha256,
+        "source": "DART_VIEWER",
+        "source_file": str(body_path),
+    }
+
+
 def _prepared_family_terminal_candidates(
+    root: Path,
     events: Sequence[dict[str, object]],
     family: SupportActionFamilyEntry,
 ) -> list[dict[str, object]]:
@@ -1395,6 +1601,34 @@ def _prepared_family_terminal_candidates(
     the parent event.  Otherwise one withdrawn or incomplete historical family
     for the same issuer could block an unrelated current adjustment.
     """
+    source_rows = [
+        source for source in family.sources
+        if source.receipt_no == family.terminal_economic_receipt_no
+    ]
+    if len(source_rows) != 1:
+        raise RuntimeError("support family terminal source is ambiguous")
+    if source_rows[0].structured_path is None:
+        if family.action_type == "bonus_issue":
+            return [_viewer_bonus_family_event(root, family)]
+        if family.action_type == "stock_dividend":
+            disclosure = [
+                event for event in events
+                if str(event.get("identifier") or "").zfill(6)
+                == family.ticker
+                and event.get("event_type") == "stock_dividend"
+                and event.get("source") == "DART_DISCLOSURE"
+                and str(event.get("rcept_no") or "")
+                == family.terminal_economic_receipt_no
+                and not _is_related_company_report(event.get("report_name"))
+            ]
+            if not family.terminal_admissible or any(
+                event.get("record_date") is not None
+                and event.get("ratio_numerator") is not None
+                and event.get("ratio_denominator") is not None
+                for event in disclosure
+            ):
+                return disclosure
+            return [_viewer_stock_dividend_family_event(root, family)]
     expected_source = (
         "DART_DISCLOSURE"
         if family.action_type == "stock_dividend"
@@ -1451,31 +1685,85 @@ def _component_supports(
             "prepared stock-dividend rows are absent from verified official "
             f"families: {uncovered_stock}"
         )
+    matching_kind = [
+        item for item in kind_supports
+        if item["ticker"] == ticker
+        and item["support_semantic_role"] == "ADJUSTMENT_COMPONENT"
+        and item["support_action_type"] == "stock_dividend"
+        and item["target_cash_receipt_no"] == cash_receipt_no
+        and _date(
+            item.get("target_adjustment_date"),
+            field="KIND target adjustment date",
+        ) == adjustment_date
+        and _date(item.get("support_record_date"), field="KIND record date")
+        == record_date
+    ]
+    if len(matching_kind) > 1:
+        raise RuntimeError("KIND stock support is ambiguous")
+    matching_paid = [
+        item for item in kind_supports
+        if item["ticker"] == ticker
+        and item["support_semantic_role"] == "ADJUSTMENT_COMPONENT"
+        and item["support_action_type"] == "paid_increase"
+        and item["target_cash_receipt_no"] == cash_receipt_no
+        and _date(
+            item.get("target_adjustment_date"),
+            field="KIND paid-rights target date",
+        ) == adjustment_date
+    ]
+    if len(matching_paid) > 1:
+        raise RuntimeError("KIND paid-rights support is ambiguous")
     matching_stock_families: list[
         tuple[SupportActionFamilyEntry, dict[str, object]]
     ] = []
     for family in stock_entries:
         preliminary = [
-            event for event in _prepared_family_terminal_candidates(events, family)
-            if event.get("record_date") == record_date
+            event for event in _prepared_family_terminal_candidates(
+                root, events, family,
+            )
+            if (
+                event.get("record_date") == record_date
+                if event.get("source") != "DART_VIEWER"
+                else event.get("record_date") is not None
+                and adjustment_date < event["record_date"]
+                <= adjustment_date + timedelta(days=7)
+            )
         ]
         if not preliminary:
             continue
         if len(preliminary) != 1:
             raise RuntimeError("ambiguous prepared stock-dividend family terminal")
         if not family.terminal_admissible:
+            # A cross-class DART decision is deliberately not an ordinary
+            # same-class component.  It may coexist with one independently
+            # reviewed KIND component that binds COMMON_AND_PREFERRED holders
+            # to NEW_PREFERRED shares (the CJ case).  Withdrawal, cancellation,
+            # denial and zero remain hard failures even when a notice exists.
+            if (
+                family.terminal_status == "CROSS_CLASS_DISTRIBUTION"
+                and len(matching_kind) == 1
+            ):
+                continue
             raise RuntimeError(
                 "terminal stock-dividend family is inadmissible: "
                 f"root={family.root_receipt_no} status={family.terminal_status}"
             )
-        terminal = _verified_family_terminal_event(root, events, family)
-        if terminal is not preliminary[0]:
+        terminal = (
+            preliminary[0]
+            if preliminary[0].get("source") == "DART_VIEWER"
+            else _verified_family_terminal_event(root, events, family)
+        )
+        if str(terminal.get("rcept_no") or "") != str(
+            preliminary[0].get("rcept_no") or ""
+        ):
             raise RuntimeError("stock-dividend family terminal identity changed")
         matching_stock_families.append((family, terminal))
     if len(matching_stock_families) > 1:
         raise RuntimeError("ambiguous verified stock-dividend families")
     components: list[dict[str, object]] = []
-    groups_by_kind: dict[str, list[str]] = {"stock": [], "bonus": []}
+    groups_by_kind: dict[str, list[str]] = {
+        "stock": [], "bonus": [], "paid": [],
+    }
     diagnostic: dict[str, object] = {
         "terminal_stock_receipts": [],
         "component_receipts": [],
@@ -1489,9 +1777,12 @@ def _component_supports(
     if matching_stock_families:
         family, terminal = matching_stock_families[0]
         ratio = float(family.terminal_ratio)
+        stock_record_date = _date(
+            terminal["record_date"], field="stock-dividend record date",
+        )
         group = _semantic_group(
             ticker=ticker,
-            record_date=record_date,
+            record_date=stock_record_date,
             kind="STOCK_DIVIDEND",
             ratio=ratio,
         )
@@ -1525,20 +1816,8 @@ def _component_supports(
             "semantics": "PER_ELIGIBLE_SHARE_ENTITLEMENT",
         })
 
-    matching_kind = [
-        item for item in kind_supports
-        if item["ticker"] == ticker
-        and item["support_semantic_role"] == "ADJUSTMENT_COMPONENT"
-        and item["support_action_type"] == "stock_dividend"
-        and item["target_cash_receipt_no"] == cash_receipt_no
-        and _date(
-            item.get("target_adjustment_date"), field="KIND target adjustment date",
-        ) == adjustment_date
-        and _date(item.get("support_record_date"), field="KIND record date")
-        == record_date
-    ]
     if matching_kind:
-        if matching_stock_families or len(matching_kind) != 1:
+        if matching_stock_families:
             raise RuntimeError("KIND/DART stock support is ambiguous")
         item = matching_kind[0]
         if item["support_report_name"] != KIND_COMPONENT_REPORT_NAME_61474:
@@ -1587,6 +1866,63 @@ def _component_supports(
             "semantics": "CROSS_CLASS_ENTITLEMENT_NOT_PRICE_DILUTION",
         })
 
+    if matching_paid:
+        if matching_stock_families or matching_kind:
+            raise RuntimeError("paid-rights/stock support is ambiguous")
+        item = matching_paid[0]
+        if (
+            ticker != "183190"
+            or cash_receipt_no != "20180226800579"
+            or adjustment_date != date(2017, 12, 27)
+            or item["support_report_name"] != KIND_COMPONENT_REPORT_NAME_11306
+        ):
+            raise RuntimeError("paid-rights component is outside the closed set")
+        ratio = float(item["support_ratio_numerator"])
+        denominator = float(item["support_ratio_denominator"])
+        paid_record_date = _date(
+            item["support_record_date"], field="paid-rights record date",
+        )
+        group = _semantic_group(
+            ticker=ticker,
+            record_date=paid_record_date,
+            kind="PAID_INCREASE",
+            ratio=ratio / denominator,
+        )
+        event = {
+            "source": "KRX_KIND",
+            "rcept_no": item["support_action_key"],
+            "event_type": "paid_increase",
+            "announcement_date": _date(
+                item["support_announcement_date"], field="paid-rights announcement",
+            ),
+            "effective_date": None,
+            "record_date": paid_record_date,
+            "ratio_numerator": ratio,
+            "ratio_denominator": denominator,
+            "expected_factor": None,
+            "report_name": item["support_report_name"],
+            "action_scope": "ISSUER",
+        }
+        components.append(_support_row(
+            event,
+            evidence_key=evidence_key,
+            target_cash_receipt_no=cash_receipt_no,
+            target_adjustment_date=adjustment_date,
+            body_path=str(item["support_action_body_path"]),
+            body_sha=str(item["support_action_body_sha256"]),
+            groups=[group],
+            role="ADJUSTMENT_COMPONENT",
+            entitlement="COMMON",
+            distributed="COMMON",
+        ))
+        groups_by_kind["paid"].append(group)
+        diagnostic["component_entitlement_ratios"].append({
+            "receipt": str(item["support_action_key"]),
+            "action_type": "paid_increase",
+            "ratio": ratio / denominator,
+            "semantics": "PAID_RIGHTS_ENTITLEMENT_NOT_PRICE_FACTOR",
+        })
+
     bonus_events = [
         row for row in issuer
         if row.get("source") == "DART_STRUCTURED"
@@ -1617,7 +1953,7 @@ def _component_supports(
     ] = []
     for family in bonus_entries:
         preliminary = []
-        for event in _prepared_family_terminal_candidates(events, family):
+        for event in _prepared_family_terminal_candidates(root, events, family):
             effective = event.get("effective_date")
             if effective is not None and abs(
                 (effective - adjustment_date).days
@@ -1633,7 +1969,13 @@ def _component_supports(
                 f"root={family.root_receipt_no} status={family.terminal_status}"
             )
         terminal = _verified_family_terminal_event(root, events, family)
-        if terminal is not preliminary[0]:
+        if (
+            terminal.get("source") != "DART_VIEWER"
+            and terminal is not preliminary[0]
+        ) or (
+            terminal.get("source") == "DART_VIEWER"
+            and terminal != preliminary[0]
+        ):
             raise RuntimeError("bonus-issue family terminal identity changed")
         matching_bonus_families.append((family, terminal))
     if len(matching_bonus_families) > 1:
@@ -1708,20 +2050,41 @@ def _corroborations(
     ]
     selected: list[dict[str, object]] = []
     corroborated: set[str] = set()
+    compact_asset = corporate_actions._compact(asset_name)
+    expected_security_class = (
+        "PREFERRED"
+        if re.search(r"(?:[0-9]+우|우B|우선주|우)$", compact_asset)
+        else "COMMON"
+    )
     for event in sorted(candidates, key=lambda item: str(item["rcept_no"])):
         body_path, body_sha = _matching_body(root, event)
-        reference, reason = _labelled_notice(root / body_path)
+        try:
+            notice = _labelled_notice(root / body_path)
+        except DartDetachmentNoticeNotFound:
+            # Correction and attachment disclosures can share the target date
+            # without containing the exchange notice table.  They are not
+            # candidates unless one complete exact table parses.
+            continue
+        if (
+            notice.ticker != ticker
+            or notice.security_class != expected_security_class
+            or notice.effective_date != adjustment_date
+            or notice.action_type != event["event_type"]
+        ):
+            raise RuntimeError("official detachment notice identity mismatch")
+        reference = notice.reference_price
+        reason = notice.reason
         if not math.isclose(reference, raw_reference, rel_tol=0, abs_tol=1e-8):
             raise RuntimeError("official notice/KRX reference price mismatch")
-        compact = corporate_actions._compact(
-            f"{event.get('report_name') or ''} {reason}"
-        )
+        compact = corporate_actions._compact(reason)
         groups: list[str] = []
         event_type = event["event_type"]
         if event_type == "ex_dividend" and "주식배당" in compact:
             groups.extend(groups_by_kind["stock"])
         elif event_type == "rights_detachment" and "무상증자" in compact:
             groups.extend(groups_by_kind["bonus"])
+        elif event_type == "rights_detachment" and "유상증자" in compact:
+            groups.extend(groups_by_kind["paid"])
         elif event_type == "combined_detachment":
             if "배당" in compact:
                 groups.extend(groups_by_kind["stock"])
@@ -1732,6 +2095,15 @@ def _corroborations(
             # promoted into this non-cash scale evidence graph.
             continue
         unique_groups = sorted(set(groups))
+        if event_type == "combined_detachment":
+            group_kinds = frozenset(group.split("|")[2] for group in unique_groups)
+            if REVIEWED_COMBINED_NOTICE_GROUP_KINDS.get(
+                str(event["rcept_no"])
+            ) != group_kinds:
+                raise RuntimeError(
+                    "combined detachment notice is outside the reviewed "
+                    "receipt/group contract"
+                )
         selected.append(_support_row(
             event,
             evidence_key=evidence_key,
@@ -1746,6 +2118,13 @@ def _corroborations(
         ))
         corroborated.update(unique_groups)
 
+    dart_group_counts: dict[str, int] = {}
+    for row in selected:
+        for group in json.loads(row["support_semantic_group_keys"]):
+            dart_group_counts[group] = dart_group_counts.get(group, 0) + 1
+    if any(count != 1 for count in dart_group_counts.values()):
+        raise RuntimeError("official detachment notice is ambiguous for a component")
+
     kind_candidates = [
         item for item in kind_supports
         if item["ticker"] == ticker
@@ -1757,18 +2136,13 @@ def _corroborations(
         and _date(item.get("support_ex_date"), field="KIND ex date")
         == adjustment_date
     ]
-    compact_asset = corporate_actions._compact(asset_name)
     if kind_candidates and not compact_asset:
         raise RuntimeError("KIND corroboration requires exact parent asset name")
-    expected_security_class = (
-        "PREFERRED"
-        if re.search(r"(?:[0-9]+우|우B|우선주|우)$", compact_asset)
-        else "COMMON"
-    )
     exact_kind: list[dict[str, object]] = []
     for item in kind_candidates:
         if item["support_report_name"] not in {
             KIND_REFERENCE_REPORT_NAME_99311,
+            KIND_REFERENCE_REPORT_NAME_99302,
             KIND_REFERENCE_REPORT_NAME_70767,
         }:
             raise RuntimeError("KIND reference report-name contract changed")
@@ -1791,6 +2165,8 @@ def _corroborations(
             groups.extend(groups_by_kind["stock"])
         elif event_type == "rights_detachment" and "무상증자" in compact:
             groups.extend(groups_by_kind["bonus"])
+        elif event_type == "rights_detachment" and "유상증자" in compact:
+            groups.extend(groups_by_kind["paid"])
         elif event_type == "combined_detachment":
             if "주식배당" in compact:
                 groups.extend(groups_by_kind["stock"])
@@ -2007,12 +2383,13 @@ def _build_one(
     ):
         raise RuntimeError("overlap/KRX raw price parity failed")
     observed_factor = reference / previous_close
-    if not math.isclose(
-        observed_factor,
-        float(row.source_adjustment_factor),
-        rel_tol=0,
-        abs_tol=5e-13,
-    ):
+    factor_low, factor_high = stored_price_factor_interval(
+        previous_close=float(row.previous_close),
+        previous_adj_close=float(row.previous_adj_close),
+        applied_close=float(row.applied_close),
+        applied_adj_close=float(row.applied_adj_close),
+    )
+    if not factor_low <= observed_factor <= factor_high:
         raise RuntimeError("overlap/KRX reference factor parity failed")
     components, groups_by_kind, diagnostic = _component_supports(
         root,
@@ -2041,12 +2418,48 @@ def _build_one(
     # date.  It therefore requires an exact official detachment notice.
     dart_stock_groups = {
         group for component in components
-        if component["support_action_source"] == "DART_DISCLOSURE"
+        if component["support_action_source"] in {
+            "DART_DISCLOSURE", "DART_VIEWER",
+        }
         and component["support_action_type"] == "stock_dividend"
         for group in json.loads(component["support_semantic_group_keys"])
     }
     if not dart_stock_groups.issubset(corroborated):
-        raise RuntimeError("stock-dividend family lacks exact ex/reference notice")
+        viewer_stock = [
+            component for component in components
+            if component["support_action_source"] == "DART_VIEWER"
+            and component["support_action_type"] == "stock_dividend"
+        ]
+        reviewed_exception = False
+        if len(viewer_stock) == 1 and not (
+            dart_stock_groups & corroborated
+        ):
+            component = viewer_stock[0]
+            reviewed_identity = (
+                ticker,
+                receipt,
+                adjustment_date.isoformat(),
+                str(component["support_action_key"]),
+                _date(
+                    component["support_record_date"],
+                    field="reviewed stock record date",
+                ).isoformat(),
+                format(
+                    float(component["support_ratio_numerator"])
+                    / float(component["support_ratio_denominator"]),
+                    ".12g",
+                ),
+                previous_object.content_sha256,
+                applied_object.content_sha256,
+                format(reference, ".12g"),
+            )
+            reviewed_exception = reviewed_identity in NO_NOTICE_STOCK_DIVIDEND
+        if not reviewed_exception:
+            raise RuntimeError(
+                "stock-dividend family lacks exact ex/reference notice: "
+                f"reviewed_identity={locals().get('reviewed_identity')}"
+            )
+        diagnostic["corroboration_mode"] = "NO_NOTICE_MARKET_REFERENCE"
     supports = components + corroborations
     support_frame = pd.DataFrame(supports)
     all_groups = {
@@ -2224,6 +2637,8 @@ def _publish_source_manifest(
     root: Path,
     payload: dict[str, object],
     *,
+    coverage_start: date,
+    coverage_end: date,
     expected_parent_count: int = EXPECTED_PARENT_COUNT,
 ):
     """Atomically publish, verify twice, and restore the prior manifest on failure."""
@@ -2231,12 +2646,20 @@ def _publish_source_manifest(
     previous = destination.read_bytes() if destination.is_file() else None
     try:
         _atomic_write(destination, _canonical_bytes(payload))
-        verified = verify_source_evidence_manifest(str(root))
+        verified = verify_source_evidence_manifest(
+            str(root),
+            required_start=coverage_start,
+            required_end=coverage_end,
+        )
         if verified.row_count != expected_parent_count:
             raise RuntimeError("source-evidence verifier parent count changed")
         # A second filesystem read catches accidental dependence on mutable
         # in-memory rows or on a verifier result cached across the write.
-        verified_again = verify_source_evidence_manifest(str(root))
+        verified_again = verify_source_evidence_manifest(
+            str(root),
+            required_start=coverage_start,
+            required_end=coverage_end,
+        )
         if verified.metadata != verified_again.metadata:
             raise RuntimeError("source-evidence verifier roundtrip changed")
     except Exception:
@@ -2266,15 +2689,23 @@ def build_source_evidence(
         root, inputs, expected_s3_root=expected_s3_root,
     )
     prices = {item.trade_date: item for item in price_objects}
-    verified_families = verify_support_action_families(root)
+    verified_families = verify_support_action_families(
+        root, required_start=coverage_start, required_end=coverage_end,
+    )
     families_by_ticker: dict[str, list[SupportActionFamilyEntry]] = {}
     for family in verified_families.entries:
         families_by_ticker.setdefault(family.ticker, []).append(family)
-    prepared, prepare_stats = corporate_actions.prepare(str(root))
+    prepared, prepare_stats = corporate_actions.prepare(
+        str(root),
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+    )
     events = prepared.to_dict("records")
     # Calling prepare only after v3/v5 marker verification is intentional: no
     # old classification artifact or legacy disclosure manifest can be used.
-    viewer = verify_viewer_corrections(str(root))
+    viewer = verify_viewer_corrections(
+        str(root), required_start=coverage_start, required_end=coverage_end,
+    )
     viewer_by_receipt = {item.receipt_no: item for item in viewer.receipts}
     kind = _kind_supports(root)
     parents: list[dict[str, object]] = []
@@ -2349,7 +2780,12 @@ def build_source_evidence(
         raise RuntimeError("duplicate evidence parent key")
     payload = _manifest_payload(parents)
     destination = root / MANIFEST_RELATIVE_PATH
-    verified = _publish_source_manifest(root, payload)
+    verified = _publish_source_manifest(
+        root,
+        payload,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+    )
     summary = {
         "schema_version": BUILD_SUMMARY_SCHEMA,
         "complete": True,

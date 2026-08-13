@@ -1,9 +1,16 @@
-"""DART 배당·기업행사 Bronze를 기존 KRX Silver 자산에 source-scoped 적재한다."""
+"""DART 배당·기업행사 Bronze의 source-scoped Silver 적재를 준비한다.
+
+Standalone CLI apply는 총수익 rebuild와 audit까지 원자적으로 닫을 수 없어
+비활성화되어 있다. 실제 쓰기는 ``pipeline.daily_full`` 또는
+``pipeline.dart_silver_backfill_ecs`` closed orchestrator에서만 수행한다.
+"""
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import math
+import re
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
@@ -41,6 +48,10 @@ from pipeline.silver.return_contract import (
     acquire_return_writer_transaction_lock,
     is_valid_krx_ticker,
     normalize_krx_ticker,
+)
+from pipeline.silver.reviewed_cash_scale_exceptions import (
+    PAID_RIGHTS_COMPONENT_BODY_SHA256,
+    PAID_RIGHTS_IDENTITY,
 )
 from pipeline.silver_quality import repository
 from pipeline.silver_quality.models import CandidateBundle
@@ -127,9 +138,16 @@ def _exclude_unmapped(frame, allowed: set[str]) -> tuple[object, dict]:
 def _manifest_support_action_candidates(
     scale_evidence,
 ) -> pd.DataFrame:
-    """Create only exact manifest-bound KIND actions absent from DART input."""
+    """Create exact manifest-bound actions absent from native DART input.
+
+    KIND rows are official exchange artifacts.  ``DART_VIEWER`` rows are
+    official, content-addressed DART viewer bodies used only when a verified
+    issuer family's exact structured/disclosure economics are unavailable.
+    """
     support = scale_evidence.support_frame
-    support = support[support["support_action_source"].eq("KRX_KIND")]
+    support = support[support["support_action_source"].isin({
+        "KRX_KIND", "DART_VIEWER",
+    })]
     if support.empty:
         return pd.DataFrame(columns=corporate_actions.COLUMNS)
     parent_by_key = scale_evidence.frame.set_index("evidence_key")
@@ -157,21 +175,122 @@ def _manifest_support_action_candidates(
     for row in support.to_dict("records"):
         evidence_key = str(row["evidence_key"])
         if evidence_key not in parent_by_key.index:
-            raise RuntimeError("KIND support action has no evidence parent")
+            raise RuntimeError("synthetic support action has no evidence parent")
         parent = parent_by_key.loc[evidence_key]
         if isinstance(parent, pd.DataFrame):
-            raise RuntimeError("KIND support evidence parent is ambiguous")
+            raise RuntimeError("synthetic support evidence parent is ambiguous")
         if (
             str(row.get("target_cash_receipt_no") or "")
             != str(parent["cash_receipt_no"])
             or pd.Timestamp(row.get("target_adjustment_date")).date()
             != pd.Timestamp(parent["adjustment_trade_date"]).date()
         ):
-            raise RuntimeError("KIND support target/parent parity failed")
+            raise RuntimeError("synthetic support target/parent parity failed")
+        source = str(row["support_action_source"])
+        action_type = str(row["support_action_type"])
+        if source == "DART_VIEWER":
+            numerator = float(row.get("support_ratio_numerator") or 0)
+            denominator = float(row.get("support_ratio_denominator") or 0)
+            body_sha = str(row.get("support_action_body_sha256") or "")
+            body_path = str(row.get("support_action_body_path") or "")
+            report_name = re.sub(
+                r"\s+", "", str(row.get("support_report_name") or ""),
+            )
+            if (
+                row.get("support_semantic_role") != "ADJUSTMENT_COMPONENT"
+                or row.get("support_entitlement_security_class") != "COMMON"
+                or row.get("support_distributed_security_class") != "COMMON"
+                or row.get("support_action_scope") != "ISSUER"
+                or re.fullmatch(r"[0-9]{14}", str(
+                    row.get("support_action_key") or ""
+                )) is None
+                or not body_path.endswith(f"sha256={body_sha}.html")
+                or not body_path.startswith(
+                    "corporate_actions/dart/support_action_families/"
+                    "objects/sha256="
+                )
+                or numerator <= 0
+                or denominator <= 0
+            ):
+                raise RuntimeError(
+                    "DART_VIEWER synthetic action semantics changed"
+                )
+            expected = row.get("support_expected_price_factor")
+            if action_type == "bonus_issue":
+                if (
+                    re.fullmatch(
+                        r"(?:\[기재정정\])?"
+                        r"주요사항보고서\(무상증자결정\)",
+                        report_name,
+                    ) is None
+                    or row.get("support_ex_date") is None
+                    or (
+                        row.get("support_record_date") is not None
+                        and not pd.isna(row.get("support_record_date"))
+                    )
+                    or expected is None
+                    or pd.isna(expected)
+                    or not math.isclose(
+                        float(expected),
+                        1.0 / (1.0 + numerator / denominator),
+                        rel_tol=0,
+                        abs_tol=5e-13,
+                    )
+                ):
+                    raise RuntimeError(
+                        "DART_VIEWER bonus synthetic action semantics changed"
+                    )
+            elif action_type == "stock_dividend":
+                if (
+                    re.fullmatch(
+                        r"(?:\[기재정정\])?주식배당결정", report_name,
+                    ) is None
+                    or (
+                        row.get("support_ex_date") is not None
+                        and not pd.isna(row.get("support_ex_date"))
+                    )
+                    or row.get("support_record_date") is None
+                    or pd.isna(row.get("support_record_date"))
+                    or (expected is not None and not pd.isna(expected))
+                ):
+                    raise RuntimeError(
+                        "DART_VIEWER stock-dividend synthetic action semantics "
+                        "changed"
+                    )
+            else:
+                raise RuntimeError(
+                    "DART_VIEWER synthetic action type changed"
+                )
+        elif source == "KRX_KIND" and action_type == "paid_increase":
+            paid_identity = (
+                str(parent["ticker"]).zfill(6),
+                str(parent["cash_receipt_no"]),
+                pd.Timestamp(parent["adjustment_trade_date"]).date().isoformat(),
+                str(row["support_action_key"]),
+                pd.Timestamp(row["support_record_date"]).date().isoformat(),
+                format(
+                    float(row["support_ratio_numerator"])
+                    / float(row["support_ratio_denominator"]),
+                    ".12g",
+                ),
+            )
+            if (
+                paid_identity != PAID_RIGHTS_IDENTITY
+                or str(row["support_action_body_sha256"])
+                != PAID_RIGHTS_COMPONENT_BODY_SHA256
+                or row["support_semantic_role"] != "ADJUSTMENT_COMPONENT"
+                or row["support_entitlement_security_class"] != "COMMON"
+                or row["support_distributed_security_class"] != "COMMON"
+                or (
+                    row.get("support_expected_price_factor") is not None
+                    and not pd.isna(row.get("support_expected_price_factor"))
+                )
+            ):
+                raise RuntimeError("paid-rights synthetic identity changed")
         identity = (
-            "KRX_KIND",
+            source,
             str(row["support_action_key"]),
-            str(row["support_action_type"]),
+            action_type,
             str(parent["ticker"]),
         )
         previous_support = support_by_identity.get(identity)
@@ -182,17 +301,17 @@ def _manifest_support_action_candidates(
             ]
             if mismatched:
                 raise RuntimeError(
-                    "reused KIND support action has conflicting immutable "
+                    "reused synthetic support action has conflicting immutable "
                     f"semantics: identity={identity} fields={mismatched}"
                 )
-            # Multiple cash receipts can legitimately reuse one immutable KIND
-            # action.  corporate_action stores that action once; evidence
+            # Multiple cash receipts can legitimately reuse one immutable
+            # official action.  corporate_action stores it once; evidence
             # children retain each parent-specific reference separately.
             continue
         support_by_identity[identity] = row
         records_by_identity[identity] = {
             "identifier": str(parent["ticker"]),
-            "event_type": str(row["support_action_type"]),
+            "event_type": action_type,
             "announcement_date": row["support_announcement_date"],
             "effective_date": row["support_ex_date"],
             "match_window_days": 0,
@@ -220,16 +339,22 @@ def _manifest_support_action_candidates(
             "corp_cls": None,
             "action_scope": row["support_action_scope"],
             "cash_amount_status": None,
-            "source_evidence_status": None,
+            "source_evidence_status": (
+                "VERIFIED_DART_VIEWER_BODY"
+                if source == "DART_VIEWER" else None
+            ),
             "correction_of_action_key": None,
             "revision_root_action_key": None,
             "revision_kind": None,
-            "viewer_evidence_sha256": None,
+            "viewer_evidence_sha256": (
+                row["support_action_body_sha256"]
+                if source == "DART_VIEWER" else None
+            ),
             "economic_evidence_sha256": None,
             "reviewed_correction_id": None,
             "payment_date_quality_status": None,
             "source_body_sha256": row["support_action_body_sha256"],
-            "source": "KRX_KIND",
+            "source": source,
             "source_file": row["support_action_body_path"],
         }
     records = [records_by_identity[key] for key in sorted(records_by_identity)]
@@ -615,7 +740,11 @@ def run(
         required_start=DEFAULT_COVERAGE_START,
         required_end=expected_coverage_end,
     )
-    scale_evidence = verify_source_evidence_manifest(base)
+    scale_evidence = verify_source_evidence_manifest(
+        base,
+        required_start=verified.coverage_start,
+        required_end=verified.coverage_end,
+    )
     if verified.cash_adjustment_scale_source_evidence != scale_evidence.metadata:
         raise RuntimeError("action snapshot/cash-scale manifest metadata mismatch")
     owns_connection = conn is None
@@ -643,12 +772,16 @@ def run(
             }
         else:
             dividend_frame, dividend_stats = dividends.prepare(base)
-        action_frame, action_stats = corporate_actions.prepare(base)
+        action_frame, action_stats = corporate_actions.prepare(
+            base,
+            coverage_start=verified.coverage_start,
+            coverage_end=verified.coverage_end,
+        )
         if total_return_actions_only:
-            kind_support = _manifest_support_action_candidates(scale_evidence)
-            if not kind_support.empty:
+            manifest_support = _manifest_support_action_candidates(scale_evidence)
+            if not manifest_support.empty:
                 action_frame = pd.concat(
-                    [action_frame, kind_support], ignore_index=True,
+                    [action_frame, manifest_support], ignore_index=True,
                 )
             before_filter = len(action_frame)
             action_frame = _total_return_actions(action_frame, scale_evidence)
@@ -1047,7 +1180,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="검증된 snapshot을 Silver에 반영 (기본은 DB read-only dry-run)",
+        help=(
+            "standalone apply는 비활성화됨; 쓰기는 daily_full 또는 "
+            "dart_silver_backfill_ecs closed orchestrator 전용"
+        ),
     )
     parser.add_argument(
         "--expected-coverage-end",
@@ -1059,12 +1195,20 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    run(
-        src=args.src,
-        base_override=args.base,
-        total_return_actions_only=args.total_return_actions_only,
-        apply=args.apply,
-        expected_coverage_end=args.expected_coverage_end,
+    kwargs = {
+        "src": args.src,
+        "base_override": args.base,
+        "total_return_actions_only": args.total_return_actions_only,
+        "apply": args.apply,
+        "expected_coverage_end": args.expected_coverage_end,
+    }
+    if not args.apply:
+        run(**kwargs)
+        return
+    raise RuntimeError(
+        "direct DART action --apply is disabled because it can stop before "
+        "the total-return rebuild/audit; use pipeline.daily_full or "
+        "pipeline.dart_silver_backfill_ecs --phase dart-extras"
     )
 
 

@@ -1736,19 +1736,24 @@ def _build_batch(
         audit["is_canonical"] & audit["excluded_reason"].isna()
     ]
     if not applied_audit.empty:
-        raw_cash = pd.to_numeric(applied_audit["raw_cash_amount"], errors="coerce")
-        selected_scale = pd.to_numeric(
-            applied_audit["selected_cash_scale"], errors="coerce",
+        # Match the NUMERIC(28,12)/(28,8) database audit exactly.  pandas
+        # ``round`` uses bankers' rounding and disagrees with the publisher's
+        # ROUND_HALF_UP contract on exact half-quantum cash values.
+        resolution_parity = pd.Series(
+            [
+                Decimal(str(row["adjusted_cash_amount"])).quantize(
+                    Decimal("0.00000001"), rounding=ROUND_HALF_UP,
+                )
+                == (
+                    Decimal(str(row["raw_cash_amount"]))
+                    * Decimal(str(row["selected_cash_scale"]))
+                ).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+                and bool(row["scale_price_factor_parity"])
+                for row in applied_audit.to_dict("records")
+            ],
+            index=applied_audit.index,
+            dtype="bool",
         )
-        adjusted = pd.to_numeric(
-            applied_audit["adjusted_cash_amount"], errors="coerce",
-        )
-        expected_adjusted = (raw_cash * selected_scale).round(8)
-        cash_parity = adjusted.round(8).eq(expected_adjusted)
-        scale_parity = applied_audit[
-            "scale_price_factor_parity"
-        ].fillna(False).astype(bool)
-        resolution_parity = cash_parity & scale_parity
         if not resolution_parity.all():
             raise RuntimeError("resolution-v2 adjusted-cash/scale parity failed")
     else:

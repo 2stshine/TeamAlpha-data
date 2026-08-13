@@ -76,6 +76,28 @@ def test_build_batch_applies_dividend_and_audits_source_action():
     assert audit["quality_run_id"] == run_id
 
 
+def test_build_batch_uses_database_half_up_cash_rounding():
+    prices = _prices([
+        (1, "1", date(2026, 1, 2), 100.0, 100.0),
+        (1, "1", date(2026, 1, 5), 100.0, 100.0),
+    ])
+    actions = _actions([{
+        "effective_date": date(2026, 1, 5),
+        "cash_amount": 0.000000005,
+    }])
+
+    batch = _build_batch(
+        prices,
+        actions,
+        pd.Series(pd.to_datetime(["2026-01-02", "2026-01-05"])),
+        run_id=None,
+        max_dividend_yield=1.0,
+    )
+
+    assert batch.audit.iloc[0]["adjusted_cash_amount"] == 0.00000001
+    assert batch.resolution_parity_count == 1
+
+
 def test_future_event_is_not_silently_applied_and_has_explicit_reason():
     prices = _prices([
         (1, "1", date(2026, 1, 2), 100.0, 100.0),

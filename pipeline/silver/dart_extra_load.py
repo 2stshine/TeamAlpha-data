@@ -546,6 +546,12 @@ def _source_receipt_frame(
             ["ticker", "receipt_no", "asset_id", "mapping_status", "excluded_reason"],
         ].head(20).to_dict("records")
         raise RuntimeError(f"invalid DART cash receipt mapping partition: {sample}")
+    try:
+        cash["asset_id"] = cash["asset_id"].astype("Int64")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "DART cash source receipt has a non-integral asset identity"
+        ) from exc
     return cash[_SOURCE_RECEIPT_COLUMNS].reset_index(drop=True)
 
 

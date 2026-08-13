@@ -288,9 +288,10 @@ def test_full_source_receipt_preserves_included_and_excluded_rows():
     assert receipts["receipt_no"].tolist() == [
         "20250228801790", "20250228801791",
     ]
-    assert receipts.set_index("receipt_no").loc[
+    assert pd.isna(receipts.set_index("receipt_no").loc[
         "20250228801791", "asset_id"
-    ] != 1
+    ])
+    assert str(receipts["asset_id"].dtype) == "Int64"
     assert stats["source_cash_receipt_count"] == 2
     assert stats["included_cash_receipt_count"] == 1
     assert stats["excluded_cash_receipt_count"] == 1

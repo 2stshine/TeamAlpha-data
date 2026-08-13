@@ -75,3 +75,15 @@ def test_cash_scale_support_ratio_precision_preserves_reviewed_terms():
     assert "support_ratio_denominator NUMERIC(28,12)" in schema
     assert "support_ratio_numerator TYPE NUMERIC(28,12)" in migration
     assert "support_ratio_denominator TYPE NUMERIC(28,12)" in migration
+
+
+def test_corporate_action_ratio_precision_matches_support_rows():
+    schema = (ROOT / "sql/schema.sql").read_text(encoding="utf-8")
+    migration = (
+        ROOT / "pipeline/silver_quality/migrations/"
+        "012_corporate_action_ratio_precision.sql"
+    ).read_text(encoding="utf-8")
+    assert "ratio_numerator NUMERIC(28,12)" in schema
+    assert "ratio_denominator NUMERIC(28,12)" in schema
+    assert migration.count("ratio_numerator TYPE NUMERIC(28,12)") == 2
+    assert migration.count("ratio_denominator TYPE NUMERIC(28,12)") == 2

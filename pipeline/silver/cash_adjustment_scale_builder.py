@@ -1588,6 +1588,23 @@ def _viewer_stock_dividend_family_event(
     }
 
 
+def _assert_viewer_stock_family_identity(
+    family: SupportActionFamilyEntry,
+    source: object,
+) -> None:
+    """Require the manifest's ordered official family to bind its root."""
+    ordered = tuple(family.ordered_family_receipts)
+    if (
+        not ordered
+        or ordered[0] != family.terminal_receipt_no
+        or ordered[-1] != family.root_receipt_no
+        or family.terminal_economic_receipt_no not in ordered
+        or getattr(source, "receipt_no", None)
+        != family.terminal_economic_receipt_no
+    ):
+        raise RuntimeError("viewer stock-dividend family identity changed")
+
+
 def _prepared_family_terminal_candidates(
     root: Path,
     events: Sequence[dict[str, object]],
@@ -1628,6 +1645,7 @@ def _prepared_family_terminal_candidates(
                 for event in disclosure
             ):
                 return disclosure
+            _assert_viewer_stock_family_identity(family, source_rows[0])
             return [_viewer_stock_dividend_family_event(root, family)]
     expected_source = (
         "DART_DISCLOSURE"

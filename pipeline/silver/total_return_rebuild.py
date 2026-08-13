@@ -1164,10 +1164,11 @@ def _prepare_local_action_snapshot(
             "local complete Bronze has no ISSUER DART cash-dividend"
         )
 
-    mapped, mapping_stats = map_actions_to_pit_assets(
+    mapped, mapping_stats, source_action_frame = map_actions_to_pit_assets(
         conn,
         scoped,
         coverage_start=CONTRACT_COVERAGE_START,
+        include_audit=True,
     )
     normalized = corporate_actions.normalize_for_publish(mapped)
     if normalized.empty or not normalized["action_type"].eq("cash_dividend").any():
@@ -1188,7 +1189,9 @@ def _prepare_local_action_snapshot(
     else:
         from pipeline.silver.dart_extra_load import _source_receipt_frame
 
-        receipt_frame = _source_receipt_frame(mapped, quality_run_id=None)
+        receipt_frame = _source_receipt_frame(
+            source_action_frame, quality_run_id=None,
+        )
         published_for_binding = normalized.copy()
         published_for_binding["quality_run_id"] = None
         bound_scale = bind_source_evidence(

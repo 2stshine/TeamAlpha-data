@@ -405,37 +405,12 @@ def test_public_manifest_row_digest_helpers_match_frozen_contract(tmp_path):
 
 
 def test_manifest_accepts_generic_numbered_dart_dividend_notice(tmp_path):
-    _, _, manifest_path = _fixture(tmp_path)
-    manifest = json.loads(manifest_path.read_bytes())
-    notice = manifest["evidence"][0]["support_actions"][2]
-    body = tmp_path / notice["support_action_body_path"]
-    _zip(body, _dart_numbered_notice())
-    stock_group = manifest["evidence"][0]["support_actions"][1][
-        "support_semantic_group_keys"
-    ]
-    notice.update({
-        "support_action_type": "ex_dividend",
-        "support_action_body_sha256": _sha(body),
-        "support_report_name": "배당락",
-        "support_semantic_group_keys": stock_group,
-        "support_reason": "주식배당",
-    })
-    _refresh_manifest(manifest_path, manifest)
-
-    verified = _verify(str(tmp_path))
-
-    exact = verified.support_frame[
-        verified.support_frame["support_action_key"].eq("20211228900755")
-    ].iloc[0]
-    assert exact["support_action_type"] == "ex_dividend"
-    assert exact["support_report_name"] == "배당락"
+    parent, notice, _ = _numbered_notice_support(tmp_path)
+    evidence._verify_support_body(tmp_path, parent, notice)
 
 
 def test_manifest_accepts_valid_notice_beside_incomplete_correction(tmp_path):
-    _, _, manifest_path = _fixture(tmp_path)
-    manifest = json.loads(manifest_path.read_bytes())
-    notice = manifest["evidence"][0]["support_actions"][2]
-    body = tmp_path / notice["support_action_body_path"]
+    parent, notice, body = _numbered_notice_support(tmp_path)
     with zipfile.ZipFile(body, "w") as archive:
         archive.writestr(
             "correction.xml",
@@ -443,19 +418,8 @@ def test_manifest_accepts_valid_notice_beside_incomplete_correction(tmp_path):
             "<td>2021-12-29</td></tr></table></document>",
         )
         archive.writestr("notice.xml", _dart_numbered_notice())
-    stock_group = manifest["evidence"][0]["support_actions"][1][
-        "support_semantic_group_keys"
-    ]
-    notice.update({
-        "support_action_type": "ex_dividend",
-        "support_action_body_sha256": _sha(body),
-        "support_report_name": "배당락",
-        "support_semantic_group_keys": stock_group,
-        "support_reason": "주식배당",
-    })
-    _refresh_manifest(manifest_path, manifest)
-
-    assert _verify(str(tmp_path)).row_count == 1
+    notice["support_action_body_sha256"] = _sha(body)
+    evidence._verify_support_body(tmp_path, parent, notice)
 
 
 @pytest.mark.parametrize(

@@ -1479,7 +1479,7 @@ def test_viewer_stock_dividend_family_rejects_unreviewed_or_tampered_identity(
     family = _viewer_stock_dividend_family(tmp_path)
     family.root_receipt_no = "20151216900094"
 
-    with pytest.raises(RuntimeError, match="no official non-cash"):
+    with pytest.raises(RuntimeError, match="family identity changed"):
         builder._component_supports(
             tmp_path, [], [], [family], ticker="032960",
             record_date=date(2015, 12, 31),

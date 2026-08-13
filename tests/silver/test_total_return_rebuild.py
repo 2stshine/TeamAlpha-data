@@ -368,6 +368,12 @@ def test_local_action_snapshot_filters_issuer_and_reports_unmapped(
                 out_of_scope_market_ticker_count=0,
                 out_of_scope_market_classes={},
             ),
+            frame.assign(
+                asset_id=[1, 2],
+                pit_mapping_status="INCLUDED",
+                pit_excluded_reason=None,
+                pit_event_date=date(2026, 1, 2),
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -467,13 +473,14 @@ def test_local_preview_fully_binds_nonempty_parent_and_child_evidence(
         rebuild,
         "map_actions_to_pit_assets",
         lambda conn, frame, **kwargs: (
+            frame.assign(asset_id=7),
+            SimpleNamespace(out_of_scope_instrument_count=0),
             frame.assign(
                 asset_id=7,
                 pit_mapping_status="INCLUDED",
                 pit_excluded_reason=None,
                 pit_event_date=date(2021, 12, 31),
             ),
-            SimpleNamespace(out_of_scope_instrument_count=0),
         ),
     )
     monkeypatch.setattr(
@@ -484,7 +491,15 @@ def test_local_preview_fully_binds_nonempty_parent_and_child_evidence(
     monkeypatch.setattr(
         dart_extra_load,
         "_source_receipt_frame",
-        lambda frame, **kwargs: pd.DataFrame([{"receipt_no": "bound-cash"}]),
+        lambda frame, **kwargs: (
+            pd.DataFrame([{"receipt_no": "bound-cash"}])
+            if {
+                "pit_mapping_status", "pit_excluded_reason", "pit_event_date",
+            }.issubset(frame.columns)
+            else (_ for _ in ()).throw(
+                AssertionError("local preview did not preserve PIT audit rows")
+            )
+        ),
     )
 
     def fake_bind(verified, **kwargs):

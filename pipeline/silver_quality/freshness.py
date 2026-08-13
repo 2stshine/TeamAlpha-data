@@ -26,6 +26,11 @@ MAX_LAG_DAYS = {
 }
 
 
+def total_return_contract_report(conn) -> dict:
+    """Public read-only readiness report for orchestration preflights."""
+    return _total_return_contract_report(conn)
+
+
 def evaluate(conn, *, as_of: date | None = None) -> dict:
     as_of = as_of or datetime.now(KST).date()
     with conn.cursor() as c:

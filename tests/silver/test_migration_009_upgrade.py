@@ -137,6 +137,12 @@ def test_schema_and_migration_010_preserve_canonical_evidence_column_order():
                 assert match is not None, column
                 positions.append(match.start())
             assert positions == sorted(positions)
+        assert "'DART_STRUCTURED','DART_VIEWER'" in child
+        assert (
+            "corporate_actions/dart/support_action_families/objects/"
+            in child
+        )
+        assert "support_expected_price_factor=round(" in child
 
 
 def _run(command: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
@@ -491,6 +497,40 @@ def test_migration_010_is_idempotent_and_freezes_parent_child_contract(tmp_path)
                 cur.execute(child_insert, (
                     "20260101000001", date(2026, 1, 2),
                 ))
+                viewer_insert = """
+                    INSERT INTO cash_adjustment_scale_support_action(
+                        action_snapshot_run_id,evidence_key,
+                        support_action_source,support_action_key,
+                        support_action_type,target_cash_receipt_no,
+                        target_adjustment_date,support_action_body_path,
+                        support_action_body_sha256,support_action_quality_run_id,
+                        support_announcement_date,support_ex_date,
+                        support_ratio_numerator,support_ratio_denominator,
+                        support_entitlement_security_class,
+                        support_distributed_security_class,
+                        support_expected_price_factor,
+                        support_report_name,support_action_scope,
+                        support_semantic_group_keys,support_semantic_role,
+                        manifest_support_row_sha256
+                    ) VALUES (
+                        '00000000-0000-0000-0000-000000000010','parent-two',
+                        'DART_VIEWER','20251201000002','bonus_issue',
+                        '20260101000002',DATE '2026-01-03',
+                        'corporate_actions/dart/support_action_families/'
+                            'objects/sha256=' || repeat('e',64) || '.html',
+                        repeat('e',64),
+                        '00000000-0000-0000-0000-000000000010',
+                        DATE '2025-12-01',DATE '2026-01-03',0.1,1,
+                        'COMMON','COMMON',%s,
+                        '주요사항보고서(무상증자결정)','ISSUER','["g2"]',
+                        'ADJUSTMENT_COMPONENT',repeat('f',64)
+                    )
+                """
+                cur.execute("SAVEPOINT invalid_viewer_factor")
+                with pytest.raises(psycopg.errors.CheckViolation):
+                    cur.execute(viewer_insert, (0.9,))
+                cur.execute("ROLLBACK TO SAVEPOINT invalid_viewer_factor")
+                cur.execute(viewer_insert, (0.909090909091,))
                 cur.execute(
                     "SELECT count(*) FROM cash_adjustment_scale_support_action"
                 )
@@ -527,7 +567,7 @@ def test_migration_010_is_idempotent_and_freezes_parent_child_contract(tmp_path)
         )
         assert grant_preserved is True
         assert final_view_column == "source_body_sha256"
-        assert exact_parent_child_count == 1
+        assert exact_parent_child_count == 2
     finally:
         if started:
             subprocess.run(

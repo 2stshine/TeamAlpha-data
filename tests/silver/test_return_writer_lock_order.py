@@ -12,7 +12,9 @@ def _position(source: str, token: str) -> int:
 
 def test_daily_lock_precedes_asset_and_price_mutations():
     source = inspect.getsource(load.incremental)
-    lock = _position(source, "acquire_return_writer_transaction_lock(conn)")
+    lock = _position(
+        source, "acquire_return_writer_transaction_lock(connection)",
+    )
     assert lock < _position(source, "assets.publish(")
     assert lock < _position(source, '"DELETE FROM price_daily "')
     assert lock < _position(source, "prices.publish(")

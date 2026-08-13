@@ -15,9 +15,11 @@ import html
 import json
 import re
 import zipfile
+from dataclasses import dataclass
 from datetime import date, datetime
-from functools import lru_cache
 from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
 from uuid import UUID
 
 import pandas as pd
@@ -26,7 +28,9 @@ from pipeline.bronze.dart_disclosure_observations import (
     canonicalize_disclosures,
 )
 from pipeline.bronze.dart_support_action_families import (
+    MANIFEST_RELATIVE_PATH as SUPPORT_FAMILY_MANIFEST_RELATIVE_PATH,
     stock_dividend_common_ratio_from_body,
+    verify_support_action_families,
 )
 from pipeline.common import db
 from pipeline.bronze.dart_viewer_corrections import (
@@ -111,6 +115,22 @@ PRICE_ADJUSTING_STRUCTURED = {
     "combined_offering",
     "capital_reduction",
 }
+
+
+@dataclass(frozen=True)
+class _PrepareEvidenceContext:
+    """Verified, invocation-local evidence used throughout one prepare run."""
+
+    base: str
+    viewer_index: Mapping[str, object]
+    viewer_text_by_receipt: Mapping[str, str]
+    viewer_manifest_path: Path
+    viewer_manifest_sha256: str | None
+    viewer_object_bindings: tuple[tuple[Path, int, str], ...]
+    support_manifest_path: Path
+    support_manifest_sha256: str | None
+    support_object_bindings: tuple[tuple[Path, int, str], ...]
+    support_snapshot: object | None
 
 
 def _empty() -> pd.DataFrame:
@@ -328,6 +348,7 @@ def _structured_row(
     row: dict,
     report_name: object = None,
     corp_cls: object = None,
+    accepted_date: object = None,
 ) -> dict | None:
     ticker = _ticker_from_path(path)
     event_type = _event_from_path(path)
@@ -352,7 +373,12 @@ def _structured_row(
     return {
         "identifier": ticker,
         "event_type": event_type,
-        "announcement_date": _announcement_date(row),
+        # The official list acceptance date is authoritative.  A receipt
+        # number is a selector identity and can carry the previous calendar
+        # day's prefix after overnight DART processing.
+        "announcement_date": (
+            _parse_date(accepted_date) or _announcement_date(row)
+        ),
         "effective_date": effective_date,
         "match_window_days": 7 if effective_date else 0,
         "expected_factor": _structured_expected_factor(event_type, row),
@@ -544,26 +570,417 @@ def _decode_document(payload: bytes) -> str:
     )
 
 
-@lru_cache(maxsize=8)
 def _verified_viewer_index(
     base: str,
-    manifest_mtime_ns: int,
-    manifest_size: int,
+    manifest_sha256: str,
+    required_start: date,
+    required_end: date,
 ) -> dict[str, object]:
-    del manifest_mtime_ns, manifest_size
-    verified = verify_viewer_corrections(base)
+    del manifest_sha256
+    verified = verify_viewer_corrections(
+        base,
+        required_start=required_start,
+        required_end=required_end,
+    )
     return {item.receipt_no: item for item in verified.receipts}
 
 
-def _viewer_index(base: str) -> dict[str, object]:
+def _viewer_index(
+    base: str,
+    *,
+    required_start: date | None = None,
+    required_end: date | None = None,
+) -> dict[str, object]:
     root = Path(base).expanduser().resolve()
     manifest = root / VIEWER_MANIFEST_RELATIVE_PATH
     if not manifest.is_file():
         return {}
-    stat = manifest.stat()
+    if (required_start is None) != (required_end is None):
+        raise ValueError(
+            "viewer required_start/required_end must be provided together"
+        )
+    if required_start is None:
+        try:
+            payload = json.loads(manifest.read_bytes())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"missing/invalid DART viewer correction manifest: {manifest}"
+            ) from exc
+        required_start = _parse_date(payload.get("seed_coverage_start"))
+        required_end = _parse_date(payload.get("seed_coverage_end"))
+        if required_start is None or required_end is None:
+            raise RuntimeError(
+                "DART viewer correction manifest has no valid seed coverage"
+            )
+    manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
     return _verified_viewer_index(
-        str(root), stat.st_mtime_ns, stat.st_size,
+        str(root), manifest_sha256, required_start, required_end,
     )
+
+
+def _path_sha256_if_file(path: Path) -> str | None:
+    try:
+        payload = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(f"cannot read evidence manifest: {path}") from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _resolved_snapshot_path(root: Path, value: str) -> Path:
+    path = Path(value)
+    return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
+def _assert_no_evidence_symlink(root: Path, path: Path) -> None:
+    """Reject mutable symlink indirection below a verified snapshot root."""
+    candidate = path if path.is_absolute() else root / path
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"evidence path escapes snapshot root: {path}") from exc
+    if ".." in relative.parts:
+        raise RuntimeError(f"evidence path escapes snapshot root: {path}")
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError(f"symlinked evidence path is forbidden: {current}")
+
+
+def _prepare_evidence_context(
+    base: str,
+    *,
+    coverage_start: date | None,
+    coverage_end: date | None,
+) -> _PrepareEvidenceContext:
+    root = Path(base).expanduser().resolve()
+    viewer_manifest = root / VIEWER_MANIFEST_RELATIVE_PATH
+    _assert_no_evidence_symlink(root, viewer_manifest)
+    viewer_sha = _path_sha256_if_file(viewer_manifest)
+    viewer_index: dict[str, object] = {}
+    viewer_text_by_receipt: dict[str, str] = {}
+    viewer_object_bindings: tuple[tuple[Path, int, str], ...] = ()
+    if viewer_sha is not None:
+        required_start = coverage_start
+        required_end = coverage_end
+        if required_start is None:
+            try:
+                payload = json.loads(viewer_manifest.read_bytes())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"missing/invalid DART viewer correction manifest: "
+                    f"{viewer_manifest}"
+                ) from exc
+            required_start = _parse_date(payload.get("seed_coverage_start"))
+            required_end = _parse_date(payload.get("seed_coverage_end"))
+            if required_start is None or required_end is None:
+                raise RuntimeError(
+                    "DART viewer correction manifest has no valid seed coverage"
+                )
+        verified = verify_viewer_corrections(
+            str(root),
+            required_start=required_start,
+            required_end=required_end,
+        )
+        if (
+            _resolved_snapshot_path(root, verified.manifest_path)
+            != viewer_manifest
+            or
+            verified.manifest_sha256 != viewer_sha
+            or _path_sha256_if_file(viewer_manifest) != viewer_sha
+        ):
+            raise RuntimeError(
+                "DART viewer correction manifest changed during verification"
+            )
+        declared_bindings: dict[Path, tuple[int, str]] = {}
+
+        def declare_binding(relative: str, length: int, digest: str) -> None:
+            lexical = Path(relative)
+            path = lexical if lexical.is_absolute() else root / lexical
+            _assert_no_evidence_symlink(root, path)
+            path = path.resolve()
+            if root not in path.parents:
+                raise RuntimeError(
+                    f"DART viewer evidence path is unsafe: {relative}"
+                )
+            identity = (int(length), str(digest))
+            existing = declared_bindings.get(path)
+            if existing is not None and existing != identity:
+                raise RuntimeError(
+                    f"conflicting DART viewer evidence identity: {relative}"
+                )
+            declared_bindings[path] = identity
+
+        for probe in verified.dependency_probes:
+            declare_binding(
+                probe.main_path,
+                probe.main_content_length,
+                probe.main_sha256,
+            )
+        for evidence in verified.receipts:
+            for relative, length, digest in (
+                (
+                    evidence.main_path,
+                    evidence.main_content_length,
+                    evidence.main_sha256,
+                ),
+                (
+                    evidence.viewer_path,
+                    evidence.viewer_content_length,
+                    evidence.viewer_sha256,
+                ),
+                (
+                    evidence.economic_main_path,
+                    evidence.economic_main_content_length,
+                    evidence.economic_main_sha256,
+                ),
+                (
+                    evidence.economic_viewer_path,
+                    evidence.economic_viewer_content_length,
+                    evidence.economic_viewer_sha256,
+                ),
+            ):
+                declare_binding(relative, length, digest)
+
+        frozen_body_by_path: dict[Path, bytes] = {}
+        viewer_object_bindings = tuple(
+            (path, length, digest)
+            for path, (length, digest) in sorted(
+                declared_bindings.items(), key=lambda item: str(item[0]),
+            )
+        )
+        for path, length, digest in viewer_object_bindings:
+            try:
+                frozen_body = path.read_bytes()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"DART viewer evidence is unreadable: {path}"
+                ) from exc
+            if (
+                len(frozen_body) != length
+                or hashlib.sha256(frozen_body).hexdigest() != digest
+            ):
+                raise RuntimeError(
+                    f"DART viewer evidence changed after verification: {path}"
+                )
+            frozen_body_by_path[path] = frozen_body
+
+        for evidence in verified.receipts:
+            body = frozen_body_by_path[(root / evidence.viewer_path).resolve()]
+            decoded = _decode_document(body)
+            visible = html.unescape(re.sub(r"<[^>]+>", " ", decoded))
+            viewer_index[evidence.receipt_no] = evidence
+            viewer_text_by_receipt[evidence.receipt_no] = re.sub(
+                r"\s+", " ", visible,
+            )
+
+    support_manifest = root / SUPPORT_FAMILY_MANIFEST_RELATIVE_PATH
+    _assert_no_evidence_symlink(root, support_manifest)
+    support_sha = _path_sha256_if_file(support_manifest)
+    support_snapshot = None
+    support_object_bindings: tuple[tuple[Path, int, str], ...] = ()
+    if support_sha is not None and coverage_start is not None:
+        support_snapshot = verify_support_action_families(
+            root,
+            required_start=coverage_start,
+            required_end=coverage_end,
+        )
+        if (
+            _resolved_snapshot_path(root, support_snapshot.manifest_path)
+            != support_manifest
+            or
+            support_snapshot.manifest_sha256 != support_sha
+            or _path_sha256_if_file(support_manifest) != support_sha
+        ):
+            raise RuntimeError(
+                "DART support-family manifest changed during verification"
+            )
+        declared_support_bindings: dict[Path, tuple[int | None, str]] = {}
+
+        def declare_support_binding(
+            relative: str,
+            length: int | None,
+            digest: str,
+        ) -> None:
+            lexical = Path(relative)
+            path = lexical if lexical.is_absolute() else root / lexical
+            _assert_no_evidence_symlink(root, path)
+            path = path.resolve()
+            if root not in path.parents:
+                raise RuntimeError(
+                    f"DART support-family evidence path is unsafe: {relative}"
+                )
+            identity = (length, str(digest))
+            existing = declared_support_bindings.get(path)
+            if existing is not None:
+                existing_length, existing_digest = existing
+                if (
+                    existing_digest != identity[1]
+                    or (
+                        existing_length is not None
+                        and identity[0] is not None
+                        and existing_length != identity[0]
+                    )
+                ):
+                    raise RuntimeError(
+                        "conflicting DART support-family evidence identity: "
+                        f"{relative}"
+                    )
+                if existing_length is None and identity[0] is not None:
+                    declared_support_bindings[path] = identity
+                return
+            declared_support_bindings[path] = identity
+
+        for entry in support_snapshot.entries:
+            for source in entry.sources:
+                declare_support_binding(
+                    source.main_path,
+                    source.main_content_length,
+                    source.main_sha256,
+                )
+                declare_support_binding(
+                    source.body_path,
+                    source.body_content_length,
+                    source.body_sha256,
+                )
+                declare_support_binding(
+                    source.disclosure_path,
+                    source.disclosure_content_length,
+                    source.disclosure_sha256,
+                )
+                declare_support_binding(
+                    source.disclosure_manifest_path,
+                    None,
+                    source.disclosure_manifest_sha256,
+                )
+                structured_fields = (
+                    source.structured_path,
+                    source.structured_content_length,
+                    source.structured_sha256,
+                )
+                if any(value is not None for value in structured_fields) and not all(
+                    value is not None for value in structured_fields
+                ):
+                    raise RuntimeError(
+                        "incomplete DART support-family structured identity: "
+                        f"{source.receipt_no}"
+                    )
+                if source.structured_path is not None:
+                    declare_support_binding(
+                        source.structured_path,
+                        source.structured_content_length,
+                        source.structured_sha256,
+                    )
+        completeness_parents = {
+            (root / source.disclosure_manifest_path).resolve().parent
+            for entry in support_snapshot.entries
+            for source in entry.sources
+        }
+        for parent in completeness_parents:
+            for marker_name in (
+                "structured_complete_v3.json",
+                "documents_complete_v5.json",
+            ):
+                marker = parent / marker_name
+                _assert_no_evidence_symlink(root, marker)
+                marker = marker.resolve()
+                if root not in marker.parents:
+                    raise RuntimeError(
+                        f"DART support-family marker path is unsafe: {marker}"
+                    )
+                try:
+                    marker_payload = marker.read_bytes()
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"DART support-family marker is unreadable: {marker}"
+                    ) from exc
+                declare_support_binding(
+                    str(marker.relative_to(root)),
+                    len(marker_payload),
+                    hashlib.sha256(marker_payload).hexdigest(),
+                )
+        exact_support_bindings: list[tuple[Path, int, str]] = []
+        for path, (declared_length, digest) in sorted(
+            declared_support_bindings.items(), key=lambda item: str(item[0]),
+        ):
+            try:
+                payload = path.read_bytes()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"DART support-family evidence is unreadable: {path}"
+                ) from exc
+            if (
+                (declared_length is not None and len(payload) != declared_length)
+                or hashlib.sha256(payload).hexdigest() != digest
+            ):
+                raise RuntimeError(
+                    "DART support-family evidence changed after verification: "
+                    f"{path}"
+                )
+            exact_support_bindings.append((path, len(payload), digest))
+        support_object_bindings = tuple(exact_support_bindings)
+    return _PrepareEvidenceContext(
+        base=str(root),
+        viewer_index=MappingProxyType(viewer_index),
+        viewer_text_by_receipt=MappingProxyType(viewer_text_by_receipt),
+        viewer_manifest_path=viewer_manifest,
+        viewer_manifest_sha256=viewer_sha,
+        viewer_object_bindings=viewer_object_bindings,
+        support_manifest_path=support_manifest,
+        support_manifest_sha256=support_sha,
+        support_object_bindings=support_object_bindings,
+        support_snapshot=support_snapshot,
+    )
+
+
+def _assert_prepare_evidence_unchanged(
+    context: _PrepareEvidenceContext,
+) -> None:
+    root = Path(context.base)
+    _assert_no_evidence_symlink(root, context.viewer_manifest_path)
+    if (
+        _path_sha256_if_file(context.viewer_manifest_path)
+        != context.viewer_manifest_sha256
+    ):
+        raise RuntimeError("DART viewer correction manifest changed during prepare")
+    for path, length, digest in context.viewer_object_bindings:
+        _assert_no_evidence_symlink(root, path)
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(
+                f"DART viewer evidence changed during prepare: {path}"
+            ) from exc
+        if (
+            len(payload) != length
+            or hashlib.sha256(payload).hexdigest() != digest
+        ):
+            raise RuntimeError(
+                f"DART viewer evidence changed during prepare: {path}"
+            )
+    _assert_no_evidence_symlink(root, context.support_manifest_path)
+    if (
+        _path_sha256_if_file(context.support_manifest_path)
+        != context.support_manifest_sha256
+    ):
+        raise RuntimeError("DART support-family manifest changed during prepare")
+    for path, length, digest in context.support_object_bindings:
+        _assert_no_evidence_symlink(root, path)
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(
+                f"DART support-family evidence changed during prepare: {path}"
+            ) from exc
+        if (
+            len(payload) != length
+            or hashlib.sha256(payload).hexdigest() != digest
+        ):
+            raise RuntimeError(
+                f"DART support-family evidence changed during prepare: {path}"
+            )
 
 
 def _document_texts(
@@ -572,6 +989,7 @@ def _document_texts(
     ticker: str,
     rcept_no: str,
     include_viewer: bool = True,
+    evidence_context: _PrepareEvidenceContext | None = None,
 ) -> list[str]:
     paths = glob.glob(
         f"{base}/corporate_actions/dart/documents/year=*/"
@@ -588,14 +1006,23 @@ def _document_texts(
             decoded = _decode_document(payload)
             visible = html.unescape(re.sub(r"<[^>]+>", " ", decoded))
             texts.append(re.sub(r"\s+", " ", visible))
-    viewer = _viewer_index(base).get(str(rcept_no)) if include_viewer else None
-    if viewer is not None:
-        payload = (Path(base).resolve() / viewer.viewer_path).read_bytes()
-        decoded = _decode_document(payload)
-        visible = html.unescape(re.sub(r"<[^>]+>", " ", decoded))
-        # Appended last on purpose: a verified viewer revision supersedes a
-        # stale/corrupted OpenDART document body for the same receipt.
-        texts.append(re.sub(r"\s+", " ", visible))
+    if include_viewer:
+        if evidence_context is not None:
+            viewer_text = evidence_context.viewer_text_by_receipt.get(
+                str(rcept_no),
+            )
+        else:
+            viewer = _viewer_index(base).get(str(rcept_no))
+            viewer_text = None
+            if viewer is not None:
+                payload = (Path(base).resolve() / viewer.viewer_path).read_bytes()
+                decoded = _decode_document(payload)
+                visible = html.unescape(re.sub(r"<[^>]+>", " ", decoded))
+                viewer_text = re.sub(r"\s+", " ", visible)
+        if viewer_text is not None:
+            # Appended last on purpose: a verified viewer revision supersedes
+            # a stale/corrupted OpenDART body for the same receipt.
+            texts.append(viewer_text)
     return texts
 
 
@@ -722,6 +1149,7 @@ def _cash_dividend_details(
     ticker: str,
     rcept_no: str,
     include_viewer: bool = True,
+    evidence_context: _PrepareEvidenceContext | None = None,
 ) -> dict:
     details = {
         "record_date": None,
@@ -739,6 +1167,7 @@ def _cash_dividend_details(
         ticker=ticker,
         rcept_no=rcept_no,
         include_viewer=include_viewer,
+        evidence_context=evidence_context,
     ):
         # Keep field boundaries.  Compacting the entire correction document
         # can concatenate the correction table's old/new values and nearby
@@ -904,6 +1333,8 @@ def _assert_viewer_cash_parity(
 def _related_cash_correction_signatures(
     base: str,
     disclosure_rows: list[tuple[str, dict]],
+    *,
+    evidence_context: _PrepareEvidenceContext,
 ) -> set[tuple[str, date, date, float]]:
     """Identify original filings later corrected as subsidiary disclosures.
 
@@ -933,6 +1364,7 @@ def _related_cash_correction_signatures(
             base,
             ticker=ticker,
             rcept_no=str(row.get("rcept_no") or ""),
+            evidence_context=evidence_context,
         )
         origin = details.get("correction_origin_date")
         record_date = details.get("record_date")
@@ -947,7 +1379,13 @@ def _related_cash_correction_signatures(
     return signatures
 
 
-def _disclosure_row(base: str, path: str, row: dict) -> dict | None:
+def _disclosure_row(
+    base: str,
+    path: str,
+    row: dict,
+    *,
+    evidence_context: _PrepareEvidenceContext,
+) -> dict | None:
     event = _disclosure_type(row.get("report_nm"))
     if event is None:
         return None
@@ -969,6 +1407,7 @@ def _disclosure_row(base: str, path: str, row: dict) -> dict | None:
             base,
             ticker=ticker,
             rcept_no=str(row.get("rcept_no") or ""),
+            evidence_context=evidence_context,
         )
         if event_type == "cash_dividend"
         else {}
@@ -994,7 +1433,7 @@ def _disclosure_row(base: str, path: str, row: dict) -> dict | None:
     if dividend_details.get("related_company_event"):
         return None
     receipt = str(row.get("rcept_no") or "")
-    viewer_evidence = _viewer_index(base).get(receipt)
+    viewer_evidence = evidence_context.viewer_index.get(receipt)
     compact_report = _compact(row.get("report_nm"))
     is_attachment_correction = "첨부정정" in compact_report
     is_revision = any(
@@ -1027,12 +1466,14 @@ def _disclosure_row(base: str, path: str, row: dict) -> dict | None:
                 ticker=ticker,
                 rcept_no=receipt,
                 include_viewer=False,
+                evidence_context=evidence_context,
             )
             zip_details = _cash_dividend_details(
                 base,
                 ticker=ticker,
                 rcept_no=receipt,
                 include_viewer=False,
+                evidence_context=evidence_context,
             )
             if viewer_evidence.economic_classification == (
                 "POSITIVE_PENDING_RECORD_DATE"
@@ -1100,6 +1541,7 @@ def _disclosure_row(base: str, path: str, row: dict) -> dict | None:
         base,
         ticker=ticker,
         rcept_no=str(row.get("rcept_no") or ""),
+        evidence_context=evidence_context,
     ):
         source_evidence_status = "VERIFIED_OPENDART_DOCUMENT"
     else:
@@ -1286,47 +1728,189 @@ def _disclosure_rows(
     return (output, audit) if include_audit else output
 
 
+def _verified_lineage_receipts(
+    base: str,
+    *,
+    coverage_start: date,
+    coverage_end: date,
+    disclosure_rows: list[tuple[str, dict]],
+    evidence_context: _PrepareEvidenceContext,
+) -> set[str]:
+    """Return only exact, independently verified family dependencies.
+
+    Bronze can retain complete intervals outside the published action
+    coverage so that an in-coverage correction can bind its official DART
+    root.  Those intervals are evidence, not an invitation to publish every
+    historical or future filing.  The only out-of-range receipts admitted by
+    Silver are identities named by the exact viewer/support-family manifests
+    verified for this same coverage window.
+    """
+    root = Path(base).expanduser().resolve()
+    allowed: set[str] = set()
+    in_coverage_receipts = {
+        str(row.get("rcept_no") or "")
+        for _, row in disclosure_rows
+        if (
+            (accepted := _parse_date(row.get("rcept_dt"))) is not None
+            and coverage_start <= accepted <= coverage_end
+        )
+    }
+
+    def admit_family(values: set[str]) -> None:
+        exact = {
+            value for value in values if re.fullmatch(r"\d{14}", value)
+        }
+        # A verified manifest may retain extra immutable evidence, but only a
+        # family anchored by an official in-coverage list acceptance can
+        # extend the consumer scope beyond either coverage boundary.
+        if exact.intersection(in_coverage_receipts):
+            allowed.update(exact)
+
+    viewer = evidence_context.viewer_index
+    for evidence in viewer.values():
+        values = {
+            str(evidence.receipt_no),
+            str(evidence.revision_root_receipt_no),
+            str(evidence.economic_body_receipt_no),
+            *(str(value) for value in evidence.family_receipt_nos),
+            *(str(value) for value in evidence.official_family_order),
+            *(
+                str(value).partition(":")[0]
+                for value in evidence.attachment_keys
+            ),
+        }
+        admit_family(values)
+
+    support_manifest = root / SUPPORT_FAMILY_MANIFEST_RELATIVE_PATH
+    if support_manifest.is_file():
+        support = evidence_context.support_snapshot
+        if support is None:
+            raise RuntimeError("support-family manifest was not verified")
+        for entry in support.entries:
+            values = {
+                str(entry.root_receipt_no),
+                str(entry.terminal_receipt_no),
+                str(entry.terminal_economic_receipt_no),
+                *(str(value) for value in entry.ordered_family_receipts),
+                *(str(source.receipt_no) for source in entry.sources),
+            }
+            admit_family(values)
+    return allowed
+
+
+def _receipt_is_in_action_scope(
+    row: dict,
+    *,
+    coverage_start: date,
+    coverage_end: date,
+    lineage_receipts: set[str],
+) -> bool:
+    receipt = str(row.get("rcept_no") or "")
+    accepted = _parse_date(row.get("rcept_dt"))
+    if accepted is None:
+        raise RuntimeError(
+            "scoped DART action disclosure has no valid official rcept_dt: "
+            f"{receipt or '<missing>'}"
+        )
+    return (
+        coverage_start <= accepted <= coverage_end
+        or receipt in lineage_receipts
+    )
+
+
 def prepare(
     base: str,
     *,
     target_date: date | None = None,
+    coverage_start: date | None = None,
+    coverage_end: date | None = None,
 ) -> tuple[pd.DataFrame, dict]:
-    """로컬 Bronze에서 기업행사 증거를 읽고 표준 DataFrame과 통계를 반환한다."""
+    """로컬 Bronze에서 기업행사 증거를 읽고 표준 DataFrame과 통계를 반환한다.
+
+    A paired ``coverage_start``/``coverage_end`` makes publication scope
+    explicit.  Rows are then admitted by official list ``rcept_dt`` or by an
+    exact verified viewer/support family identity, never by receipt prefix or
+    by the mere presence of an out-of-range Bronze interval.
+    """
+    if (coverage_start is None) != (coverage_end is None):
+        raise ValueError("coverage_start/coverage_end must be provided together")
+    if (
+        coverage_start is not None
+        and coverage_end is not None
+        and coverage_end < coverage_start
+    ):
+        raise ValueError("coverage_end precedes coverage_start")
+    base = str(Path(base).expanduser().resolve())
+    evidence_context = _prepare_evidence_context(
+        base,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+    )
     records: list[dict] = []
-    disclosure_rows, disclosure_observation_audit = _disclosure_rows(
+    all_disclosure_rows, disclosure_observation_audit = _disclosure_rows(
         base, include_audit=True,
     )
+    lineage_receipts: set[str] = set()
+    if coverage_start is not None and coverage_end is not None:
+        lineage_receipts = _verified_lineage_receipts(
+            base,
+            coverage_start=coverage_start,
+            coverage_end=coverage_end,
+            disclosure_rows=all_disclosure_rows,
+            evidence_context=evidence_context,
+        )
+        disclosure_rows = [
+            (path, row)
+            for path, row in all_disclosure_rows
+            if _receipt_is_in_action_scope(
+                row,
+                coverage_start=coverage_start,
+                coverage_end=coverage_end,
+                lineage_receipts=lineage_receipts,
+            )
+        ]
+    else:
+        disclosure_rows = all_disclosure_rows
+    scoped_receipts = {
+        str(row.get("rcept_no") or "") for _, row in disclosure_rows
+    }
     related_cash_corrections = _related_cash_correction_signatures(
         base,
         disclosure_rows,
+        evidence_context=evidence_context,
     )
-    disclosure_by_receipt = {
+    all_disclosure_by_receipt = {
         str(row.get("rcept_no") or ""): row
-        for _, row in disclosure_rows
+        for _, row in all_disclosure_rows
     }
     structured_files = sorted(glob.glob(
         f"{base}/corporate_actions/dart/structured/"
         "event=*/year=*/corp=*/rcept=*.json"
     ))
+    scoped_structured_file_count = 0
     for path in structured_files:
         raw = _read_json(path)
-        disclosure = disclosure_by_receipt.get(
-            str(raw.get("rcept_no") or ""),
-            {},
-        )
+        receipt = str(raw.get("rcept_no") or "")
+        if coverage_start is not None and receipt not in scoped_receipts:
+            continue
+        disclosure = all_disclosure_by_receipt.get(receipt, {})
         parsed = _structured_row(
             path,
             raw,
             disclosure.get("report_nm"),
             disclosure.get("corp_cls"),
+            disclosure.get("rcept_dt"),
         )
         if parsed is not None:
             records.append(parsed)
+            scoped_structured_file_count += 1
 
     disclosure_count = 0
     related_correction_excluded = 0
     for path, row in disclosure_rows:
-        parsed = _disclosure_row(base, path, row)
+        parsed = _disclosure_row(
+            base, path, row, evidence_context=evidence_context,
+        )
         if parsed is not None:
             signature = (
                 normalize_krx_ticker(parsed["identifier"]),
@@ -1348,9 +1932,19 @@ def prepare(
             disclosure_count += 1
 
     if not records:
+        _assert_prepare_evidence_unchanged(evidence_context)
         return _empty(), {
             "row_count": 0,
             "structured_file_count": len(structured_files),
+            "scoped_structured_file_count": scoped_structured_file_count,
+            "coverage_excluded_structured_file_count": (
+                len(structured_files) - scoped_structured_file_count
+                if coverage_start is not None else 0
+            ),
+            "coverage_excluded_disclosure_count": (
+                len(all_disclosure_rows) - len(disclosure_rows)
+            ),
+            "verified_lineage_receipt_count": len(lineage_receipts),
             "disclosure_event_count": 0,
             "related_company_correction_excluded_count": (
                 related_correction_excluded
@@ -1373,9 +1967,19 @@ def prepare(
             | events["announcement_date"].between(lower, upper)
         )
         events = events[relevant].reset_index(drop=True)
+    _assert_prepare_evidence_unchanged(evidence_context)
     return events, {
         "row_count": len(events),
         "structured_file_count": len(structured_files),
+        "scoped_structured_file_count": scoped_structured_file_count,
+        "coverage_excluded_structured_file_count": (
+            len(structured_files) - scoped_structured_file_count
+            if coverage_start is not None else 0
+        ),
+        "coverage_excluded_disclosure_count": (
+            len(all_disclosure_rows) - len(disclosure_rows)
+        ),
+        "verified_lineage_receipt_count": len(lineage_receipts),
         "disclosure_event_count": disclosure_count,
         "effective_date_count": int(events["effective_date"].notna().sum()),
         "expected_factor_count": int(events["expected_factor"].notna().sum()),
@@ -1636,7 +2240,7 @@ def publish(
     )
     scale_support_action = (
         (
-            frame["source"].eq("DART_STRUCTURED")
+            frame["source"].isin(("DART_STRUCTURED", "DART_VIEWER"))
             & frame["action_type"].eq("bonus_issue")
         )
         | (

@@ -5,6 +5,8 @@ from uuid import uuid4
 import pandas as pd
 import pytest
 
+import pipeline.silver.dart_extra_load as dart_extra_load
+
 from pipeline.silver.dividend_evidence import (
     assert_verified_cash_evidence,
     invalid_cash_evidence_mask,
@@ -86,6 +88,111 @@ def test_reused_kind_support_with_conflicting_semantics_fails_closed():
         _manifest_support_action_candidates(
             _kind_scale_evidence(conflicting=True)
         )
+
+
+def _viewer_scale_evidence():
+    digest = "b" * 64
+    support = {
+        "evidence_key": "viewer",
+        "support_action_source": "DART_VIEWER",
+        "support_action_key": "20161216000097",
+        "support_action_type": "bonus_issue",
+        "target_cash_receipt_no": "20170216800001",
+        "target_adjustment_date": date(2016, 12, 28),
+        "support_action_body_path": (
+            "corporate_actions/dart/support_action_families/objects/"
+            f"sha256={digest}.html"
+        ),
+        "support_action_body_sha256": digest,
+        "support_announcement_date": date(2016, 12, 16),
+        "support_ex_date": date(2017, 1, 1),
+        "support_record_date": None,
+        "support_ratio_numerator": 0.02,
+        "support_ratio_denominator": 1.0,
+        "support_entitlement_security_class": "COMMON",
+        "support_distributed_security_class": "COMMON",
+        "support_expected_price_factor": 1.0 / 1.02,
+        "support_reference_price": None,
+        "support_reason": None,
+        "support_report_name": "주요사항보고서(무상증자결정)",
+        "support_action_scope": "ISSUER",
+        "support_semantic_role": "ADJUSTMENT_COMPONENT",
+    }
+    return SimpleNamespace(
+        frame=pd.DataFrame([{
+            "evidence_key": "viewer", "ticker": "001060",
+            "cash_receipt_no": "20170216800001",
+            "adjustment_trade_date": date(2016, 12, 28),
+        }]),
+        support_frame=pd.DataFrame([support]),
+    )
+
+
+def _viewer_stock_scale_evidence():
+    scale = _viewer_scale_evidence()
+    scale.frame.loc[0, "ticker"] = "032960"
+    changes = {
+        "support_action_key": "20151228900387",
+        "support_action_type": "stock_dividend",
+        "support_announcement_date": date(2015, 12, 28),
+        "support_ex_date": None,
+        "support_record_date": date(2015, 12, 31),
+        "support_ratio_numerator": 0.05,
+        "support_expected_price_factor": None,
+        "support_report_name": "[기재정정]주식배당결정",
+    }
+    for field, value in changes.items():
+        scale.support_frame.at[0, field] = value
+    return scale
+
+
+def test_viewer_bonus_support_becomes_exact_synthetic_corporate_action():
+    result = _manifest_support_action_candidates(_viewer_scale_evidence())
+
+    assert len(result) == 1
+    row = result.iloc[0]
+    assert row["source"] == "DART_VIEWER"
+    assert row["event_type"] == "bonus_issue"
+    assert row["rcept_no"] == "20161216000097"
+    assert row["effective_date"] == date(2017, 1, 1)
+    assert row["ratio_numerator"] == pytest.approx(0.02)
+    assert row["expected_factor"] == pytest.approx(1.0 / 1.02)
+    assert row["source_body_sha256"] == "b" * 64
+    assert row["viewer_evidence_sha256"] == "b" * 64
+    assert row["source_evidence_status"] == "VERIFIED_DART_VIEWER_BODY"
+
+
+def test_viewer_stock_support_becomes_exact_synthetic_corporate_action():
+    result = _manifest_support_action_candidates(_viewer_stock_scale_evidence())
+
+    assert len(result) == 1
+    row = result.iloc[0]
+    assert row["source"] == "DART_VIEWER"
+    assert row["event_type"] == "stock_dividend"
+    assert row["rcept_no"] == "20151228900387"
+    assert row["effective_date"] is None
+    assert row["record_date"] == date(2015, 12, 31)
+    assert row["ratio_numerator"] == pytest.approx(0.05)
+    assert pd.isna(row["expected_factor"])
+    assert row["source_evidence_status"] == "VERIFIED_DART_VIEWER_BODY"
+
+
+def test_viewer_stock_synthetic_action_rejects_bonus_semantic_drift():
+    scale = _viewer_stock_scale_evidence()
+    scale.support_frame.loc[0, "support_ex_date"] = date(2015, 12, 31)
+
+    with pytest.raises(RuntimeError, match="stock-dividend synthetic"):
+        _manifest_support_action_candidates(scale)
+
+
+def test_viewer_bonus_synthetic_action_rejects_cross_parent_or_class_drift():
+    scale = _viewer_scale_evidence()
+    scale.support_frame.loc[
+        0, "support_distributed_security_class"
+    ] = "PREFERRED"
+
+    with pytest.raises(RuntimeError, match="synthetic action semantics"):
+        _manifest_support_action_candidates(scale)
 
 
 def test_total_return_action_scope_is_minimal_and_issuer_only():
@@ -455,6 +562,35 @@ def test_alphanumeric_krx_cash_receipt_and_published_action_exact_parity(
 def test_cli_is_read_only_by_default_and_apply_is_explicit():
     assert parse_args([]).apply is False
     assert parse_args(["--apply"]).apply is True
+
+
+def test_cli_help_declares_direct_apply_disabled(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--help"])
+
+    help_text = capsys.readouterr().out
+    assert "standalone apply는 비활성화됨" in help_text
+    assert "closed orchestrator 전용" in help_text
+    assert "Standalone CLI apply" in dart_extra_load.__doc__
+
+
+def test_direct_apply_cli_is_disabled_in_favor_of_closed_orchestrator(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        dart_extra_load, "parse_args", lambda: SimpleNamespace(
+            src="local", base="/snapshot", total_return_actions_only=True,
+            apply=True, expected_coverage_end=date(2026, 8, 10),
+        ),
+    )
+    monkeypatch.setattr(
+        dart_extra_load,
+        "run",
+        lambda **kwargs: pytest.fail("unsafe standalone apply reached"),
+    )
+
+    with pytest.raises(RuntimeError, match="direct DART action --apply"):
+        dart_extra_load.main()
 
 
 def test_apply_requires_explicit_expected_snapshot_end(monkeypatch):

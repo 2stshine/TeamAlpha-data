@@ -13,17 +13,43 @@ import pytest
 from pipeline.silver import cash_adjustment_scale_builder as builder
 from pipeline.silver import cash_adjustment_scale_evidence as core_evidence
 from pipeline.silver import krx_kind_reference
+from pipeline.bronze import financials
 from pipeline.bronze import dart_support_action_families
 from pipeline.silver.cash_adjustment_scale_evidence import (
     MANIFEST_RELATIVE_PATH,
-    external_evidence_paths,
-    verify_source_evidence_manifest,
+    external_evidence_paths as _external_evidence_paths,
+    verify_source_evidence_manifest as _verify_source_evidence_manifest,
 )
 from pipeline.silver.dart_action_snapshot import (
     MANIFEST_RELATIVE_PATH as ACTION_SNAPSHOT_MANIFEST_RELATIVE_PATH,
     build_snapshot_manifest,
 )
 from pipeline.silver.total_return_audit import _validate_scale_source_rows
+
+
+def _family_bounds(base: str | Path) -> tuple[date, date]:
+    payload = json.loads(
+        (Path(base) / dart_support_action_families.MANIFEST_RELATIVE_PATH)
+        .read_text(encoding="utf-8")
+    )
+    return (
+        date.fromisoformat(payload["seed_coverage_start"]),
+        date.fromisoformat(payload["seed_coverage_end"]),
+    )
+
+
+def verify_source_evidence_manifest(base: str):
+    start, end = _family_bounds(base)
+    return _verify_source_evidence_manifest(
+        base, required_start=start, required_end=end,
+    )
+
+
+def external_evidence_paths(base: str):
+    start, end = _family_bounds(base)
+    return _external_evidence_paths(
+        base, required_start=start, required_end=end,
+    )
 
 
 def _sha(path: Path) -> str:
@@ -38,6 +64,21 @@ def _zip(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("document.xml", text)
+
+
+def _dart_numbered_notice(
+    *, ticker: str, effective: date, reference: str,
+    reason: str = "주식배당", security: str = "보통주식",
+) -> str:
+    return (
+        "<document><table><tr>"
+        "<td>1. 회사명</td><td>2. 주권종류</td><td>3. 단축코드</td>"
+        "<td>4. 기준가(원)</td><td>5. 배당락 실시일</td>"
+        "<td>6. 사유</td></tr><tr><td>테스트회사</td>"
+        f"<td>{security}</td><td>A{ticker}</td><td>{reference}</td>"
+        f"<td>{effective.isoformat()}</td><td>{reason}</td>"
+        "</tr></table></document>"
+    )
 
 
 def _event(
@@ -128,6 +169,95 @@ def _family(
         terminal_admissible=True,
         terminal_ratio=ratio,
         fresh_row_bind_digest="a" * 64,
+        sources=(source,),
+    )
+
+
+def _viewer_bonus_family(
+    root: Path,
+    *,
+    ticker: str,
+    receipt: str,
+    ratio: float,
+    record_date: date,
+):
+    body = (
+        "<html><body><table>"
+        f"<tr><td>4. 신주배정기준일</td><td>{record_date.isoformat()}</td></tr>"
+        "<tr><td>5. 1주당 신주배정 주식수</td>"
+        f"<td>보통주식 (주)</td><td>{ratio}</td></tr>"
+        "</table></body></html>"
+    ).encode()
+    digest = hashlib.sha256(body).hexdigest()
+    path = root / (
+        "corporate_actions/dart/support_action_families/objects/"
+        f"sha256={digest}.html"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    source = SimpleNamespace(
+        receipt_no=receipt,
+        report_name="주요사항보고서(무상증자결정)",
+        receipt_date=receipt[:4] + "-" + receipt[4:6] + "-" + receipt[6:8],
+        body_path=path.relative_to(root).as_posix(),
+        body_content_length=len(body),
+        body_sha256=digest,
+        structured_path=None,
+        structured_sha256=None,
+    )
+    return SimpleNamespace(
+        ticker=ticker,
+        action_type="bonus_issue",
+        root_receipt_no=receipt,
+        terminal_receipt_no=receipt,
+        terminal_economic_receipt_no=receipt,
+        ordered_family_receipts=(receipt,),
+        terminal_status="ACTIVE",
+        terminal_admissible=True,
+        terminal_ratio=ratio,
+        fresh_row_bind_digest="b" * 64,
+        sources=(source,),
+    )
+
+
+def _viewer_stock_dividend_family(root: Path):
+    ticker = "032960"
+    receipt = "20151228900387"
+    body = (
+        "<html><body><table>"
+        "<tr><td>1. 1주당 배당주식수 (주)</td>"
+        "<td>보통주식</td><td>0.05</td></tr>"
+        "<tr><td>4. 배당기준일</td><td>2015-12-31</td></tr>"
+        "</table></body></html>"
+    ).encode()
+    digest = hashlib.sha256(body).hexdigest()
+    path = root / (
+        "corporate_actions/dart/support_action_families/objects/"
+        f"sha256={digest}.html"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    source = SimpleNamespace(
+        receipt_no=receipt,
+        report_name="[기재정정]주식배당결정",
+        receipt_date="2015-12-28",
+        body_path=path.relative_to(root).as_posix(),
+        body_content_length=len(body),
+        body_sha256=digest,
+        structured_path=None,
+        structured_sha256=None,
+    )
+    return SimpleNamespace(
+        ticker=ticker,
+        action_type="stock_dividend",
+        root_receipt_no="20151216900093",
+        terminal_receipt_no=receipt,
+        terminal_economic_receipt_no=receipt,
+        ordered_family_receipts=(receipt, "20151216900093"),
+        terminal_status="ACTIVE",
+        terminal_admissible=True,
+        terminal_ratio=0.05,
+        fresh_row_bind_digest="c" * 64,
         sources=(source,),
     )
 
@@ -239,7 +369,9 @@ def _006800_fixture(root: Path):
         "cash_amounts": json.dumps([300.0]),
         "record_dates": json.dumps([record_date.isoformat()]),
         "previous_close": 69_500.0,
+        "previous_adj_close": 69_200.0,
         "applied_close": 70_900.0,
+        "applied_adj_close": 70_900.0,
         "source_adjustment_factor": 69_200.0 / 69_500.0,
     }]).itertuples(index=False).__next__()
     return overlap, events, {previous_date: previous, adjustment_date: applied}
@@ -420,7 +552,11 @@ def _write_official_006800_family_snapshot(root: Path):
         return bodies[receipt]
 
     return dart_support_action_families.collect_support_action_families(
-        root, apply=True, fetcher=fetcher,
+        root,
+        coverage_start=date(2026, 1, 1),
+        coverage_end=date(2026, 12, 31),
+        apply=True,
+        fetcher=fetcher,
     )
 
 
@@ -488,6 +624,31 @@ def test_006800_numeric_cash_coincidence_cannot_replace_official_stock_family(tm
     assert reference["support_action_key"] == "20260313001262"
     assert reference["support_entitlement_security_class"] == "COMMON"
     assert reference["support_reference_price"] == 69_200.0
+
+
+def test_builder_reference_factor_uses_stored_price_rounding_interval(tmp_path):
+    overlap, events, prices = _006800_fixture(tmp_path)
+    kind = _write_006800_kind_support(tmp_path)
+    rounded = overlap._replace(
+        previous_adj_close=23_066.6667,
+        applied_adj_close=23_633.3333,
+        source_adjustment_factor=(23_066.6667 / 69_500.0)
+        / (23_633.3333 / 70_900.0),
+    )
+    observed = 69_200.0 / 69_500.0
+
+    assert abs(observed - rounded.source_adjustment_factor) > 5e-13
+    parent, _ = builder._build_one(
+        tmp_path,
+        rounded,
+        events=events,
+        viewer_by_receipt={},
+        kind_supports=kind,
+        support_families=_006800_families(events),
+        prices=prices,
+    )
+
+    assert parent["expected_price_factor"] == pytest.approx(observed)
 
 
 def test_006800_parent_roundtrips_through_frozen_core_verifier(tmp_path):
@@ -651,6 +812,10 @@ def test_core_price_receipt_rejects_parent_identity_conflict(tmp_path, field):
 
 def test_action_snapshot_hashes_price_head_receipt_manifest(tmp_path):
     _write_verified_scale_fixture(tmp_path)
+    corp_codes = tmp_path / financials.CORPCODE_BRONZE_PATH
+    if not corp_codes.is_file():
+        corp_codes.parent.mkdir(parents=True, exist_ok=True)
+        corp_codes.write_text("<result></result>", encoding="utf-8")
 
     build_snapshot_manifest(
         str(tmp_path), coverage_start=date(2026, 1, 1),
@@ -709,6 +874,231 @@ def test_plain_ex_notice_cannot_substitute_for_non_cash_component(tmp_path):
             kind_supports=[],
             support_families=[],
             prices=prices,
+        )
+
+
+def test_labelled_notice_ignores_unrelated_payload_and_binds_exact_table(tmp_path):
+    path = tmp_path / "notice.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("correction.xml", "<document>정정 첨부 문서</document>")
+        archive.writestr(
+            "notice.xml",
+            _dart_numbered_notice(
+                ticker="038680", effective=date(2024, 12, 27),
+                reference="4,200",
+            ),
+        )
+
+    notice = builder._labelled_notice(path)
+
+    assert notice.ticker == "038680"
+    assert notice.security_class == "COMMON"
+    assert notice.effective_date == date(2024, 12, 27)
+    assert notice.reference_price == 4_200.0
+    assert notice.reason == "주식배당"
+
+
+def test_labelled_notice_isolates_incomplete_marker_attachment(tmp_path):
+    path = tmp_path / "notice.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "correction.xml",
+            "<document><table><tr><td>5. 배당락 실시일</td>"
+            "<td>2024-12-27</td></tr></table></document>",
+        )
+        archive.writestr(
+            "notice.xml",
+            _dart_numbered_notice(
+                ticker="038680", effective=date(2024, 12, 27),
+                reference="4,200",
+            ),
+        )
+
+    notice = builder._labelled_notice(path)
+
+    assert notice.ticker == "038680"
+    assert notice.reference_price == 4_200.0
+
+
+def test_labelled_notice_rejects_incomplete_marker_only(tmp_path):
+    path = tmp_path / "notice.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "correction.xml",
+            "<document><table><tr><td>5. 배당락 실시일</td>"
+            "<td>2024-12-27</td></tr></table></document>",
+        )
+
+    with pytest.raises(
+        krx_kind_reference.DartDetachmentNoticeNotFound,
+        match="absent",
+    ):
+        builder._labelled_notice(path)
+
+
+def test_labelled_notice_rejects_two_distinct_exact_payloads(tmp_path):
+    path = tmp_path / "notice.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, reference in (("first.xml", "4,200"), ("second.xml", "4,210")):
+            archive.writestr(
+                name,
+                _dart_numbered_notice(
+                    ticker="038680", effective=date(2024, 12, 27),
+                    reference=reference,
+                ),
+            )
+
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        builder._labelled_notice(path)
+
+
+def test_corroborations_skip_non_notice_candidate_and_bind_exact_identity(tmp_path):
+    ticker = "038680"
+    adjustment = date(2024, 12, 27)
+    paths = [
+        tmp_path / (
+            "corporate_actions/dart/documents/year=2024/corp=038680/"
+            f"rcept={receipt}.zip"
+        )
+        for receipt in ("20241226900001", "20241226901050")
+    ]
+    _zip(paths[0], "<document>[기재정정] 첨부 문서</document>")
+    _zip(paths[1], _dart_numbered_notice(
+        ticker=ticker, effective=adjustment, reference="4,200",
+    ))
+    events = [
+        _event(
+            tmp_path, ticker=ticker, receipt=receipt,
+            event_type="ex_dividend", body=path,
+            announcement=date(2024, 12, 26), effective=adjustment,
+            report=report,
+        )
+        for receipt, path, report in (
+            ("20241226900001", paths[0], "[기재정정]배당락(주식배당)"),
+            ("20241226901050", paths[1], "배당락(주식배당)"),
+        )
+    ]
+
+    supports, groups = builder._corroborations(
+        tmp_path,
+        events,
+        ticker=ticker,
+        asset_name="에스넷",
+        adjustment_date=adjustment,
+        raw_reference=4_200.0,
+        evidence_key="038680:test",
+        cash_receipt_no="20250310000001",
+        groups_by_kind={"stock": ["stock-group"], "bonus": []},
+    )
+
+    assert [row["support_action_key"] for row in supports] == [
+        "20241226901050"
+    ]
+    assert groups == {"stock-group"}
+
+
+@pytest.mark.parametrize(
+    ("body_ticker", "security", "body_date", "reference", "error"),
+    [
+        ("000000", "보통주식", date(2024, 12, 27), "4,200", "identity"),
+        ("038680", "우선주", date(2024, 12, 27), "4,200", "identity"),
+        ("038680", "보통주식", date(2024, 12, 30), "4,200", "identity"),
+        ("038680", "보통주식", date(2024, 12, 27), "4,210", "reference"),
+    ],
+)
+def test_corroboration_notice_identity_mismatch_fails_closed(
+    tmp_path, body_ticker, security, body_date, reference, error,
+):
+    path = tmp_path / (
+        "corporate_actions/dart/documents/year=2024/corp=038680/"
+        "rcept=20241226901050.zip"
+    )
+    _zip(path, _dart_numbered_notice(
+        ticker=body_ticker, effective=body_date, reference=reference,
+        security=security,
+    ))
+    event = _event(
+        tmp_path, ticker="038680", receipt="20241226901050",
+        event_type="ex_dividend", body=path,
+        announcement=date(2024, 12, 26), effective=date(2024, 12, 27),
+        report="배당락(주식배당)",
+    )
+
+    with pytest.raises(RuntimeError, match=error):
+        builder._corroborations(
+            tmp_path,
+            [event],
+            ticker="038680",
+            asset_name="에스넷",
+            adjustment_date=date(2024, 12, 27),
+            raw_reference=4_200.0,
+            evidence_key="038680:test",
+            cash_receipt_no="20250310000001",
+            groups_by_kind={"stock": ["stock-group"], "bonus": []},
+        )
+
+
+def test_corroboration_uses_exact_notice_reason_not_disclosure_title(tmp_path):
+    path = tmp_path / (
+        "corporate_actions/dart/documents/year=2024/corp=038680/"
+        "rcept=20241226901050.zip"
+    )
+    _zip(path, _dart_numbered_notice(
+        ticker="038680", effective=date(2024, 12, 27),
+        reference="4,200", reason="현금배당",
+    ))
+    event = _event(
+        tmp_path, ticker="038680", receipt="20241226901050",
+        event_type="ex_dividend", body=path,
+        announcement=date(2024, 12, 26), effective=date(2024, 12, 27),
+        report="배당락(주식배당)",
+    )
+
+    supports, groups = builder._corroborations(
+        tmp_path,
+        [event],
+        ticker="038680",
+        asset_name="에스넷",
+        adjustment_date=date(2024, 12, 27),
+        raw_reference=4_200.0,
+        evidence_key="038680:test",
+        cash_receipt_no="20250310000001",
+        groups_by_kind={"stock": ["stock-group"], "bonus": []},
+    )
+
+    assert supports == []
+    assert groups == set()
+
+
+def test_two_exact_notice_candidates_for_one_group_fail_closed(tmp_path):
+    events = []
+    for receipt in ("20241226901050", "20241226901051"):
+        path = tmp_path / (
+            "corporate_actions/dart/documents/year=2024/corp=038680/"
+            f"rcept={receipt}.zip"
+        )
+        _zip(path, _dart_numbered_notice(
+            ticker="038680", effective=date(2024, 12, 27),
+            reference="4,200",
+        ))
+        events.append(_event(
+            tmp_path, ticker="038680", receipt=receipt,
+            event_type="ex_dividend", body=path,
+            announcement=date(2024, 12, 26), effective=date(2024, 12, 27),
+            report="배당락(주식배당)",
+        ))
+
+    with pytest.raises(RuntimeError, match="ambiguous for a component"):
+        builder._corroborations(
+            tmp_path,
+            events,
+            ticker="038680",
+            asset_name="에스넷",
+            adjustment_date=date(2024, 12, 27),
+            raw_reference=4_200.0,
+            evidence_key="038680:test",
+            cash_receipt_no="20250310000001",
+            groups_by_kind={"stock": ["stock-group"], "bonus": []},
         )
 
 
@@ -988,6 +1378,206 @@ def test_same_target_inadmissible_support_family_holds_parent(tmp_path):
         )
 
 
+def test_viewer_backed_bonus_family_supplies_missing_structured_component(
+    tmp_path,
+):
+    family = _viewer_bonus_family(
+        tmp_path,
+        ticker="001060",
+        receipt="20161216000097",
+        ratio=0.02,
+        record_date=date(2017, 1, 1),
+    )
+
+    components, groups, diagnostic = builder._component_supports(
+        tmp_path,
+        [],
+        [],
+        [family],
+        ticker="001060",
+        record_date=date(2016, 12, 31),
+        adjustment_date=date(2016, 12, 28),
+        evidence_key="001060:2016-12-28",
+        cash_receipt_no="20170217800213",
+    )
+
+    assert len(components) == 1
+    component = components[0]
+    assert component["support_action_source"] == "DART_VIEWER"
+    assert component["support_action_key"] == "20161216000097"
+    assert component["support_action_type"] == "bonus_issue"
+    assert component["support_ex_date"] == date(2017, 1, 1)
+    assert component["support_ratio_numerator"] == pytest.approx(0.02)
+    assert component["support_expected_price_factor"] == pytest.approx(
+        1 / 1.02,
+    )
+    assert component["support_action_body_path"] == family.sources[0].body_path
+    assert groups["bonus"]
+    assert diagnostic["bonus_family_root_receipt"] == "20161216000097"
+
+
+def test_viewer_backed_bonus_family_rejects_body_tamper(tmp_path):
+    family = _viewer_bonus_family(
+        tmp_path,
+        ticker="060560",
+        receipt="20170919000279",
+        ratio=1.0,
+        record_date=date(2017, 10, 1),
+    )
+    body = tmp_path / family.sources[0].body_path
+    body.write_bytes(body.read_bytes().replace(b"1.0", b"0.5"))
+
+    with pytest.raises(RuntimeError, match="body changed"):
+        builder._component_supports(
+            tmp_path,
+            [],
+            [],
+            [family],
+            ticker="060560",
+            record_date=date(2017, 9, 30),
+            adjustment_date=date(2017, 9, 28),
+            evidence_key="060560:2017-09-28",
+            cash_receipt_no="20170919900263",
+        )
+
+
+def test_viewer_backed_stock_dividend_family_supplies_corrected_component(
+    tmp_path,
+):
+    family = _viewer_stock_dividend_family(tmp_path)
+
+    components, groups, diagnostic = builder._component_supports(
+        tmp_path,
+        [],
+        [],
+        [family],
+        ticker="032960",
+        record_date=date(2015, 12, 31),
+        adjustment_date=date(2015, 12, 29),
+        evidence_key="032960:2015-12-29",
+        cash_receipt_no="20160229800375",
+    )
+
+    assert len(components) == 1
+    component = components[0]
+    assert component["support_action_source"] == "DART_VIEWER"
+    assert component["support_action_key"] == "20151228900387"
+    assert component["support_action_type"] == "stock_dividend"
+    assert component["support_ex_date"] is None
+    assert component["support_record_date"] == date(2015, 12, 31)
+    assert component["support_ratio_numerator"] == pytest.approx(0.05)
+    assert component["support_expected_price_factor"] is None
+    assert groups["stock"] == [
+        "032960|2015-12-31|STOCK_DIVIDEND|0.05"
+    ]
+    assert diagnostic["stock_family_root_receipt"] == "20151216900093"
+
+
+def test_viewer_stock_dividend_family_rejects_unreviewed_or_tampered_identity(
+    tmp_path,
+):
+    family = _viewer_stock_dividend_family(tmp_path)
+    family.root_receipt_no = "20151216900094"
+
+    with pytest.raises(RuntimeError, match="no official non-cash"):
+        builder._component_supports(
+            tmp_path, [], [], [family], ticker="032960",
+            record_date=date(2015, 12, 31),
+            adjustment_date=date(2015, 12, 29),
+            evidence_key="032960:2015-12-29",
+            cash_receipt_no="20160229800375",
+        )
+
+    family = _viewer_stock_dividend_family(tmp_path)
+    body = tmp_path / family.sources[0].body_path
+    body.write_bytes(body.read_bytes().replace(b"0.05", b"0.06"))
+    with pytest.raises(RuntimeError, match="body changed"):
+        builder._component_supports(
+            tmp_path, [], [], [family], ticker="032960",
+            record_date=date(2015, 12, 31),
+            adjustment_date=date(2015, 12, 29),
+            evidence_key="032960:2015-12-29",
+            cash_receipt_no="20160229800375",
+        )
+
+
+def test_cross_class_dart_family_defers_only_to_exact_kind_component(tmp_path):
+    receipt = "20181221800001"
+    record = date(2018, 12, 31)
+    body = tmp_path / (
+        "corporate_actions/dart/documents/year=2018/corp=001040/"
+        f"rcept={receipt}.zip"
+    )
+    _zip(body, "<document>주식배당결정 배당기준일 2018-12-31 종류주식 0.15</document>")
+    event = _event(
+        tmp_path,
+        ticker="001040",
+        receipt=receipt,
+        event_type="stock_dividend",
+        body=body,
+        announcement=date(2018, 12, 21),
+        record=record,
+        report="[기재정정]주식배당결정",
+    )
+    source = SimpleNamespace(
+        receipt_no=receipt,
+        report_name=event["report_name"],
+        receipt_date="2018-12-21",
+        body_path=body.relative_to(tmp_path).as_posix(),
+        body_content_length=body.stat().st_size,
+        body_sha256=_sha(body),
+        structured_path=None,
+        structured_sha256=None,
+    )
+    family = SimpleNamespace(
+        ticker="001040",
+        action_type="stock_dividend",
+        root_receipt_no="20181220800750",
+        terminal_receipt_no=receipt,
+        terminal_economic_receipt_no=receipt,
+        ordered_family_receipts=(receipt, "20181220800750"),
+        terminal_status="CROSS_CLASS_DISTRIBUTION",
+        terminal_admissible=False,
+        terminal_ratio=None,
+        fresh_row_bind_digest="c" * 64,
+        sources=(source,),
+    )
+    kind = {
+        "ticker": "001040",
+        "support_semantic_role": "ADJUSTMENT_COMPONENT",
+        "support_action_type": "stock_dividend",
+        "target_cash_receipt_no": "20190211800997",
+        "target_adjustment_date": "2018-12-27",
+        "support_record_date": "2018-12-31",
+        "support_report_name": krx_kind_reference.KIND_COMPONENT_REPORT_NAME_61474,
+        "support_ratio_numerator": 0.15,
+        "support_ratio_denominator": 1.0,
+        "support_action_key": "20181220002252",
+        "support_announcement_date": "2018-12-21",
+        "support_action_body_path": "corporate_actions/krx/kind/body.html",
+        "support_action_body_sha256": "d" * 64,
+        "support_entitlement_security_class": "COMMON_AND_PREFERRED",
+        "support_distributed_security_class": "NEW_PREFERRED",
+        "support_expected_price_factor": None,
+    }
+
+    components, _, _ = builder._component_supports(
+        tmp_path,
+        [event],
+        [kind],
+        [family],
+        ticker="001040",
+        record_date=record,
+        adjustment_date=date(2018, 12, 27),
+        evidence_key="001040:2018-12-27",
+        cash_receipt_no="20190211800997",
+    )
+
+    assert len(components) == 1
+    assert components[0]["support_action_source"] == "KRX_KIND"
+    assert components[0]["support_action_key"] == "20181220002252"
+
+
 def test_iwin_composite_notice_corroborates_two_distinct_components(tmp_path):
     ticker = "090150"
     record = date(2021, 12, 31)
@@ -1003,9 +1593,12 @@ def test_iwin_composite_notice_corroborates_two_distinct_components(tmp_path):
     _zip(
         combined,
         "<document>권배락<table>"
-        "<tr><td>권배락 실시일</td><td>2021-12-29</td></tr>"
-        "<tr><td>기준가격</td><td>4960</td></tr>"
-        "<tr><td>사유</td><td>무상증자 및 배당</td></tr></table></document>",
+        '<tr><td>1. 권배락 실시일</td><td colspan="4">2021-12-29</td></tr>'
+        '<tr><td>2. 권배락 사유</td><td colspan="4">무상증자 및 배당</td></tr>'
+        '<tr><td rowspan="2">3. 권배락 내역</td><td>회사명</td>'
+        '<td>주권종류</td><td>단축코드</td><td>기준가(원)</td></tr>'
+        '<tr><td>광진윈텍</td><td>보통주식</td><td>A090150</td>'
+        '<td>4,960</td></tr></table></document>',
     )
     events = [
         _event(
@@ -1350,7 +1943,7 @@ def test_atomic_manifest_publish_restores_previous_on_second_read_failure(
     destination.write_bytes(b"previous-canonical-manifest")
     calls = []
 
-    def fake_verify(_base):
+    def fake_verify(_base, **_kwargs):
         calls.append(len(calls))
         return SimpleNamespace(
             row_count=1,
@@ -1362,6 +1955,8 @@ def test_atomic_manifest_publish_restores_previous_on_second_read_failure(
         builder._publish_source_manifest(
             tmp_path,
             {"schema_version": "fixture"},
+            coverage_start=date(2026, 1, 1),
+            coverage_end=date(2026, 12, 31),
             expected_parent_count=1,
         )
 

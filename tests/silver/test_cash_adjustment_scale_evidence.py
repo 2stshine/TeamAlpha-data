@@ -4,6 +4,7 @@ import zipfile
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
@@ -12,6 +13,19 @@ import pytest
 
 from pipeline.silver import cash_adjustment_scale_evidence as evidence
 from pipeline.bronze import dart_support_action_families
+
+
+def _verify(base: str | Path):
+    root = Path(base)
+    payload = json.loads(
+        (root / dart_support_action_families.MANIFEST_RELATIVE_PATH)
+        .read_text(encoding="utf-8")
+    )
+    return evidence.verify_source_evidence_manifest(
+        str(root),
+        required_start=date.fromisoformat(payload["seed_coverage_start"]),
+        required_end=date.fromisoformat(payload["seed_coverage_end"]),
+    )
 
 
 def _sha(path: Path) -> str:
@@ -29,6 +43,79 @@ def _zip(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("document.xml", text)
+
+
+def _dart_numbered_notice(
+    *,
+    ticker: str = "005950",
+    effective: date = date(2021, 12, 29),
+    reference: str = "4,960",
+    reason: str = "주식배당",
+    security: str = "보통주식",
+    date_label: str = "배당락 실시일",
+) -> str:
+    return (
+        "<document><table><tr>"
+        "<td>1. 회사명</td><td>2. 주권종류</td><td>3. 단축코드</td>"
+        f"<td>4. 기준가(원)</td><td>5. {date_label}</td>"
+        "<td>6. 사유</td></tr><tr><td>테스트회사</td>"
+        f"<td>{security}</td><td>A{ticker}</td><td>{reference}</td>"
+        f"<td>{effective.isoformat()}</td><td>{reason}</td>"
+        "</tr></table></document>"
+    )
+
+
+def _numbered_notice_support(
+    root: Path,
+    *,
+    reason: str = "주식배당",
+    action_type: str = "ex_dividend",
+    date_label: str = "배당락 실시일",
+    groups: tuple[str, ...] = (
+        "005950|2021-12-31|STOCK_DIVIDEND|0.1",
+    ),
+) -> tuple[dict, dict, Path]:
+    body = (
+        root / "corporate_actions/dart/documents/year=2021/corp=005950"
+        / "rcept=20211228900001.zip"
+    )
+    _zip(body, _dart_numbered_notice(
+        reason=reason, date_label=date_label,
+    ))
+    row = _support(
+        key="20211228900001", source="DART_DISCLOSURE",
+        action_type=action_type, path=str(body.relative_to(root)),
+        body_sha=_sha(body), report="배당락", groups=list(groups),
+        role="CORROBORATION", announcement=date(2021, 12, 28),
+        ex_date=date(2021, 12, 29), reference=4_960, reason=reason,
+        entitlement="COMMON",
+    )
+    parent = {
+        "ticker": "005950",
+        "adjustment_trade_date": date(2021, 12, 29),
+        "raw_reference_price": 4_960,
+    }
+    return parent, row, body
+
+
+def _legacy_combined_notice(
+    *,
+    ticker: str = "005950",
+    effective: date = date(2021, 12, 29),
+    reference: str = "4,960",
+    reason: str = "무상증자 및 배당",
+    security: str = "보통주식",
+) -> str:
+    return (
+        "<document>권배락<table>"
+        f"<tr><td>1. 권배락 실시일</td><td>{effective.isoformat()}</td></tr>"
+        f"<tr><td>2. 권배락 사유</td><td>{reason}</td></tr>"
+        "<tr><td>3. 권배락 내역</td><td>회사명</td>"
+        "<td>주권종류</td><td>단축코드</td><td>기준가(원)</td></tr>"
+        f"<tr><td></td><td>삼성전자</td><td>{security}</td>"
+        f"<td>A{ticker}</td><td>{reference}</td></tr>"
+        "</table></document>"
+    )
 
 
 def _support(
@@ -72,7 +159,8 @@ def _write_support_families(root: Path) -> None:
         {
             "rcept_no": "20211217000406", "rcept_dt": "20211217",
             "stock_code": "005950", "corp_code": "00100001",
-            "corp_cls": "Y", "report_nm": "무상증자결정",
+            "corp_cls": "Y",
+            "report_nm": "주요사항보고서(무상증자결정)",
         },
         {
             "rcept_no": "20211224900781", "rcept_dt": "20211224",
@@ -133,7 +221,10 @@ def _write_support_families(root: Path) -> None:
         return bodies[receipt]
 
     dart_support_action_families.collect_support_action_families(
-        root, apply=True, fetcher=fetcher,
+        root,
+        coverage_end=date(2026, 12, 31),
+        apply=True,
+        fetcher=fetcher,
     )
 
 
@@ -157,9 +248,12 @@ def _fixture(root: Path):
     _zip(
         combined,
         "<document>권배락<table>"
-        "<tr><td>권배락 실시일</td><td>2021-12-29</td></tr>"
-        "<tr><td>기준가격</td><td>4,960</td></tr>"
-        "<tr><td>사유</td><td>무상증자 및 배당</td></tr>"
+        "<tr><td>1. 권배락 실시일</td><td>2021-12-29</td></tr>"
+        "<tr><td>2. 권배락 사유</td><td>무상증자 및 배당</td></tr>"
+        "<tr><td>3. 권배락 내역</td><td>회사명</td>"
+        "<td>주권종류</td><td>단축코드</td><td>기준가(원)</td></tr>"
+        "<tr><td></td><td>삼성전자</td><td>보통주식</td>"
+        "<td>A005950</td><td>4,960</td></tr>"
         "</table></document>",
     )
     previous = root / "stock/marcap/date=2021-12-28/all.parquet"
@@ -183,7 +277,7 @@ def _fixture(root: Path):
             key="20211217000406", source="DART_STRUCTURED",
             action_type="bonus_issue",
             path=str(bonus.relative_to(root)), body_sha=_sha(bonus),
-            report="무상증자결정", groups=[bonus_group],
+            report="주요사항보고서(무상증자결정)", groups=[bonus_group],
             role="ADJUSTMENT_COMPONENT", expected=0.5,
             ratio_numerator=1.0, ratio_denominator=1.0,
             entitlement="COMMON", distributed="COMMON",
@@ -310,6 +404,273 @@ def test_public_manifest_row_digest_helpers_match_frozen_contract(tmp_path):
         ]
 
 
+def test_manifest_accepts_generic_numbered_dart_dividend_notice(tmp_path):
+    _, _, manifest_path = _fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_bytes())
+    notice = manifest["evidence"][0]["support_actions"][2]
+    body = tmp_path / notice["support_action_body_path"]
+    _zip(body, _dart_numbered_notice())
+    stock_group = manifest["evidence"][0]["support_actions"][1][
+        "support_semantic_group_keys"
+    ]
+    notice.update({
+        "support_action_type": "ex_dividend",
+        "support_action_body_sha256": _sha(body),
+        "support_report_name": "배당락",
+        "support_semantic_group_keys": stock_group,
+        "support_reason": "주식배당",
+    })
+    _refresh_manifest(manifest_path, manifest)
+
+    verified = _verify(str(tmp_path))
+
+    exact = verified.support_frame[
+        verified.support_frame["support_action_key"].eq("20211228900755")
+    ].iloc[0]
+    assert exact["support_action_type"] == "ex_dividend"
+    assert exact["support_report_name"] == "배당락"
+
+
+def test_manifest_accepts_valid_notice_beside_incomplete_correction(tmp_path):
+    _, _, manifest_path = _fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_bytes())
+    notice = manifest["evidence"][0]["support_actions"][2]
+    body = tmp_path / notice["support_action_body_path"]
+    with zipfile.ZipFile(body, "w") as archive:
+        archive.writestr(
+            "correction.xml",
+            "<document><table><tr><td>5. 배당락 실시일</td>"
+            "<td>2021-12-29</td></tr></table></document>",
+        )
+        archive.writestr("notice.xml", _dart_numbered_notice())
+    stock_group = manifest["evidence"][0]["support_actions"][1][
+        "support_semantic_group_keys"
+    ]
+    notice.update({
+        "support_action_type": "ex_dividend",
+        "support_action_body_sha256": _sha(body),
+        "support_report_name": "배당락",
+        "support_semantic_group_keys": stock_group,
+        "support_reason": "주식배당",
+    })
+    _refresh_manifest(manifest_path, manifest)
+
+    assert _verify(str(tmp_path)).row_count == 1
+
+
+@pytest.mark.parametrize(
+    ("reason", "action_type", "date_label", "group"),
+    [
+        (
+            "현금배당", "ex_dividend", "배당락 실시일",
+            "005950|2021-12-31|STOCK_DIVIDEND|0.1",
+        ),
+        (
+            "유상증자", "rights_detachment", "권리락 실시일",
+            "005950|2021-12-31|BONUS_ISSUE|1",
+        ),
+    ],
+)
+def test_evidence_rejects_notice_reason_group_forgery(
+    tmp_path, reason, action_type, date_label, group,
+):
+    parent, row, _ = _numbered_notice_support(
+        tmp_path, reason=reason, action_type=action_type,
+        date_label=date_label, groups=(group,),
+    )
+
+    with pytest.raises(RuntimeError, match="reason/group semantics"):
+        evidence._verify_support_body(tmp_path, parent, row)
+
+
+def test_support_body_swap_after_frozen_read_fails_closed(tmp_path, monkeypatch):
+    parent, row, body = _numbered_notice_support(tmp_path)
+    forged = tmp_path / "forged.zip"
+    _zip(
+        forged,
+        _dart_numbered_notice().replace("테스트회사", "동기화위조회사"),
+    )
+    forged_bytes = forged.read_bytes()
+    original = evidence._read_regular_file_no_follow
+    calls = 0
+
+    def swap_after_first_read(path):
+        nonlocal calls
+        payload, identity = original(path)
+        calls += 1
+        if calls == 1:
+            body.write_bytes(forged_bytes)
+        return payload, identity
+
+    monkeypatch.setattr(
+        evidence, "_read_regular_file_no_follow", swap_after_first_read,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="changed (?:while being frozen|during verification)",
+    ):
+        evidence._verify_support_body(tmp_path, parent, row)
+
+
+def test_support_body_symlink_is_rejected(tmp_path):
+    parent, row, body = _numbered_notice_support(tmp_path)
+    target = tmp_path / "immutable-target.zip"
+    target.write_bytes(body.read_bytes())
+    body.unlink()
+    body.symlink_to(target)
+
+    with pytest.raises(RuntimeError, match="contains a symlink"):
+        evidence._verify_support_body(tmp_path, parent, row)
+
+
+def test_invocation_end_gate_rejects_post_validation_support_swap(
+    tmp_path, monkeypatch,
+):
+    _, supports, _ = _fixture(tmp_path)
+    target = tmp_path / supports[0]["support_action_body_path"]
+    forged = target.read_bytes() + b"\n"
+    original = evidence._validate_support_family_bindings
+
+    def swap_after_family_validation(*args, **kwargs):
+        result = original(*args, **kwargs)
+        target.write_bytes(forged)
+        return result
+
+    monkeypatch.setattr(
+        evidence,
+        "_validate_support_family_bindings",
+        swap_after_family_validation,
+    )
+
+    with pytest.raises(RuntimeError, match="changed during verification"):
+        _verify(tmp_path)
+
+
+def test_invocation_end_gate_rejects_source_manifest_swap(
+    tmp_path, monkeypatch,
+):
+    _, _, manifest_path = _fixture(tmp_path)
+    original = evidence._validate_kind_support_bindings
+
+    def swap_after_semantic_validation(*args, **kwargs):
+        result = original(*args, **kwargs)
+        manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+        return result
+
+    monkeypatch.setattr(
+        evidence,
+        "_validate_kind_support_bindings",
+        swap_after_semantic_validation,
+    )
+
+    with pytest.raises(RuntimeError, match="changed during verification"):
+        _verify(tmp_path)
+
+
+def test_invocation_end_gate_rejects_support_family_manifest_swap(
+    tmp_path, monkeypatch,
+):
+    _fixture(tmp_path)
+    support_manifest = (
+        tmp_path / dart_support_action_families.MANIFEST_RELATIVE_PATH
+    )
+    original = evidence._validate_support_family_bindings
+    mutated = False
+
+    def swap_after_family_validation(*args, **kwargs):
+        nonlocal mutated
+        result = original(*args, **kwargs)
+        if not mutated:
+            support_manifest.write_bytes(support_manifest.read_bytes() + b"\n")
+            mutated = True
+        return result
+
+    monkeypatch.setattr(
+        evidence,
+        "_validate_support_family_bindings",
+        swap_after_family_validation,
+    )
+
+    with pytest.raises(RuntimeError, match="changed during verification"):
+        _verify(tmp_path)
+
+
+def test_invocation_end_gate_rejects_kind_manifest_appearing(
+    tmp_path, monkeypatch,
+):
+    _fixture(tmp_path)
+    kind_manifest = tmp_path / evidence.KIND_SUPPORT_MANIFEST_RELATIVE_PATH
+    assert not kind_manifest.exists()
+    original = evidence._validate_kind_support_bindings
+    mutated = False
+
+    def create_after_kind_validation(*args, **kwargs):
+        nonlocal mutated
+        result = original(*args, **kwargs)
+        if not mutated:
+            kind_manifest.parent.mkdir(parents=True, exist_ok=True)
+            kind_manifest.write_bytes(b"{}")
+            mutated = True
+        return result
+
+    monkeypatch.setattr(
+        evidence,
+        "_validate_kind_support_bindings",
+        create_after_kind_validation,
+    )
+
+    with pytest.raises(RuntimeError, match="existence changed"):
+        _verify(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("support_reference_price", 4_959, "reference price changed"),
+        ("support_reason", "무상증자와 주식배당", "reason changed"),
+    ],
+)
+def test_manifest_rejects_fully_rehashed_notice_value_drift(
+    tmp_path, field, value, message,
+):
+    _, _, manifest_path = _fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["evidence"][0]["support_actions"][2][field] = value
+    _refresh_manifest(manifest_path, manifest)
+
+    with pytest.raises(RuntimeError, match=message):
+        _verify(str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("ticker", "005951"),
+        ("security", "우선주식"),
+        ("effective", date(2021, 12, 30)),
+        ("action_type", "ex_dividend"),
+    ],
+)
+def test_manifest_rejects_fully_rehashed_notice_identity_drift(
+    tmp_path, mutation, value,
+):
+    _, _, manifest_path = _fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_bytes())
+    notice = manifest["evidence"][0]["support_actions"][2]
+    if mutation == "action_type":
+        notice["support_action_type"] = value
+    else:
+        arguments = {mutation: value}
+        body = tmp_path / notice["support_action_body_path"]
+        _zip(body, _legacy_combined_notice(**arguments))
+        notice["support_action_body_sha256"] = _sha(body)
+    _refresh_manifest(manifest_path, manifest)
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        _verify(str(tmp_path))
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -326,7 +687,7 @@ def test_manifest_rejects_support_cross_parent_target_swap(
     manifest_path.write_bytes(_canonical_json(payload))
 
     with pytest.raises(RuntimeError, match=message):
-        evidence.verify_source_evidence_manifest(str(tmp_path))
+        _verify(str(tmp_path))
 
 
 @pytest.mark.parametrize(
@@ -355,7 +716,7 @@ def test_source_manifest_rejects_unknown_or_noncanonical_fields(
         manifest_path.write_bytes(_canonical_json(payload))
 
     with pytest.raises(RuntimeError, match=message):
-        evidence.verify_source_evidence_manifest(str(tmp_path))
+        _verify(str(tmp_path))
 
 
 def _receipts(parent):
@@ -404,7 +765,7 @@ def _published(parent, supports, run_id):
 
 def test_manifest_and_binding_preserve_composite_support_lineage(tmp_path):
     parent, supports, _ = _fixture(tmp_path)
-    verified = evidence.verify_source_evidence_manifest(str(tmp_path))
+    verified = _verify(str(tmp_path))
     run_id = uuid4()
     receipts = pd.DataFrame([{
         "receipt_no": parent["cash_receipt_no"], "asset_id": 7,
@@ -450,7 +811,7 @@ def test_source_manifest_revalidation_rejects_family_terminal_replacement(
     )
 
     with pytest.raises(RuntimeError, match="derived manifest row changed"):
-        evidence.verify_source_evidence_manifest(str(tmp_path))
+        _verify(str(tmp_path))
 
 
 def test_manifest_rejects_support_group_without_exactly_one_component(tmp_path):
@@ -462,12 +823,12 @@ def test_manifest_rejects_support_group_without_exactly_one_component(tmp_path):
     manifest_path.write_bytes(_canonical_json(manifest))
 
     with pytest.raises(RuntimeError, match="row digest mismatch"):
-        evidence.verify_source_evidence_manifest(str(tmp_path))
+        _verify(str(tmp_path))
 
 
 def test_binding_rejects_cash_action_body_substitution(tmp_path):
     parent, supports, _ = _fixture(tmp_path)
-    verified = evidence.verify_source_evidence_manifest(str(tmp_path))
+    verified = _verify(str(tmp_path))
     run_id = uuid4()
     receipts = pd.DataFrame([{
         "receipt_no": parent["cash_receipt_no"], "asset_id": 7,
@@ -492,7 +853,7 @@ def test_manifest_rejects_previous_price_body_tamper(tmp_path):
     previous.write_bytes(previous.read_bytes() + b"tamper")
 
     with pytest.raises(RuntimeError, match="SHA mismatch"):
-        evidence.verify_source_evidence_manifest(str(tmp_path))
+        _verify(str(tmp_path))
 
 
 @pytest.mark.parametrize(
@@ -520,7 +881,7 @@ def test_manifest_rejects_parent_child_aggregate_mismatch(
     manifest_path.write_bytes(_canonical_json(manifest))
 
     with pytest.raises(RuntimeError, match=message):
-        evidence.verify_source_evidence_manifest(str(tmp_path))
+        _verify(str(tmp_path))
 
 
 @pytest.mark.parametrize(
@@ -564,7 +925,7 @@ def test_manifest_rejects_invalid_semantic_group_graph(
     _refresh_manifest(manifest_path, manifest)
 
     with pytest.raises(RuntimeError, match=message):
-        evidence.verify_source_evidence_manifest(str(tmp_path))
+        _verify(str(tmp_path))
 
 
 @pytest.mark.parametrize(
@@ -592,7 +953,7 @@ def test_manifest_rejects_price_provenance_or_value_mutation(
     _refresh_manifest(manifest_path, manifest)
 
     with pytest.raises(RuntimeError, match=message):
-        evidence.verify_source_evidence_manifest(str(tmp_path))
+        _verify(str(tmp_path))
 
 
 def test_manifest_rejects_semantically_different_valid_support_body(tmp_path):
@@ -613,7 +974,7 @@ def test_manifest_rejects_semantically_different_valid_support_body(tmp_path):
     _refresh_manifest(manifest_path, manifest)
 
     with pytest.raises(RuntimeError, match="component ratio changed"):
-        evidence.verify_source_evidence_manifest(str(tmp_path))
+        _verify(str(tmp_path))
 
 
 @pytest.mark.parametrize(
@@ -630,7 +991,7 @@ def test_binding_rejects_support_action_snapshot_mutation(
     tmp_path, field, value, message,
 ):
     parent, supports, _ = _fixture(tmp_path)
-    verified = evidence.verify_source_evidence_manifest(str(tmp_path))
+    verified = _verify(str(tmp_path))
     run_id = uuid4()
     published = _published(parent, supports, run_id)
     target = published["action_type"].eq("stock_dividend")
@@ -647,7 +1008,7 @@ def test_binding_rejects_support_action_snapshot_mutation(
 
 def test_binding_rejects_unused_orphan_support_child(tmp_path):
     parent, supports, _ = _fixture(tmp_path)
-    verified = evidence.verify_source_evidence_manifest(str(tmp_path))
+    verified = _verify(str(tmp_path))
     orphan = verified.support_frame.iloc[[0]].copy()
     orphan["evidence_key"] = "orphan-evidence-key"
     verified_with_orphan = replace(
@@ -729,6 +1090,220 @@ def test_kind_stock_dividend_ratio_requires_exact_numeric_token(tmp_path):
             tmp_path,
             {"adjustment_trade_date": date(2018, 12, 27)},
             row,
+        )
+
+
+def _viewer_bonus_support(tmp_path: Path) -> tuple[dict, Path]:
+    payload = (
+        "<html><body><table>"
+        "<tr><td>4. 신주배정기준일</td><td>2021-12-31</td></tr>"
+        "<tr><td>5. 1주당 신주배정 주식수</td>"
+        "<td>보통주식 (주)</td><td>1.0</td></tr>"
+        "</table></body></html>"
+    ).encode()
+    digest = hashlib.sha256(payload).hexdigest()
+    body = (
+        tmp_path / "corporate_actions/dart/support_action_families/objects"
+        / f"sha256={digest}.html"
+    )
+    body.parent.mkdir(parents=True)
+    body.write_bytes(payload)
+    row = {
+        "support_action_source": "DART_VIEWER",
+        "support_action_key": "20211217000406",
+        "support_action_type": "bonus_issue",
+        "support_action_body_path": str(body.relative_to(tmp_path)),
+        "support_action_body_sha256": digest,
+        "support_action_scope": "ISSUER",
+        "support_semantic_role": "ADJUSTMENT_COMPONENT",
+        "support_semantic_group_keys": (
+            '["005950|2021-12-31|BONUS_ISSUE|1"]'
+        ),
+        "support_announcement_date": date(2021, 12, 17),
+        "support_ex_date": date(2021, 12, 31),
+        "support_record_date": None,
+        "support_ratio_numerator": 1.0,
+        "support_ratio_denominator": 1.0,
+        "support_entitlement_security_class": "COMMON",
+        "support_distributed_security_class": "COMMON",
+        "support_expected_price_factor": 0.5,
+        "support_report_name": "주요사항보고서(무상증자결정)",
+    }
+    return row, body
+
+
+def _viewer_stock_dividend_support(tmp_path: Path) -> tuple[dict, Path]:
+    payload = (
+        "<html><body><table>"
+        "<tr><td>1. 1주당 배당주식수 (주)</td>"
+        "<td>보통주식</td><td>0.05</td></tr>"
+        "<tr><td>4. 배당기준일</td><td>2015-12-31</td></tr>"
+        "</table></body></html>"
+    ).encode()
+    digest = hashlib.sha256(payload).hexdigest()
+    body = (
+        tmp_path / "corporate_actions/dart/support_action_families/objects"
+        / f"sha256={digest}.html"
+    )
+    body.parent.mkdir(parents=True)
+    body.write_bytes(payload)
+    row = {
+        "support_action_source": "DART_VIEWER",
+        "support_action_key": "20151228900387",
+        "support_action_type": "stock_dividend",
+        "support_action_body_path": str(body.relative_to(tmp_path)),
+        "support_action_body_sha256": digest,
+        "support_action_scope": "ISSUER",
+        "support_semantic_role": "ADJUSTMENT_COMPONENT",
+        "support_semantic_group_keys": (
+            '["032960|2015-12-31|STOCK_DIVIDEND|0.05"]'
+        ),
+        "support_announcement_date": date(2015, 12, 28),
+        "support_ex_date": None,
+        "support_record_date": date(2015, 12, 31),
+        "support_ratio_numerator": 0.05,
+        "support_ratio_denominator": 1.0,
+        "support_entitlement_security_class": "COMMON",
+        "support_distributed_security_class": "COMMON",
+        "support_expected_price_factor": None,
+        "support_report_name": "[기재정정]주식배당결정",
+    }
+    return row, body
+
+
+def test_viewer_bonus_component_requires_exact_body_terms_and_semantics(
+    tmp_path,
+):
+    row, _ = _viewer_bonus_support(tmp_path)
+    parent = {"adjustment_trade_date": date(2021, 12, 29)}
+
+    evidence._verify_support_body(tmp_path, parent, row)
+
+    row["support_expected_price_factor"] = 0.6
+    with pytest.raises(RuntimeError, match="expected factor mismatch"):
+        evidence._verify_support_body(tmp_path, parent, row)
+
+
+def test_viewer_stock_dividend_requires_exact_body_terms_and_semantics(
+    tmp_path,
+):
+    row, _ = _viewer_stock_dividend_support(tmp_path)
+    parent = {
+        "ticker": "032960",
+        "adjustment_trade_date": date(2015, 12, 29),
+    }
+
+    evidence._verify_support_body(tmp_path, parent, row)
+
+    row["support_record_date"] = date(2016, 1, 1)
+    with pytest.raises(RuntimeError, match="date/factor parity"):
+        evidence._verify_support_body(tmp_path, parent, row)
+
+
+def test_viewer_stock_dividend_group_rejects_fully_rehashed_drift(tmp_path):
+    row, _ = _viewer_stock_dividend_support(tmp_path)
+    row.update({
+        "evidence_key": "viewer-stock-parent",
+        "target_cash_receipt_no": "20160229800375",
+        "target_adjustment_date": date(2015, 12, 29),
+        "support_semantic_group_keys": '["arbitrary-group"]',
+        "support_reference_price": None,
+        "support_reason": None,
+    })
+    row["manifest_support_row_sha256"] = evidence._manifest_support_row_sha(row)
+    support = pd.DataFrame([row])
+    parent = {
+        "ticker": "032960",
+        "support_action_count": 1,
+        "support_semantic_group_count": 1,
+        "support_action_digest": evidence.support_manifest_digest(support),
+    }
+
+    with pytest.raises(RuntimeError, match="does not bind ticker/date/ratio"):
+        evidence._validate_support_groups(parent, support)
+
+
+def test_viewer_bonus_group_rejects_fully_rehashed_arbitrary_identity(
+    tmp_path,
+):
+    row, _ = _viewer_bonus_support(tmp_path)
+    row.update({
+        "evidence_key": "viewer-parent",
+        "target_cash_receipt_no": "20220214901227",
+        "target_adjustment_date": date(2021, 12, 29),
+        "support_semantic_group_keys": '["arbitrary-group"]',
+        "support_reference_price": None,
+        "support_reason": None,
+    })
+    row["manifest_support_row_sha256"] = (
+        evidence._manifest_support_row_sha(row)
+    )
+    support = pd.DataFrame([row])
+    parent = {
+        "ticker": "005950",
+        "support_action_count": 1,
+        "support_semantic_group_count": 1,
+        "support_action_digest": evidence.support_manifest_digest(support),
+    }
+
+    with pytest.raises(RuntimeError, match="does not bind ticker/date/ratio"):
+        evidence._validate_support_groups(parent, support)
+
+
+def test_viewer_bonus_component_rebinds_exact_terminal_family_body(
+    tmp_path, monkeypatch,
+):
+    row, _ = _viewer_bonus_support(tmp_path)
+    row.update({
+        "evidence_key": "viewer-parent",
+        "target_cash_receipt_no": "20220214901227",
+        "target_adjustment_date": date(2021, 12, 29),
+    })
+    family_source = SimpleNamespace(
+        receipt_no="20211217000406",
+        report_name="주요사항보고서(무상증자결정)",
+        receipt_date="2021-12-17",
+        body_path=row["support_action_body_path"],
+        body_sha256=row["support_action_body_sha256"],
+        structured_path=None,
+        structured_sha256=None,
+    )
+    family = SimpleNamespace(
+        ticker="005950",
+        action_type="bonus_issue",
+        terminal_economic_receipt_no="20211217000406",
+        terminal_admissible=True,
+        terminal_ratio=1.0,
+        root_receipt_no="20211217000406",
+        terminal_status="ACTIVE",
+        sources=(family_source,),
+    )
+    monkeypatch.setattr(
+        evidence,
+        "verify_support_action_families",
+        lambda *args, **kwargs: SimpleNamespace(entries=(family,)),
+    )
+    parents = pd.DataFrame([{
+        "evidence_key": "viewer-parent", "ticker": "005950",
+    }])
+    supports = pd.DataFrame([row])
+
+    evidence._validate_support_family_bindings(
+        tmp_path,
+        parents,
+        supports,
+        required_start=date(2015, 1, 1),
+        required_end=date(2026, 8, 10),
+    )
+
+    supports.loc[0, "support_action_body_sha256"] = "f" * 64
+    with pytest.raises(RuntimeError, match="viewer-body parity"):
+        evidence._validate_support_family_bindings(
+            tmp_path,
+            parents,
+            supports,
+            required_start=date(2015, 1, 1),
+            required_end=date(2026, 8, 10),
         )
 
 

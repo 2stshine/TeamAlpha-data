@@ -22,6 +22,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlencode
@@ -29,8 +30,10 @@ from urllib.parse import urlencode
 import requests
 
 from pipeline.bronze.corporate_actions import (
-    _event_api_for_title,
-    _needs_document,
+    _candidate_corp_to_stock,
+    _document_candidate_receipts,
+    _is_listed_disclosure_candidate,
+    _structured_query_keys,
 )
 from pipeline.bronze.dart_disclosure_observations import (
     canonicalize_disclosures,
@@ -42,14 +45,17 @@ from pipeline.bronze.dart_support_action_families import (
 )
 
 
-SCHEMA_VERSION = "dart_viewer_correction_snapshot_v2"
-SOURCE_CONTRACT = "dart_official_main_family_attachment_viewer_body_v2"
+SCHEMA_VERSION = "dart_viewer_correction_snapshot_v4"
+SOURCE_CONTRACT = (
+    "dart_official_seed_bounded_main_family_dependency_viewer_body_v4"
+)
 FAMILY_ORDER_CONTRACT = "OFFICIAL_MAIN_NEWEST_TO_OLDEST_WITH_ATTACHMENT_KEYS"
 ATTACHMENT_PARENT_CONTRACT = "OFFICIAL_FAMILY_ROOT_NOT_DIRECT_ATTACHMENT_TARGET"
 MAIN_URL = "https://dart.fss.or.kr/dsaf001/main.do"
 MANIFEST_RELATIVE_PATH = Path(
     "corporate_actions/dart/viewer_corrections/manifest.json"
 )
+OBJECT_ROOT_RELATIVE_PATH = MANIFEST_RELATIVE_PATH.parent / "objects"
 KNOWN_DAMAGED_DOCUMENT_RECEIPTS = {
     # The cached document body contains literal '?' bytes in every Korean
     # label.  The official viewer body is intact and is required permanently,
@@ -101,12 +107,37 @@ class ViewerReceiptEvidence:
 
 
 @dataclass(frozen=True)
+class ViewerDependencyProbe:
+    """Official selector proof for one provisional out-of-range revision."""
+
+    receipt_no: str
+    rcept_dt: str
+    current_selector: str
+    family_receipt_nos: tuple[str, ...]
+    attachment_keys: tuple[str, ...]
+    intersects_seed_receipt: bool
+    selected_dependency: bool
+    main_path: str
+    main_content_length: int
+    main_sha256: str
+
+
+@dataclass(frozen=True)
 class VerifiedViewerCorrectionSnapshot:
     base: str
     manifest_path: str
     manifest_sha256: str
+    seed_coverage_start: date
+    seed_coverage_end: date
+    seed_receipt_count: int
+    seed_receipt_digest: str
+    dependency_receipt_count: int
+    dependency_receipt_digest: str
+    dependency_probe_count: int
+    dependency_probe_digest: str
     receipt_count: int
     receipt_digest: str
+    dependency_probes: tuple[ViewerDependencyProbe, ...]
     receipts: tuple[ViewerReceiptEvidence, ...]
 
 
@@ -143,6 +174,7 @@ def _atomic_write(path: Path, payload: bytes) -> None:
 
 
 def _cash_disclosures(root: Path) -> dict[str, dict]:
+    corp_to_stock: dict[str, str] = {}
     observations: list[tuple[Path, dict]] = []
     complete_receipts: set[str] = set()
     incomplete_relevant: dict[str, dict] = {}
@@ -163,34 +195,23 @@ def _cash_disclosures(root: Path) -> dict[str, dict]:
             raise RuntimeError(f"invalid DART disclosures body: {path}") from exc
         if not isinstance(payload, list):
             raise RuntimeError(f"DART disclosures must be a list: {path}")
+        corp_to_stock.update(_candidate_corp_to_stock(str(root), payload))
         relevant = {
             str(row.get("rcept_no") or ""): row
             for row in payload
             if isinstance(row, dict)
+            and _is_listed_disclosure_candidate(row, corp_to_stock)
             and "현금현물배당결정" in _compact(row.get("report_nm"))
-            and re.fullmatch(r"\d{14}", str(row.get("rcept_no") or ""))
         }
         structured_marker = path.parent / "structured_complete_v3.json"
         document_marker = path.parent / "documents_complete_v5.json"
         if not structured_marker.is_file() or not document_marker.is_file():
             incomplete_relevant.update(relevant)
             continue
-        structured_queries = {
-            (event_api.slug, str(row.get("corp_code") or ""))
-            for row in payload
-            if isinstance(row, dict)
-            and str(row.get("stock_code") or "").strip()
-            and str(row.get("corp_code") or "")
-            and (event_api := _event_api_for_title(row.get("report_nm")))
-            is not None
-        }
-        document_candidates = {
-            str(row.get("rcept_no") or "")
-            for row in payload
-            if isinstance(row, dict)
-            and _needs_document(row.get("report_nm"))
-            and str(row.get("rcept_no") or "")
-        }
+        structured_queries = _structured_query_keys(payload, corp_to_stock)
+        document_candidates = _document_candidate_receipts(
+            payload, corp_to_stock,
+        )
         for marker_path, count_field, expected_count in (
             (
                 structured_marker,
@@ -235,7 +256,7 @@ def _cash_disclosures(root: Path) -> dict[str, dict]:
                 continue
             receipt = str(row.get("rcept_no") or "")
             if (
-                re.fullmatch(r"\d{14}", receipt)
+                _is_listed_disclosure_candidate(row, corp_to_stock)
                 and "현금현물배당결정" in _compact(row.get("report_nm"))
             ):
                 observations.append((path, row))
@@ -284,7 +305,75 @@ def _cash_disclosures(root: Path) -> dict[str, dict]:
     }
 
 
-def required_viewer_receipts(base: str) -> tuple[str, ...]:
+_REVISION_TITLE_MARKERS = ("정정", "철회", "취소", "부결")
+_SUBSIDIARY_TITLE_MARKERS = (
+    "자회사의주요경영사항",
+    "종속회사의주요경영사항",
+)
+
+
+def _cash_disclosure_date(receipt: str, row: dict) -> date:
+    rendered = parse_dart_date(row.get("rcept_dt"))
+    if rendered is None:
+        raise RuntimeError(f"invalid DART cash receipt date: {receipt}")
+    return date.fromisoformat(rendered)
+
+
+def _is_issuer_cash_disclosure(row: dict) -> bool:
+    title = _compact(row.get("report_nm"))
+    return not any(marker in title for marker in _SUBSIDIARY_TITLE_MARKERS)
+
+
+def _seed_cash_receipts(
+    disclosures: dict[str, dict],
+    *,
+    coverage_start: date,
+    coverage_end: date,
+) -> frozenset[str]:
+    seeds: set[str] = set()
+    for receipt, row in disclosures.items():
+        receipt_date = _cash_disclosure_date(receipt, row)
+        if (
+            coverage_start <= receipt_date <= coverage_end
+            and _is_issuer_cash_disclosure(row)
+        ):
+            seeds.add(receipt)
+    return frozenset(seeds)
+
+
+def _outside_revision_candidates(
+    disclosures: dict[str, dict],
+    *,
+    coverage_start: date,
+    coverage_end: date,
+) -> tuple[str, ...]:
+    """Return provisional out-of-range corrections, never dependencies yet.
+
+    A complete dependency-day disclosure ZIP can contain unrelated reports.
+    Its list date or co-location with a needed support-family correction is
+    not lineage evidence. Apply mode refreshes each candidate's official
+    ``main.do`` selector and retains it only when that exact selector
+    intersects an in-range issuer cash seed.
+    """
+    candidates: set[str] = set()
+    for receipt, row in disclosures.items():
+        receipt_date = _cash_disclosure_date(receipt, row)
+        title = _compact(row.get("report_nm"))
+        if (
+            not coverage_start <= receipt_date <= coverage_end
+            and _is_issuer_cash_disclosure(row)
+            and any(marker in title for marker in _REVISION_TITLE_MARKERS)
+        ):
+            candidates.add(receipt)
+    return tuple(sorted(candidates))
+
+
+def required_viewer_receipts(
+    base: str,
+    *,
+    coverage_start: date,
+    coverage_end: date,
+) -> tuple[str, ...]:
     """Return every cash correction plus known damaged source bodies.
 
     ZIP availability does not close revision lineage: a correction can change
@@ -292,8 +381,20 @@ def required_viewer_receipts(base: str) -> tuple[str, ...]:
     therefore bound to the official viewer family and final corrected body.
     """
     root = Path(base).expanduser().resolve()
+    if coverage_end < coverage_start:
+        raise ValueError("viewer coverage_end precedes coverage_start")
     disclosures = _cash_disclosures(root)
-    required = set(KNOWN_DAMAGED_DOCUMENT_RECEIPTS).intersection(disclosures)
+    seed_receipts = _seed_cash_receipts(
+        disclosures,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+    )
+    seed_disclosures = {
+        receipt: disclosures[receipt] for receipt in seed_receipts
+    }
+    required = set(KNOWN_DAMAGED_DOCUMENT_RECEIPTS).intersection(
+        seed_disclosures
+    )
     unavailable_root = (
         root / "corporate_actions" / "dart" / "documents_unavailable"
     )
@@ -302,16 +403,9 @@ def required_viewer_receipts(base: str) -> tuple[str, ...]:
         for path in unavailable_root.glob("year=*/corp=*/rcept=*.xml")
         if path.is_file()
     }
-    for receipt, row in disclosures.items():
+    for receipt, row in seed_disclosures.items():
         title = _compact(row.get("report_nm"))
-        if (
-            "자회사의주요경영사항" in title
-            or "종속회사의주요경영사항" in title
-        ):
-            continue
-        is_revision = any(
-            marker in title for marker in ("정정", "철회", "취소", "부결")
-        )
+        is_revision = any(marker in title for marker in _REVISION_TITLE_MARKERS)
         if is_revision:
             required.add(receipt)
         unavailable_path = unavailable.get(receipt)
@@ -530,6 +624,7 @@ def _get(
 
 
 def _receipt_main_path(root: Path, receipt: str) -> Path:
+    """Return the legacy mutable cache path (never trusted by v3)."""
     directory = (
         root / "corporate_actions" / "dart" / "viewer_corrections"
         / f"receipt={receipt}"
@@ -545,6 +640,44 @@ def _viewer_evidence_path(main_path: Path, *, prefix: str, dtd: str) -> Path:
     return main_path.with_name(f"{prefix}.dtd={dtd}.html")
 
 
+def _content_addressed_evidence_path(root: Path, payload: bytes) -> Path:
+    """Store one freshly fetched official page under its SHA-256 identity.
+
+    DART's ``main.do`` selector is mutable: a later correction adds another
+    receipt to every member's official family.  A receipt-named cache can
+    therefore never prove that the selector was refreshed.  Existing objects
+    are accepted only when their complete body still matches the digest
+    encoded in the path.
+    """
+    digest = _sha256_bytes(payload)
+    destination = root / OBJECT_ROOT_RELATIVE_PATH / f"sha256={digest}.html"
+    if destination.is_file():
+        if destination.read_bytes() != payload:
+            raise RuntimeError(
+                "content-addressed DART viewer object changed: "
+                f"{destination}"
+            )
+        return destination
+    _atomic_write(destination, payload)
+    return destination
+
+
+def _fetch_main_payload(
+    receipt: str,
+    *,
+    tries: int,
+    timeout: float,
+    rate_limiter: _RateLimiter,
+) -> bytes:
+    main_url = f"{MAIN_URL}?{urlencode({'rcpNo': receipt})}"
+    return _get(
+        main_url,
+        tries=tries,
+        timeout=timeout,
+        rate_limiter=rate_limiter,
+    )
+
+
 def _fetch_one(
     root: Path,
     receipt: str,
@@ -554,20 +687,18 @@ def _fetch_one(
     rate_limiter: _RateLimiter,
     report_name: object,
     report_names: dict[str, object] | None = None,
+    prefetched_main_payload: bytes | None = None,
 ) -> ViewerReceiptEvidence:
     attachment_correction = "첨부정정" in _compact(report_name)
-    main_path = _receipt_main_path(root, receipt)
-    main_url = f"{MAIN_URL}?{urlencode({'rcpNo': receipt})}"
-    if main_path.is_file():
-        main_payload = main_path.read_bytes()
-    else:
-        main_payload = _get(
-            main_url,
-            tries=tries,
-            timeout=timeout,
-            rate_limiter=rate_limiter,
-        )
-        _atomic_write(main_path, main_payload)
+    # Never reuse a receipt-named main page. Its family and attachment
+    # selectors change when DART publishes a later correction.
+    main_payload = prefetched_main_payload or _fetch_main_payload(
+        receipt,
+        tries=tries,
+        timeout=timeout,
+        rate_limiter=rate_limiter,
+    )
+    main_path = _content_addressed_evidence_path(root, main_payload)
     (
         dcm_no,
         correction_of,
@@ -588,38 +719,28 @@ def _fetch_one(
     dtd = source_page.dtd
     current_selector = source_page.current_selector
     attachment_keys = source_page.attachment_keys
-    viewer_path = _viewer_evidence_path(
-        main_path, prefix="viewer", dtd=dtd,
-    )
     viewer_url = official_dart_viewer_url(receipt, dcm_no, dtd)
-    if viewer_path.is_file():
-        viewer_payload = viewer_path.read_bytes()
-    else:
-        viewer_payload = _get(
-            viewer_url,
+    viewer_payload = _get(
+        viewer_url,
+        tries=tries,
+        timeout=timeout,
+        rate_limiter=rate_limiter,
+    )
+    viewer_path = _content_addressed_evidence_path(root, viewer_payload)
+    if attachment_correction:
+        economic_main_url = (
+            f"{MAIN_URL}?"
+            f"{urlencode({'rcpNo': economic_body_receipt})}"
+        )
+        economic_main_payload = _get(
+            economic_main_url,
             tries=tries,
             timeout=timeout,
             rate_limiter=rate_limiter,
         )
-        _atomic_write(viewer_path, viewer_payload)
-    if attachment_correction:
-        economic_main_path = main_path.with_name(
-            f"economic_main.receipt={economic_body_receipt}.html"
+        economic_main_path = _content_addressed_evidence_path(
+            root, economic_main_payload,
         )
-        if economic_main_path.is_file():
-            economic_main_payload = economic_main_path.read_bytes()
-        else:
-            economic_main_url = (
-                f"{MAIN_URL}?"
-                f"{urlencode({'rcpNo': economic_body_receipt})}"
-            )
-            economic_main_payload = _get(
-                economic_main_url,
-                tries=tries,
-                timeout=timeout,
-                rate_limiter=rate_limiter,
-            )
-            _atomic_write(economic_main_path, economic_main_payload)
         economic_page = parse_official_dart_main_page(
             economic_body_receipt,
             economic_main_payload,
@@ -646,24 +767,20 @@ def _fetch_one(
                 "DART attachment/economic main selectors disagree: "
                 f"source={receipt} economic={economic_body_receipt}"
             )
-        economic_viewer_path = _viewer_evidence_path(
-            main_path, prefix="economic_viewer", dtd=economic_body_dtd,
+        economic_viewer_url = official_dart_viewer_url(
+            economic_body_receipt,
+            economic_body_dcm,
+            economic_body_dtd,
         )
-        if economic_viewer_path.is_file():
-            economic_viewer_payload = economic_viewer_path.read_bytes()
-        else:
-            economic_viewer_url = official_dart_viewer_url(
-                economic_body_receipt,
-                economic_body_dcm,
-                economic_body_dtd,
-            )
-            economic_viewer_payload = _get(
-                economic_viewer_url,
-                tries=tries,
-                timeout=timeout,
-                rate_limiter=rate_limiter,
-            )
-            _atomic_write(economic_viewer_path, economic_viewer_payload)
+        economic_viewer_payload = _get(
+            economic_viewer_url,
+            tries=tries,
+            timeout=timeout,
+            rate_limiter=rate_limiter,
+        )
+        economic_viewer_path = _content_addressed_evidence_path(
+            root, economic_viewer_payload,
+        )
     else:
         economic_main_path = main_path
         economic_main_payload = main_payload
@@ -731,6 +848,122 @@ def _receipt_digest(receipts: Iterable[ViewerReceiptEvidence]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(rendered).hexdigest()
+
+
+def _receipt_identity_digest(receipts: Iterable[str]) -> str:
+    rendered = json.dumps(
+        sorted(set(receipts)),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(rendered).hexdigest()
+
+
+def _dependency_probe_digest(
+    probes: Iterable[ViewerDependencyProbe],
+) -> str:
+    rendered = json.dumps(
+        [asdict(item) for item in probes],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(rendered).hexdigest()
+
+
+def _discover_outside_family_dependencies(
+    root: Path,
+    disclosures: dict[str, dict],
+    *,
+    coverage_start: date,
+    coverage_end: date,
+    tries: int,
+    timeout: float,
+    rate_limiter: _RateLimiter,
+    workers: int,
+) -> tuple[dict[str, bytes], tuple[ViewerDependencyProbe, ...]]:
+    """Refresh provisional outside corrections and retain exact seed links.
+
+    Every main page is content-addressed and bound as a probe so offline
+    verification can prove that no complete-snapshot candidate was omitted.
+    Only exact seed-linked pages are also returned as economic dependencies.
+    """
+    seed_cash_receipts = _seed_cash_receipts(
+        disclosures,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+    )
+    candidates = _outside_revision_candidates(
+        disclosures,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+    )
+    if not candidates:
+        return {}, ()
+    executor = ThreadPoolExecutor(max_workers=workers)
+    futures = {
+        executor.submit(
+            _fetch_main_payload,
+            receipt,
+            tries=tries,
+            timeout=timeout,
+            rate_limiter=rate_limiter,
+        ): receipt
+        for receipt in candidates
+    }
+    retained: dict[str, bytes] = {}
+    probes: list[ViewerDependencyProbe] = []
+    try:
+        for future in as_completed(futures):
+            receipt = futures[future]
+            payload = future.result()
+            attachment = "첨부정정" in _compact(
+                disclosures[receipt].get("report_nm")
+            )
+            page = parse_official_dart_main_page(
+                receipt,
+                payload,
+                expected_attachment_only=attachment,
+            )
+            exact_lineage = set(page.family_receipts)
+            if page.current_selector == "FAMILY":
+                exact_lineage.add(receipt)
+            intersects_seed = bool(
+                exact_lineage.intersection(seed_cash_receipts)
+            )
+            if intersects_seed:
+                retained[receipt] = payload
+            main_path = _content_addressed_evidence_path(root, payload)
+            receipt_date = _cash_disclosure_date(
+                receipt, disclosures[receipt]
+            ).isoformat()
+            probes.append(ViewerDependencyProbe(
+                receipt_no=receipt,
+                rcept_dt=receipt_date,
+                current_selector=page.current_selector,
+                family_receipt_nos=page.family_receipts,
+                attachment_keys=page.attachment_keys,
+                intersects_seed_receipt=intersects_seed,
+                selected_dependency=intersects_seed,
+                main_path=main_path.relative_to(root).as_posix(),
+                main_content_length=len(payload),
+                main_sha256=_sha256_bytes(payload),
+            ))
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+    print(
+        "[dart-viewer-corrections] "
+        f"provisional_outside={len(candidates)} "
+        f"linked_dependencies={len(retained)}",
+        flush=True,
+    )
+    probes.sort(key=lambda item: item.receipt_no)
+    return retained, tuple(probes)
 
 
 _TERMINAL_ECONOMIC_CLASSIFICATIONS = frozenset({
@@ -862,7 +1095,8 @@ def _pending_terminal_dependencies(
 def collect_viewer_corrections(
     base: str,
     *,
-    extra_receipts: Iterable[str] = (),
+    coverage_start: date,
+    coverage_end: date,
     apply: bool = False,
     workers: int = 4,
     tries: int = 4,
@@ -870,18 +1104,20 @@ def collect_viewer_corrections(
     request_interval_seconds: float = DEFAULT_REQUEST_INTERVAL_SECONDS,
 ) -> VerifiedViewerCorrectionSnapshot | dict:
     root = Path(base).expanduser().resolve()
+    if coverage_end < coverage_start:
+        raise ValueError("viewer coverage_end precedes coverage_start")
     disclosures = _cash_disclosures(root)
-    required = set(required_viewer_receipts(str(root)))
-    required.update(str(value) for value in extra_receipts)
-    invalid = sorted(
-        receipt for receipt in required
-        if not re.fullmatch(r"\d{14}", receipt) or receipt not in disclosures
+    seed_required = set(required_viewer_receipts(
+        str(root),
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+    ))
+    ordered_seeds = tuple(sorted(seed_required))
+    provisional = _outside_revision_candidates(
+        disclosures,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
     )
-    if invalid:
-        raise RuntimeError(
-            f"viewer fallback receipts absent from cash disclosures: {invalid[:20]}"
-        )
-    ordered = tuple(sorted(required))
     if not apply:
         return {
             "apply": False,
@@ -889,8 +1125,13 @@ def collect_viewer_corrections(
             "source_contract": SOURCE_CONTRACT,
             "family_order": FAMILY_ORDER_CONTRACT,
             "attachment_parent_contract": ATTACHMENT_PARENT_CONTRACT,
-            "required_receipt_count": len(ordered),
-            "required_receipts": list(ordered),
+            "seed_coverage_start": coverage_start.isoformat(),
+            "seed_coverage_end": coverage_end.isoformat(),
+            "seed_receipt_count": len(ordered_seeds),
+            "seed_receipt_digest": _receipt_identity_digest(ordered_seeds),
+            "seed_receipts": list(ordered_seeds),
+            "provisional_outside_candidate_count": len(provisional),
+            "provisional_outside_candidates": list(provisional),
         }
     if workers < 1 or workers > 8:
         raise ValueError("workers must be in [1, 8]")
@@ -904,6 +1145,18 @@ def collect_viewer_corrections(
         request_interval_seconds,
         DEFAULT_REQUEST_JITTER_SECONDS,
     )
+    prefetched_main, dependency_probes = _discover_outside_family_dependencies(
+        root,
+        disclosures,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+        tries=tries,
+        timeout=timeout,
+        rate_limiter=rate_limiter,
+        workers=workers,
+    )
+    required = seed_required | set(prefetched_main)
+    ordered = tuple(sorted(required))
     executor = ThreadPoolExecutor(max_workers=workers)
     futures = {
             executor.submit(
@@ -915,6 +1168,7 @@ def collect_viewer_corrections(
                 rate_limiter=rate_limiter,
                 report_name=disclosures[receipt].get("report_nm"),
                 report_names=report_names,
+                prefetched_main_payload=prefetched_main.get(receipt),
             ): receipt
             for receipt in ordered
         }
@@ -967,6 +1221,7 @@ def collect_viewer_corrections(
             dependency_executor.shutdown(wait=True)
         required.update(dependencies)
     ordered = tuple(sorted(required))
+    dependency_receipts = tuple(sorted(required - seed_required))
     evidence.sort(key=lambda item: item.receipt_no)
     _validate_terminal_families(evidence, disclosures)
     payload = {
@@ -974,30 +1229,211 @@ def collect_viewer_corrections(
         "source_contract": SOURCE_CONTRACT,
         "family_order": FAMILY_ORDER_CONTRACT,
         "attachment_parent_contract": ATTACHMENT_PARENT_CONTRACT,
+        "seed_coverage_start": coverage_start.isoformat(),
+        "seed_coverage_end": coverage_end.isoformat(),
         "complete": True,
+        "seed_receipts": list(ordered_seeds),
+        "seed_receipt_count": len(ordered_seeds),
+        "seed_receipt_digest": _receipt_identity_digest(ordered_seeds),
+        "dependency_receipts": list(dependency_receipts),
+        "dependency_receipt_count": len(dependency_receipts),
+        "dependency_receipt_digest": _receipt_identity_digest(
+            dependency_receipts
+        ),
+        "dependency_probe_count": len(dependency_probes),
+        "dependency_probe_digest": _dependency_probe_digest(
+            dependency_probes
+        ),
+        "dependency_probes": [
+            asdict(item) for item in dependency_probes
+        ],
         "required_receipts": list(ordered),
         "receipt_count": len(evidence),
         "receipt_digest": _receipt_digest(evidence),
         "receipts": [asdict(item) for item in evidence],
     }
     manifest = root / MANIFEST_RELATIVE_PATH
-    _atomic_write(
-        manifest,
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8"),
+    rendered = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    previous = manifest.read_bytes() if manifest.is_file() else None
+    _atomic_write(manifest, rendered)
+    try:
+        return verify_viewer_corrections(
+            str(root),
+            required_start=coverage_start,
+            required_end=coverage_end,
+            required_receipts=ordered,
+        )
+    except BaseException:
+        if previous is None:
+            manifest.unlink(missing_ok=True)
+        else:
+            _atomic_write(manifest, previous)
+        raise
+
+
+def _declared_receipt_list(payload: dict, field: str) -> tuple[str, ...]:
+    values = payload.get(field)
+    if (
+        not isinstance(values, list)
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"\d{14}", value) is None
+            for value in values
+        )
+        or values != sorted(set(values))
+    ):
+        raise RuntimeError(
+            f"DART viewer {field} must be a sorted unique receipt list"
+        )
+    return tuple(values)
+
+
+def _verify_dependency_probes(
+    root: Path,
+    payload: dict,
+    disclosures: dict[str, dict],
+    *,
+    required_start: date,
+    required_end: date,
+    declared_dependencies: tuple[str, ...],
+) -> tuple[ViewerDependencyProbe, ...]:
+    rows = payload.get("dependency_probes")
+    if not isinstance(rows, list):
+        raise RuntimeError("DART viewer dependency probes must be a list")
+    expected_candidates = _outside_revision_candidates(
+        disclosures,
+        coverage_start=required_start,
+        coverage_end=required_end,
     )
-    return verify_viewer_corrections(str(root), required_receipts=ordered)
+    seed_cash_receipts = _seed_cash_receipts(
+        disclosures,
+        coverage_start=required_start,
+        coverage_end=required_end,
+    )
+    dependency_set = set(declared_dependencies)
+    probes: list[ViewerDependencyProbe] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("invalid DART viewer dependency probe entry")
+        try:
+            probe = ViewerDependencyProbe(
+                receipt_no=str(row.get("receipt_no") or ""),
+                rcept_dt=str(row.get("rcept_dt") or ""),
+                current_selector=str(row.get("current_selector") or ""),
+                family_receipt_nos=tuple(
+                    str(value) for value in row.get("family_receipt_nos") or []
+                ),
+                attachment_keys=tuple(
+                    str(value) for value in row.get("attachment_keys") or []
+                ),
+                intersects_seed_receipt=row["intersects_seed_receipt"],
+                selected_dependency=row["selected_dependency"],
+                main_path=str(row.get("main_path") or ""),
+                main_content_length=int(row.get("main_content_length", -1)),
+                main_sha256=str(row.get("main_sha256") or ""),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "invalid DART viewer dependency probe entry"
+            ) from exc
+        disclosure = disclosures.get(probe.receipt_no)
+        if (
+            disclosure is None
+            or probe.receipt_no in seen
+            or re.fullmatch(r"\d{14}", probe.receipt_no) is None
+            or probe.rcept_dt != _cash_disclosure_date(
+                probe.receipt_no, disclosure
+            ).isoformat()
+            or probe.current_selector not in {"FAMILY", "ATTACHMENT"}
+            or not probe.family_receipt_nos
+            or len(probe.family_receipt_nos)
+            != len(set(probe.family_receipt_nos))
+            or any(
+                re.fullmatch(r"\d{14}", value) is None
+                for value in probe.family_receipt_nos
+            )
+            or len(probe.attachment_keys) != len(set(probe.attachment_keys))
+            or any(
+                re.fullmatch(r"\d{14}:\d+", value) is None
+                for value in probe.attachment_keys
+            )
+            or not isinstance(probe.intersects_seed_receipt, bool)
+            or not isinstance(probe.selected_dependency, bool)
+            or re.fullmatch(r"[0-9a-f]{64}", probe.main_sha256) is None
+        ):
+            raise RuntimeError("invalid DART viewer dependency probe identity")
+        seen.add(probe.receipt_no)
+        main_path = (root / probe.main_path).resolve()
+        expected_path = (
+            OBJECT_ROOT_RELATIVE_PATH
+            / f"sha256={probe.main_sha256}.html"
+        ).as_posix()
+        if (
+            probe.main_path != expected_path
+            or root not in main_path.parents
+            or not main_path.is_file()
+            or main_path.stat().st_size != probe.main_content_length
+            or _sha256_path(main_path) != probe.main_sha256
+        ):
+            raise RuntimeError(
+                "DART viewer dependency probe body changed: "
+                f"{probe.receipt_no}"
+            )
+        attachment = "첨부정정" in _compact(disclosure.get("report_nm"))
+        page = parse_official_dart_main_page(
+            probe.receipt_no,
+            main_path.read_bytes(),
+            expected_attachment_only=attachment,
+        )
+        if (
+            page.current_selector != probe.current_selector
+            or page.family_receipts != probe.family_receipt_nos
+            or page.attachment_keys != probe.attachment_keys
+        ):
+            raise RuntimeError(
+                "DART viewer dependency probe lineage changed: "
+                f"{probe.receipt_no}"
+            )
+        exact_lineage = set(page.family_receipts)
+        if page.current_selector == "FAMILY":
+            exact_lineage.add(probe.receipt_no)
+        expected_selected = bool(exact_lineage.intersection(seed_cash_receipts))
+        if (
+            probe.intersects_seed_receipt is not expected_selected
+            or probe.selected_dependency is not expected_selected
+            or (probe.receipt_no in dependency_set) is not expected_selected
+        ):
+            raise RuntimeError(
+                "DART viewer dependency probe selection changed: "
+                f"{probe.receipt_no}"
+            )
+        probes.append(probe)
+    probes.sort(key=lambda item: item.receipt_no)
+    if tuple(item.receipt_no for item in probes) != expected_candidates:
+        raise RuntimeError("DART viewer dependency probe candidate set changed")
+    digest = _dependency_probe_digest(probes)
+    if payload.get("dependency_probe_digest") != digest:
+        raise RuntimeError("DART viewer dependency probe digest mismatch")
+    if int(payload.get("dependency_probe_count", -1)) != len(probes):
+        raise RuntimeError("DART viewer dependency probe count mismatch")
+    return tuple(probes)
 
 
 def verify_viewer_corrections(
     base: str,
     *,
+    required_start: date,
+    required_end: date,
     required_receipts: Iterable[str] | None = None,
 ) -> VerifiedViewerCorrectionSnapshot:
+    if required_end < required_start:
+        raise ValueError("viewer required_end precedes required_start")
     root = Path(base).expanduser().resolve()
     manifest = root / MANIFEST_RELATIVE_PATH
     try:
@@ -1026,24 +1462,80 @@ def verify_viewer_corrections(
         raise RuntimeError("unsupported DART viewer correction provenance")
     if payload.get("complete") is not True:
         raise RuntimeError("DART viewer correction snapshot is incomplete")
-    declared_required = tuple(sorted(set(
-        str(value) for value in payload.get("required_receipts") or []
-    )))
-    expected = tuple(sorted(set(
-        required_viewer_receipts(str(root))
-        if required_receipts is None else (str(value) for value in required_receipts)
-    )))
-    if not set(expected).issubset(declared_required):
-        missing = sorted(set(expected) - set(declared_required))
+    if (
+        payload.get("seed_coverage_start") != required_start.isoformat()
+        or payload.get("seed_coverage_end") != required_end.isoformat()
+    ):
+        raise RuntimeError("DART viewer seed coverage mismatch")
+    declared_seeds = _declared_receipt_list(payload, "seed_receipts")
+    declared_dependencies = _declared_receipt_list(
+        payload, "dependency_receipts"
+    )
+    declared_required = _declared_receipt_list(payload, "required_receipts")
+    if set(declared_seeds).intersection(declared_dependencies) or (
+        tuple(sorted(set(declared_seeds) | set(declared_dependencies)))
+        != declared_required
+    ):
+        raise RuntimeError("DART viewer seed/dependency receipt partition changed")
+    disclosures = _cash_disclosures(root)
+    automatic_seeds = set(required_viewer_receipts(
+        str(root),
+        coverage_start=required_start,
+        coverage_end=required_end,
+    ))
+    expected = (
+        automatic_seeds
+        if required_receipts is None
+        else {str(value) for value in required_receipts}
+    )
+    if automatic_seeds != set(declared_seeds):
+        missing = sorted(automatic_seeds - set(declared_seeds))
+        extra = sorted(set(declared_seeds) - automatic_seeds)
+        raise RuntimeError(
+            "DART viewer seed receipt set changed: "
+            f"missing={missing[:20]} extra={extra[:20]}"
+        )
+    if not expected.issubset(declared_required):
+        missing = sorted(expected - set(declared_required))
         raise RuntimeError(
             f"DART viewer correction receipts are missing: {missing[:20]}"
         )
+    invalid_seeds = sorted(
+        receipt for receipt in declared_seeds
+        if receipt not in disclosures
+        or not _is_issuer_cash_disclosure(disclosures[receipt])
+        or not required_start <= _cash_disclosure_date(
+            receipt, disclosures[receipt]
+        ) <= required_end
+    )
+    if invalid_seeds:
+        raise RuntimeError(
+            "DART viewer seed receipt falls outside exact issuer coverage: "
+            f"{invalid_seeds[:20]}"
+        )
+    for field, identities in (
+        ("seed", declared_seeds),
+        ("dependency", declared_dependencies),
+    ):
+        if int(payload.get(f"{field}_receipt_count", -1)) != len(identities):
+            raise RuntimeError(f"DART viewer {field} receipt count mismatch")
+        if payload.get(f"{field}_receipt_digest") != _receipt_identity_digest(
+            identities
+        ):
+            raise RuntimeError(f"DART viewer {field} receipt digest mismatch")
+    dependency_probes = _verify_dependency_probes(
+        root,
+        payload,
+        disclosures,
+        required_start=required_start,
+        required_end=required_end,
+        declared_dependencies=declared_dependencies,
+    )
     rows = payload.get("receipts")
     if not isinstance(rows, list):
         raise RuntimeError("DART viewer correction receipts must be a list")
     receipts: list[ViewerReceiptEvidence] = []
     seen: set[str] = set()
-    disclosures = _cash_disclosures(root)
     for row in rows:
         if not isinstance(row, dict):
             raise RuntimeError("invalid DART viewer correction receipt entry")
@@ -1170,38 +1662,23 @@ def verify_viewer_corrections(
             "report_nm"
         )
         title_is_attachment = "첨부정정" in _compact(report_name)
-        expected_main = _receipt_main_path(root, evidence.receipt_no)
-        expected_viewer = _viewer_evidence_path(
-            expected_main, prefix="viewer", dtd=evidence.dtd,
-        )
-        expected_economic_main = (
-            expected_main.with_name(
-                "economic_main.receipt="
-                f"{evidence.economic_body_receipt_no}.html"
-            )
-            if title_is_attachment else expected_main
-        )
-        expected_economic_viewer = (
-            _viewer_evidence_path(
-                expected_main,
-                prefix="economic_viewer",
-                dtd=evidence.economic_body_dtd,
-            )
-            if title_is_attachment else expected_viewer
-        )
-        if (
-            evidence.main_path != expected_main.relative_to(root).as_posix()
-            or evidence.viewer_path
-            != expected_viewer.relative_to(root).as_posix()
-            or evidence.economic_main_path
-            != expected_economic_main.relative_to(root).as_posix()
-            or evidence.economic_viewer_path
-            != expected_economic_viewer.relative_to(root).as_posix()
+        for relative, digest in (
+            (evidence.main_path, evidence.main_sha256),
+            (evidence.viewer_path, evidence.viewer_sha256),
+            (evidence.economic_main_path, evidence.economic_main_sha256),
+            (
+                evidence.economic_viewer_path,
+                evidence.economic_viewer_sha256,
+            ),
         ):
-            raise RuntimeError(
-                "DART viewer evidence path is non-canonical: "
-                f"{evidence.receipt_no}"
-            )
+            expected = (
+                OBJECT_ROOT_RELATIVE_PATH / f"sha256={digest}.html"
+            ).as_posix()
+            if relative != expected:
+                raise RuntimeError(
+                    "DART viewer evidence path is non-canonical: "
+                    f"{evidence.receipt_no}"
+                )
         source_page = parse_official_dart_main_page(
             evidence.receipt_no,
             (root / evidence.main_path).read_bytes(),
@@ -1293,6 +1770,52 @@ def verify_viewer_corrections(
         receipts.append(evidence)
     receipts.sort(key=lambda item: item.receipt_no)
     _validate_terminal_families(receipts, disclosures)
+    by_receipt = {item.receipt_no: item for item in receipts}
+    selected_probe_receipts = {
+        probe.receipt_no
+        for probe in dependency_probes
+        if probe.selected_dependency
+    }
+    primary_receipts = set(declared_seeds) | selected_probe_receipts
+    if not primary_receipts.issubset(by_receipt):
+        missing = sorted(primary_receipts - set(by_receipt))
+        raise RuntimeError(
+            f"DART viewer primary evidence is missing: {missing[:20]}"
+        )
+    primary_economic_bodies = {
+        by_receipt[receipt].economic_body_receipt_no
+        for receipt in primary_receipts
+    }
+    terminal_dependencies = {
+        by_receipt[receipt].official_family_order[0]
+        for receipt in primary_receipts
+        if by_receipt[receipt].official_family_order[0]
+        not in primary_economic_bodies
+    }
+    expected_dependencies = selected_probe_receipts | (
+        terminal_dependencies - set(declared_seeds)
+    )
+    if set(declared_dependencies) != expected_dependencies:
+        raise RuntimeError(
+            "DART viewer dependency closure changed: "
+            f"expected={sorted(expected_dependencies)[:20]} "
+            f"declared={list(declared_dependencies)[:20]}"
+        )
+    seed_cash_receipts = _seed_cash_receipts(
+        disclosures,
+        coverage_start=required_start,
+        coverage_end=required_end,
+    )
+    invalid_dependencies = sorted(
+        item.receipt_no for item in receipts
+        if item.receipt_no in set(declared_dependencies)
+        and not set(item.family_receipt_nos).intersection(seed_cash_receipts)
+    )
+    if invalid_dependencies:
+        raise RuntimeError(
+            "DART viewer dependency family has no in-range cash seed: "
+            f"{invalid_dependencies[:20]}"
+        )
     if set(declared_required) != {item.receipt_no for item in receipts}:
         raise RuntimeError("DART viewer manifest receipt set mismatch")
     digest = _receipt_digest(receipts)
@@ -1304,34 +1827,72 @@ def verify_viewer_corrections(
         base=str(root),
         manifest_path=str(manifest),
         manifest_sha256=hashlib.sha256(raw).hexdigest(),
+        seed_coverage_start=required_start,
+        seed_coverage_end=required_end,
+        seed_receipt_count=len(declared_seeds),
+        seed_receipt_digest=_receipt_identity_digest(declared_seeds),
+        dependency_receipt_count=len(declared_dependencies),
+        dependency_receipt_digest=_receipt_identity_digest(
+            declared_dependencies
+        ),
+        dependency_probe_count=len(dependency_probes),
+        dependency_probe_digest=_dependency_probe_digest(
+            dependency_probes
+        ),
         receipt_count=len(receipts),
         receipt_digest=digest,
+        dependency_probes=dependency_probes,
         receipts=tuple(receipts),
     )
 
 
-def evidence_by_receipt(base: str) -> dict[str, ViewerReceiptEvidence]:
-    verified = verify_viewer_corrections(base)
+def evidence_by_receipt(
+    base: str,
+    *,
+    required_start: date,
+    required_end: date,
+) -> dict[str, ViewerReceiptEvidence]:
+    verified = verify_viewer_corrections(
+        base, required_start=required_start, required_end=required_end,
+    )
     return {item.receipt_no: item for item in verified.receipts}
+
+
+def _cli_json_default(value: object) -> str:
+    if isinstance(value, date):
+        return value.isoformat()
+    raise TypeError(
+        f"Object of type {type(value).__name__} is not JSON serializable"
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True)
-    parser.add_argument("--receipt", action="append", default=[])
+    parser.add_argument("--coverage-start", type=date.fromisoformat, required=True)
+    parser.add_argument("--coverage-end", type=date.fromisoformat, required=True)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     result = collect_viewer_corrections(
         args.base,
-        extra_receipts=args.receipt,
+        coverage_start=args.coverage_start,
+        coverage_end=args.coverage_end,
         workers=args.workers,
         apply=args.apply,
     )
     if isinstance(result, dict):
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+        # The verified result intentionally keeps the certified coverage
+        # bounds as ``date`` values.  Keep the CLI success receipt JSON-safe
+        # instead of failing after the manifest has already been published.
+        print(json.dumps(
+            asdict(result),
+            ensure_ascii=False,
+            indent=2,
+            default=_cli_json_default,
+        ))
 
 
 if __name__ == "__main__":

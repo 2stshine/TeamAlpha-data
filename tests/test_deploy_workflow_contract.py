@@ -33,20 +33,44 @@ def test_ecs_task_definition_uses_the_pushed_image_digest():
     assert 'IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"' in workflow
     assert "IMAGE_URI: ${{ steps.image.outputs.image_uri }}" in workflow
     assert '--arg image "${IMAGE_URI}"' in workflow
+    assert '.entryPoint = ["uv", "run", "python", "-m", "pipeline.daily_full"]' in workflow
+    assert ".stopTimeout = 120" in workflow
+    assert "DAILY_CPU: '8192'" in workflow
+    assert "DAILY_MEMORY: '49152'" in workflow
+    assert "DAILY_EPHEMERAL_GIB: '120'" in workflow
+    assert ".cpu = $task_cpu" in workflow
+    assert ".memory = $task_memory" in workflow
+    assert '.ephemeralStorage = {"sizeInGiB": $ephemeral_gib}' in workflow
+    assert "del(.cpu, .memory, .memoryReservation)" in workflow
+    assert ".ephemeralStorage.sizeInGiB == $ephemeral" in workflow
 
 
-def test_deploy_preserves_existing_scheduler_state():
+def test_deploy_requires_and_preserves_fail_closed_disabled_scheduler():
     workflow = _read(".github/workflows/deploy.yml")
+    preflight = workflow.split(
+        "- name: Require daily Scheduler to be disabled", 1
+    )[1].split("- name: Log in to Amazon ECR", 1)[0]
     update_step = workflow.split(
         "- name: Update EventBridge Scheduler target", 1
     )[1].split("- name: Show deployed version", 1)[0]
 
+    assert "aws scheduler get-schedule" in preflight
+    assert '== "DISABLED"' in preflight
+    assert "Refusing deploy while daily Scheduler" in preflight
     assert "aws scheduler get-schedule" in update_step
     assert "CURRENT_SCHEDULE_STATE" in update_step
-    assert "^(ENABLED|DISABLED)$" in update_step
-    assert '--state "${CURRENT_SCHEDULE_STATE}"' in update_step
+    assert '== "DISABLED"' in update_step
+    assert "Scheduler changed during deploy" in update_step
+    assert "--state DISABLED" in update_step
+    assert '--state "${CURRENT_SCHEDULE_STATE}"' not in update_step
     assert '--group-name "${SCHEDULE_GROUP}"' in update_step
     assert "--state ENABLED" not in update_step
+    assert ".EcsParameters.TaskCount = 1" in update_step
+    assert '.RetryPolicy = {' in update_step
+    assert '"MaximumRetryAttempts": 0' in update_step
+    assert ".EcsParameters.TaskCount == 1" in update_step
+    assert ".RetryPolicy.MaximumRetryAttempts == 0" in update_step
+    assert "// 0" not in update_step
 
 
 def test_any_mutable_upstream_base_image_risk_is_explicitly_documented():
@@ -72,3 +96,18 @@ def test_any_mutable_upstream_base_image_risk_is_explicitly_documented():
     if mutable_images:
         assert "upstream 참조는 mutable" in readme
         assert "bit-for-bit 동일한 digest" in readme
+
+
+def test_local_dart_recovery_commands_bind_exact_seed_coverage():
+    readme = _read("README.md")
+
+    for module in (
+        "pipeline.bronze.dart_viewer_corrections",
+        "pipeline.bronze.dart_support_action_families",
+    ):
+        command = readme.split(f"uv run python -m {module}", 1)[1].split(
+            "\n\n", 1,
+        )[0]
+        assert "--coverage-start 2015-01-01" in command
+        assert "--coverage-end 2026-08-10" in command
+        assert "--apply" in command

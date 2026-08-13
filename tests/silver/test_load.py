@@ -1,4 +1,5 @@
 from datetime import date
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -46,6 +47,8 @@ def test_incremental_skips_market_holiday_without_any_change(monkeypatch):
         dividend_files=[],
         market_closed=True,
         has_action_change=False,
+        action_coverage_start=date(2015, 1, 1),
+        action_coverage_end=date(2026, 8, 15),
     )
 
     assert finish_statuses == ["SKIPPED"]
@@ -68,11 +71,88 @@ def test_incremental_does_not_skip_when_only_action_changed(monkeypatch):
             dividend_files=[],
             market_closed=True,
             has_action_change=True,
+            action_coverage_start=date(2015, 1, 1),
+            action_coverage_end=date(2026, 8, 15),
         )
 
     # Guard was passed: the run proceeds and the transform error marks it FAILED,
     # never SKIPPED.
     assert finish_statuses == ["FAILED"]
+
+
+def test_incremental_reuses_external_epoch_connection_without_closing(
+    monkeypatch,
+):
+    external = MagicMock()
+    monkeypatch.setattr(
+        load.db,
+        "connect",
+        lambda: pytest.fail("must not open an unfenced DB session"),
+    )
+    monkeypatch.setattr(load.repository, "assert_schema", lambda conn: None)
+    monkeypatch.setattr(
+        load.repository,
+        "start_run",
+        lambda conn, **kwargs: MagicMock(run_id="run-1", mode="daily"),
+    )
+    monkeypatch.setattr(load.repository, "finish_run", lambda *a, **k: None)
+
+    load.incremental(
+        "20260815",
+        "local",
+        financial_files=[],
+        dividend_files=[],
+        market_closed=True,
+        has_action_change=False,
+        action_coverage_start=date(2015, 1, 1),
+        action_coverage_end=date(2026, 8, 15),
+        conn=external,
+    )
+
+    external.close.assert_not_called()
+
+
+def test_direct_price_load_cli_is_disabled_before_writer_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        load,
+        "parse_args",
+        lambda: SimpleNamespace(
+            mode="incremental", src="local", date="20260810", resume=None,
+        ),
+    )
+    monkeypatch.setattr(
+        load,
+        "incremental",
+        lambda *args, **kwargs: pytest.fail("unsafe incremental reached"),
+    )
+
+    with pytest.raises(RuntimeError, match="direct Silver price load"):
+        load.main()
+
+
+@pytest.mark.parametrize(
+    ("coverage_start", "coverage_end", "message"),
+    [
+        (None, date(2026, 8, 15), "coverage start"),
+        (date(2015, 1, 2), date(2026, 8, 15), "coverage start"),
+        (date(2015, 1, 1), None, "must equal target_date"),
+        (date(2015, 1, 1), date(2026, 8, 16), "must equal target_date"),
+    ],
+)
+def test_incremental_fails_before_db_when_action_coverage_is_not_exact(
+    monkeypatch, coverage_start, coverage_end, message,
+):
+    monkeypatch.setattr(
+        load.db, "connect", lambda: pytest.fail("DB opened before scope check"),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load.incremental(
+            "20260815",
+            "local",
+            action_coverage_start=coverage_start,
+            action_coverage_end=coverage_end,
+        )
 
 
 def test_daily_candidate_filter_excludes_unmapped_actions_explicitly():

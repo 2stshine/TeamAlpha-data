@@ -16,9 +16,12 @@ must match exactly one verified row; a stable-scale event must not consume one.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
+import os
 import re
+import stat
 import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -29,17 +32,33 @@ from typing import Sequence
 import pandas as pd
 
 from pipeline.bronze.dart_support_action_families import (
+    MANIFEST_RELATIVE_PATH as SUPPORT_FAMILY_MANIFEST_RELATIVE_PATH,
+    bonus_issue_common_terms_from_body,
+    _action_type as support_family_action_type,
+    stock_dividend_common_terms_from_body,
     external_evidence_paths as support_family_external_evidence_paths,
     verify_support_action_families,
 )
 from pipeline.silver.krx_kind_reference import (
+    DartDetachmentNoticeNotFound,
     KIND_COMPONENT_REPORT_NAME_61474,
+    KIND_COMPONENT_REPORT_NAME_11306,
     KIND_REFERENCE_REPORT_NAME_70767,
     KIND_REFERENCE_REPORT_NAME_99311,
+    KIND_REFERENCE_REPORT_NAME_99302,
+    KIND_SUPPORT_MANIFEST_RELATIVE_PATH,
     external_evidence_paths as kind_external_evidence_paths,
     parse_kind_reference_notice,
+    parse_dart_detachment_notice,
     parse_kind_stock_dividend_component,
+    parse_kind_paid_increase_component,
     verify_kind_support_manifest,
+)
+from pipeline.silver.reviewed_cash_scale_exceptions import (
+    NO_NOTICE_BONUS_ISSUE,
+    NO_NOTICE_STOCK_DIVIDEND,
+    PAID_RIGHTS_IDENTITY,
+    REVIEWED_COMBINED_NOTICE_GROUP_KINDS,
 )
 
 
@@ -198,6 +217,16 @@ _DECIMAL_PLACES = {
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _RECEIPT_PATTERN = re.compile(r"^[0-9]{14}$")
 _TICKER_PATTERN = re.compile(r"^[0-9A-Z]{6}$")
+_DART_VIEWER_BODY_PATTERN = re.compile(
+    r"^corporate_actions/dart/support_action_families/objects/"
+    r"sha256=([0-9a-f]{64})\.html$"
+)
+_DART_VIEWER_BONUS_REPORT_PATTERN = re.compile(
+    r"^(?:\[기재정정\])?주요사항보고서\(무상증자결정\)$"
+)
+_DART_VIEWER_STOCK_REPORT_PATTERN = re.compile(
+    r"^(?:\[기재정정\])?주식배당결정$"
+)
 
 
 @dataclass(frozen=True)
@@ -234,6 +263,27 @@ class BoundScaleSourceEvidence:
 
     frame: pd.DataFrame
     support_frame: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class _FrozenEvidenceBody:
+    """One regular evidence object read once and parsed only from these bytes."""
+
+    path: Path
+    rendered_path: str
+    expected_sha256: str
+    payload: bytes
+    file_identity: tuple[int, int, int, int, int]
+
+
+_EvidenceReadSet = dict[str, _FrozenEvidenceBody]
+
+
+@dataclass(frozen=True)
+class _OptionalEvidencePathState:
+    rendered_path: str
+    exists: bool
+    sha256: str | None
 
 
 def _sha256(path: Path) -> str:
@@ -387,28 +437,336 @@ _manifest_row_sha = manifest_parent_row_sha256
 _manifest_support_row_sha = manifest_support_row_sha256
 
 
-def _require_relative_body(
+def _reject_symlink_components(root: Path, candidate: Path) -> None:
+    current = root
+    for part in candidate.parts:
+        current = current / part
+        try:
+            if current.is_symlink():
+                raise RuntimeError(
+                    f"evidence body path contains a symlink: {candidate}"
+                )
+        except OSError as exc:
+            raise RuntimeError(
+                f"evidence body path cannot be inspected: {candidate}"
+            ) from exc
+
+
+def _regular_file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _read_regular_file_no_follow(path: Path) -> tuple[bytes, tuple[int, int, int, int, int]]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if no_follow == 0:
+        raise RuntimeError("platform cannot enforce no-follow evidence reads")
+    try:
+        descriptor = os.open(path, flags | no_follow)
+    except OSError as exc:
+        raise RuntimeError(f"evidence body cannot be opened safely: {path}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"evidence body is not a regular file: {path}")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if _regular_file_identity(before) != _regular_file_identity(after):
+        raise RuntimeError(f"evidence body changed while being read: {path}")
+    return b"".join(chunks), _regular_file_identity(after)
+
+
+def _require_frozen_relative_body(
     root: Path,
     row: dict[str, object],
     *,
     path_field: str,
     sha_field: str,
-) -> Path:
+    read_set: _EvidenceReadSet | None = None,
+) -> _FrozenEvidenceBody:
     rendered = str(row.get(path_field) or "").strip()
     candidate = Path(rendered)
     if not rendered or candidate.is_absolute() or ".." in candidate.parts:
         raise RuntimeError(f"invalid evidence body path: {path_field}={rendered!r}")
-    path = (root / candidate).resolve()
-    try:
-        path.relative_to(root)
-    except ValueError as exc:
-        raise RuntimeError(f"evidence body escapes snapshot: {rendered}") from exc
     expected = str(row.get(sha_field) or "")
-    if not path.is_file() or _SHA_PATTERN.fullmatch(expected) is None:
+    if _SHA_PATTERN.fullmatch(expected) is None:
         raise RuntimeError(f"cash-scale evidence body missing/invalid: {rendered}")
-    if _sha256(path) != expected:
+    if read_set is not None and rendered in read_set:
+        frozen = read_set[rendered]
+        if frozen.expected_sha256 != expected:
+            raise RuntimeError(
+                f"one evidence path has conflicting SHA identities: {rendered}"
+            )
+        return frozen
+    _reject_symlink_components(root, candidate)
+    path = root / candidate
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"evidence body escapes snapshot: {rendered}") from exc
+    if resolved != path:
+        raise RuntimeError(f"evidence body path is not direct: {rendered}")
+    payload, identity = _read_regular_file_no_follow(path)
+    if hashlib.sha256(payload).hexdigest() != expected:
         raise RuntimeError(f"cash-scale evidence SHA mismatch: {rendered}")
-    return path
+    _reject_symlink_components(root, candidate)
+    try:
+        current = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(f"evidence body changed while being frozen: {rendered}") from exc
+    if _regular_file_identity(current) != identity:
+        raise RuntimeError(f"evidence body changed while being frozen: {rendered}")
+    frozen = _FrozenEvidenceBody(
+        path=path,
+        rendered_path=rendered,
+        expected_sha256=expected,
+        payload=payload,
+        file_identity=identity,
+    )
+    if read_set is not None:
+        read_set[rendered] = frozen
+    return frozen
+
+
+def _assert_frozen_body_unchanged(root: Path, body: _FrozenEvidenceBody) -> None:
+    candidate = Path(body.rendered_path)
+    _reject_symlink_components(root, candidate)
+    current_payload, current_identity = _read_regular_file_no_follow(body.path)
+    if (
+        current_identity != body.file_identity
+        or current_payload != body.payload
+        or hashlib.sha256(current_payload).hexdigest() != body.expected_sha256
+    ):
+        raise RuntimeError(
+            f"evidence body changed during verification: {body.rendered_path}"
+        )
+
+
+def _assert_frozen_read_set_unchanged(
+    root: Path,
+    read_set: _EvidenceReadSet,
+) -> None:
+    for rendered in sorted(read_set):
+        _assert_frozen_body_unchanged(root, read_set[rendered])
+
+
+def _freeze_unhashed_relative_path(
+    root: Path,
+    relative: Path,
+    *,
+    read_set: _EvidenceReadSet,
+) -> _FrozenEvidenceBody:
+    """Freeze an invocation-owned manifest whose digest is derived locally."""
+    rendered = relative.as_posix()
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError(f"invalid evidence manifest path: {rendered!r}")
+    if rendered in read_set:
+        return read_set[rendered]
+    _reject_symlink_components(root, relative)
+    path = root / relative
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"evidence manifest escapes snapshot: {rendered}") from exc
+    if resolved != path:
+        raise RuntimeError(f"evidence manifest path is not direct: {rendered}")
+    payload, identity = _read_regular_file_no_follow(path)
+    digest = hashlib.sha256(payload).hexdigest()
+    _reject_symlink_components(root, relative)
+    try:
+        current = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(
+            f"evidence manifest changed while being frozen: {rendered}"
+        ) from exc
+    if _regular_file_identity(current) != identity:
+        raise RuntimeError(
+            f"evidence manifest changed while being frozen: {rendered}"
+        )
+    frozen = _FrozenEvidenceBody(
+        path=path,
+        rendered_path=rendered,
+        expected_sha256=digest,
+        payload=payload,
+        file_identity=identity,
+    )
+    read_set[rendered] = frozen
+    return frozen
+
+
+def _freeze_optional_relative_path(
+    root: Path,
+    relative: Path,
+    *,
+    read_set: _EvidenceReadSet,
+) -> _OptionalEvidencePathState:
+    rendered = relative.as_posix()
+    _reject_symlink_components(root, relative)
+    path = root / relative
+    if not path.exists():
+        return _OptionalEvidencePathState(rendered, False, None)
+    if not path.is_file():
+        raise RuntimeError(f"evidence closure path is not a file: {rendered}")
+    frozen = _freeze_unhashed_relative_path(
+        root, relative, read_set=read_set,
+    )
+    return _OptionalEvidencePathState(
+        rendered, True, frozen.expected_sha256,
+    )
+
+
+def _assert_optional_path_state_unchanged(
+    root: Path,
+    state: _OptionalEvidencePathState,
+    *,
+    read_set: _EvidenceReadSet,
+) -> None:
+    relative = Path(state.rendered_path)
+    _reject_symlink_components(root, relative)
+    path = root / relative
+    if path.exists() != state.exists:
+        raise RuntimeError(
+            f"evidence closure existence changed during verification: "
+            f"{state.rendered_path}"
+        )
+    if state.exists:
+        frozen = read_set.get(state.rendered_path)
+        if frozen is None or frozen.expected_sha256 != state.sha256:
+            raise RuntimeError(
+                f"evidence closure identity was not frozen: {state.rendered_path}"
+            )
+        _assert_frozen_body_unchanged(root, frozen)
+
+
+def _freeze_closure_paths(
+    root: Path,
+    relative_paths: Sequence[Path],
+    *,
+    read_set: _EvidenceReadSet,
+) -> tuple[str, ...]:
+    rendered_paths = tuple(sorted({path.as_posix() for path in relative_paths}))
+    for rendered in rendered_paths:
+        _freeze_unhashed_relative_path(
+            root, Path(rendered), read_set=read_set,
+        )
+    return rendered_paths
+
+
+def _support_upstream_closure_paths(
+    root: Path,
+    snapshot: object | None,
+) -> tuple[Path, ...]:
+    if snapshot is None:
+        return ()
+    paths = {Path(snapshot.manifest_path)}
+    for entry in snapshot.entries:
+        for source in entry.sources:
+            paths.update({
+                Path(source.main_path),
+                Path(source.body_path),
+                Path(source.disclosure_path),
+                Path(source.disclosure_manifest_path),
+            })
+            if source.structured_path is not None:
+                paths.add(Path(source.structured_path))
+    manifest_root = root / "corporate_actions/dart/manifests"
+    for manifest in manifest_root.glob("from=*/to=*/disclosures_v3.json"):
+        paths.add(manifest.relative_to(root))
+        for marker_name in (
+            "structured_complete_v3.json", "documents_complete_v5.json",
+        ):
+            marker = manifest.parent / marker_name
+            if marker.exists():
+                paths.add(marker.relative_to(root))
+    paths.update(
+        path.relative_to(root)
+        for path in root.glob(
+            "corporate_actions/dart/structured/event=bonus_issue/"
+            "year=*/corp=*/rcept=*.json"
+        )
+    )
+    return tuple(sorted(paths, key=Path.as_posix))
+
+
+def _support_relevant_disclosure_paths(
+    root: Path,
+    *,
+    read_set: _EvidenceReadSet,
+) -> tuple[Path, ...]:
+    """Return only individual rows the upstream family verifier can read."""
+    receipts: set[str] = set()
+    for rendered, frozen in read_set.items():
+        if not rendered.endswith("/disclosures_v3.json"):
+            continue
+        try:
+            rows = json.loads(frozen.payload)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"invalid frozen DART disclosure manifest: {rendered}"
+            ) from exc
+        if not isinstance(rows, list):
+            raise RuntimeError(
+                f"frozen DART disclosures must be a list: {rendered}"
+            )
+        receipts.update(
+            str(row.get("rcept_no") or "")
+            for row in rows
+            if isinstance(row, dict)
+            and support_family_action_type(row.get("report_nm")) is not None
+            and _RECEIPT_PATTERN.fullmatch(
+                str(row.get("rcept_no") or "")
+            ) is not None
+        )
+    paths = {
+        path.relative_to(root)
+        for path in root.glob(
+            "corporate_actions/dart/disclosures/"
+            "year=*/date=*/corp=*/rcept=*.json"
+        )
+        if path.stem.removeprefix("rcept=") in receipts
+    }
+    return tuple(sorted(paths, key=Path.as_posix))
+
+
+def _kind_upstream_closure_paths(
+    kind_rows: Sequence[dict[str, object]],
+    manifest_state: _OptionalEvidencePathState,
+    *,
+    read_set: _EvidenceReadSet,
+) -> tuple[Path, ...]:
+    if not manifest_state.exists:
+        return ()
+    manifest = read_set[manifest_state.rendered_path]
+    try:
+        payload = json.loads(manifest.payload)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("invalid frozen KIND support manifest") from exc
+    paths = {Path(manifest_state.rendered_path)}
+    for field in ("reference_request_path", "component_request_path"):
+        rendered = str(payload.get(field) or "")
+        if rendered:
+            paths.add(Path(rendered))
+    for row in kind_rows:
+        for field in (
+            "support_action_body_path", "identity_body_path",
+            "contents_body_path",
+        ):
+            rendered = str(row.get(field) or "")
+            if rendered:
+                paths.add(Path(rendered))
+    return tuple(sorted(paths, key=Path.as_posix))
 
 
 def _number(value: object, *, field: str) -> float:
@@ -422,7 +780,7 @@ def _number(value: object, *, field: str) -> float:
 
 
 def _price_observation(
-    path: Path,
+    body: _FrozenEvidenceBody,
     *,
     schema: str,
     ticker: str,
@@ -440,9 +798,11 @@ def _price_observation(
     else:
         raise RuntimeError(f"unsupported cash-scale KRX price schema: {schema}")
     try:
-        raw = pd.read_parquet(path, columns=required)
+        raw = pd.read_parquet(io.BytesIO(body.payload), columns=required)
     except Exception as exc:  # noqa: BLE001 - fail closed on provider drift
-        raise RuntimeError(f"invalid KRX evidence parquet: {path}") from exc
+        raise RuntimeError(
+            f"invalid KRX evidence parquet: {body.path}"
+        ) from exc
     code = raw[code_field].astype(str).str.upper().str.zfill(6)
     observed_date = pd.to_datetime(
         raw[date_field].astype(str), errors="coerce",
@@ -470,43 +830,52 @@ def _price_body(
     *,
     prefix: str,
     trade_date: date,
+    read_set: _EvidenceReadSet | None = None,
 ) -> tuple[float, float | None]:
-    path = _require_relative_body(
+    body = _require_frozen_relative_body(
         root,
         row,
         path_field=f"{prefix}_price_source_object_key",
         sha_field=f"{prefix}_price_source_content_sha256",
+        read_set=read_set,
     )
-    if path.suffix != ".parquet":
+    if body.path.suffix != ".parquet":
         raise RuntimeError("cash-scale KRX price body must be parquet")
     etag = str(row.get(f"{prefix}_price_source_etag") or "").strip('"')
     if re.fullmatch(r"[0-9a-f]{32}(?:-[0-9]+)?", etag) is None:
         raise RuntimeError("cash-scale KRX price object ETag is invalid")
     if "-" not in etag:
-        md5 = hashlib.md5(usedforsecurity=False)
-        with path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                md5.update(chunk)
-        if md5.hexdigest() != etag:
+        if hashlib.md5(
+            body.payload, usedforsecurity=False,
+        ).hexdigest() != etag:
             raise RuntimeError("cash-scale KRX price object ETag/body mismatch")
-    return _price_observation(
-        path,
+    observation = _price_observation(
+        body,
         schema=str(row.get(f"{prefix}_price_source_schema") or ""),
         ticker=str(row["ticker"]),
         trade_date=trade_date,
     )
+    _assert_frozen_body_unchanged(root, body)
+    return observation
 
 
-def _verify_price_bodies(root: Path, row: dict[str, object]) -> None:
+def _verify_price_bodies(
+    root: Path,
+    row: dict[str, object],
+    *,
+    read_set: _EvidenceReadSet | None = None,
+) -> None:
     if row.get("price_source") != "KRX":
         raise RuntimeError("cash-scale price source must be KRX")
     previous_date = pd.Timestamp(row["previous_trade_date"]).date()
     adjustment_date = pd.Timestamp(row["adjustment_trade_date"]).date()
     previous_close, _ = _price_body(
         root, row, prefix="previous", trade_date=previous_date,
+        read_set=read_set,
     )
     applied_close, reference = _price_body(
         root, row, prefix="adjustment", trade_date=adjustment_date,
+        read_set=read_set,
     )
     if reference is None or reference <= 0:
         raise RuntimeError("KRX adjustment body lacks a positive reference price")
@@ -535,8 +904,7 @@ def _verify_price_bodies(root: Path, row: dict[str, object]) -> None:
         raise RuntimeError("cash-scale expected price factor is inconsistent")
 
 
-def _visible_html(path: Path) -> str:
-    raw = path.read_bytes()
+def _visible_html(raw: bytes) -> str:
     for encoding in ("utf-8", "euc-kr", "cp949"):
         try:
             text = raw.decode(encoding)
@@ -624,13 +992,18 @@ def _verify_support_body(
     root: Path,
     parent: dict[str, object],
     row: dict[str, object],
+    *,
+    read_set: _EvidenceReadSet | None = None,
 ) -> None:
-    path = _require_relative_body(
+    body = _require_frozen_relative_body(
         root,
         row,
         path_field="support_action_body_path",
         sha_field="support_action_body_sha256",
+        read_set=read_set,
     )
+    path = body.path
+    raw_body = body.payload
     source = str(row.get("support_action_source") or "")
     action_type = str(row.get("support_action_type") or "")
     action_key = str(row.get("support_action_key") or "")
@@ -649,11 +1022,15 @@ def _verify_support_body(
         raise RuntimeError("cash-scale support semantic role is invalid")
     if row["support_semantic_role"] == "ADJUSTMENT_COMPONENT":
         allowed_component = (
-            (source == "DART_STRUCTURED" and action_type == "bonus_issue")
+            (
+                source in {"DART_STRUCTURED", "DART_VIEWER"}
+                and action_type == "bonus_issue"
+            )
             or (
-                source in {"DART_DISCLOSURE", "KRX_KIND"}
+                source in {"DART_DISCLOSURE", "DART_VIEWER", "KRX_KIND"}
                 and action_type == "stock_dividend"
             )
+            or (source == "KRX_KIND" and action_type == "paid_increase")
         )
         if not allowed_component:
             raise RuntimeError("unsupported adjustment-component action semantics")
@@ -667,32 +1044,103 @@ def _verify_support_body(
     if source == "DART_DISCLOSURE":
         if _RECEIPT_PATTERN.fullmatch(action_key) is None:
             raise RuntimeError("DART support action key must be a receipt")
-        if not zipfile.is_zipfile(path):
+        if not zipfile.is_zipfile(io.BytesIO(raw_body)):
             raise RuntimeError("DART support action body must be an official ZIP")
-        with zipfile.ZipFile(path) as archive:
+        with zipfile.ZipFile(io.BytesIO(raw_body)) as archive:
             payloads = [archive.read(name) for name in archive.namelist()]
             visible = " ".join(_visible_bytes(payload) for payload in payloads)
         compact = re.sub(r"\s+", "", visible)
-        if action_type == "ex_dividend":
+        if action_type in {
+            "ex_dividend", "rights_detachment", "combined_detachment",
+        }:
+            notices = []
+            for payload in payloads:
+                try:
+                    notices.append(parse_dart_detachment_notice(payload))
+                except DartDetachmentNoticeNotFound:
+                    continue
+                except RuntimeError as exc:
+                    if str(exc) != (
+                        "DART detachment notice schema is unsupported"
+                    ):
+                        raise
+                    continue
+            unique = list(dict.fromkeys(notices))
+            if len(unique) != 1:
+                raise RuntimeError(
+                    "DART detachment notice is missing/ambiguous"
+                )
+            notice = unique[0]
+            parent_ticker = str(parent.get("ticker") or "").zfill(6)
+            entitlement = row.get("support_entitlement_security_class")
+            expected_class = (
+                str(entitlement)
+                if entitlement in {"COMMON", "PREFERRED"}
+                else "COMMON"
+            )
+            reference = row.get("support_reference_price")
+            reason = re.sub(
+                r"\s+", " ", str(row.get("support_reason") or ""),
+            ).strip()
             if (
-                "배당락" not in compact or "주식배당" not in compact
-                or "배당락" not in report_name or "주식배당" not in report_name
+                notice.ticker != parent_ticker
+                or notice.security_class != expected_class
+                or notice.effective_date != adjustment_date
+                or row.get("support_ex_date") != adjustment_date
+                or notice.action_type != action_type
+            ):
+                raise RuntimeError("DART detachment notice identity changed")
+            if (
+                reference is None
+                or pd.isna(reference)
+                or not math.isclose(
+                    float(reference), notice.reference_price,
+                    rel_tol=0, abs_tol=1e-8,
+                )
+                or not math.isclose(
+                    float(reference), float(parent["raw_reference_price"]),
+                    rel_tol=0, abs_tol=1e-8,
+                )
             ):
                 raise RuntimeError(
-                    "DART support body is not a stock-dividend ex notice"
+                    "DART detachment notice reference price changed"
                 )
-            if not _body_has_date(compact, adjustment_date):
-                raise RuntimeError("DART support body lacks the adjustment date")
-        elif action_type == "rights_detachment":
-            if (
-                "권리락" not in compact or "무상증자" not in compact
-                or "권리락" not in report_name
-            ):
+            if reason != notice.reason:
+                raise RuntimeError("DART detachment notice reason changed")
+            compact_reason = re.sub(r"\s+", "", notice.reason)
+            groups = _support_groups(row.get("support_semantic_group_keys"))
+            group_kinds = {
+                group.split("|")[2] for group in groups
+                if len(group.split("|")) == 4
+            }
+            reason_group_parity = (
+                action_type == "ex_dividend"
+                and "주식배당" in compact_reason
+                and group_kinds == {"STOCK_DIVIDEND"}
+            ) or (
+                action_type == "rights_detachment"
+                and "무상증자" in compact_reason
+                and group_kinds == {"BONUS_ISSUE"}
+            ) or (
+                action_type == "rights_detachment"
+                and "유상증자" in compact_reason
+                and group_kinds == {"PAID_INCREASE"}
+            ) or (
+                action_type == "combined_detachment"
+                and all(
+                    token in compact_reason for token in ("배당", "무상증자")
+                )
+                and REVIEWED_COMBINED_NOTICE_GROUP_KINDS.get(
+                    str(row.get("support_action_key"))
+                ) == frozenset(group_kinds)
+            )
+            if not reason_group_parity:
                 raise RuntimeError(
-                    "DART support body is not a bonus rights-detachment notice"
+                    "DART detachment notice reason/group semantics changed: "
+                    f"action={action_type} reason={notice.reason} "
+                    f"groups={sorted(group_kinds)} "
+                    f"key={row.get('support_action_key')}"
                 )
-            if not _body_has_date(compact, adjustment_date):
-                raise RuntimeError("DART support body lacks the adjustment date")
         elif action_type == "stock_dividend":
             if (
                 "주식배당" not in compact or "결정" not in compact
@@ -739,47 +1187,6 @@ def _verify_support_body(
                         "support_distributed_security_class"
                     ),
                 )
-        elif action_type == "combined_detachment":
-            if "권배락" not in compact or "권배락" not in report_name:
-                raise RuntimeError(
-                    "DART support body is not a combined rights/dividend notice"
-                )
-            if not _body_has_date(compact, adjustment_date):
-                raise RuntimeError("combined-detachment body lacks adjustment date")
-            labelled = _exact_labelled_values(payloads)
-            if (
-                len(labelled["reference"]) != 1
-                or len(labelled["reason"]) != 1
-            ):
-                raise RuntimeError(
-                    "combined-detachment labelled fields are missing/ambiguous"
-                )
-            reason = re.sub(r"\s+", " ", str(
-                row.get("support_reason") or ""
-            )).strip()
-            body_reason = re.sub(r"\s+", " ", labelled["reason"][0]).strip()
-            reference = row.get("support_reference_price")
-            if (
-                not reason or reason != body_reason
-                or "무상증자" not in re.sub(r"\s+", "", body_reason)
-                or "배당" not in re.sub(r"\s+", "", body_reason)
-            ):
-                raise RuntimeError("combined-detachment labelled reason changed")
-            if reference is None or pd.isna(reference) or not math.isclose(
-                float(reference), float(parent["raw_reference_price"]),
-                rel_tol=0, abs_tol=1e-8,
-            ):
-                raise RuntimeError("combined-detachment reference price mismatch")
-            body_reference = _number(
-                labelled["reference"][0],
-                field="combined-detachment labelled reference price",
-            )
-            if not math.isclose(
-                float(reference), body_reference, rel_tol=0, abs_tol=1e-8,
-            ):
-                raise RuntimeError(
-                    "combined-detachment labelled reference price changed"
-                )
         else:
             raise RuntimeError(
                 f"unsupported DART cash-scale support type: {action_type}"
@@ -788,8 +1195,8 @@ def _verify_support_body(
         if action_type != "bonus_issue" or "무상증자" not in report_name:
             raise RuntimeError("structured support must be an issuer bonus issue")
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RuntimeError("structured bonus support body is invalid JSON") from exc
         if str(payload.get("rcept_no") or "") != action_key:
             raise RuntimeError("structured support receipt/body mismatch")
@@ -820,6 +1227,84 @@ def _verify_support_body(
             or row.get("support_distributed_security_class") != "COMMON"
         ):
             raise RuntimeError("structured bonus security-class semantics changed")
+    elif source == "DART_VIEWER":
+        if row.get("support_semantic_role") != "ADJUSTMENT_COMPONENT":
+            raise RuntimeError("viewer support must be an adjustment component")
+        if _RECEIPT_PATTERN.fullmatch(action_key) is None:
+            raise RuntimeError("viewer support action key must be a receipt")
+        path_match = _DART_VIEWER_BODY_PATTERN.fullmatch(
+            str(row.get("support_action_body_path") or "")
+        )
+        if (
+            path_match is None
+            or path_match.group(1)
+            != str(row.get("support_action_body_sha256") or "")
+            or zipfile.is_zipfile(io.BytesIO(raw_body))
+        ):
+            raise RuntimeError(
+                "viewer support must bind its content-addressed HTML"
+            )
+        if action_type == "bonus_issue":
+            if _DART_VIEWER_BONUS_REPORT_PATTERN.fullmatch(report_name) is None:
+                raise RuntimeError("viewer bonus report-name contract changed")
+            terms = bonus_issue_common_terms_from_body(raw_body)
+        elif action_type == "stock_dividend":
+            if _DART_VIEWER_STOCK_REPORT_PATTERN.fullmatch(report_name) is None:
+                raise RuntimeError(
+                    "viewer stock-dividend report-name contract changed"
+                )
+            terms = stock_dividend_common_terms_from_body(raw_body)
+        else:
+            raise RuntimeError("unsupported viewer adjustment-component action")
+        if terms is None or float(terms.common_ratio) <= 0:
+            raise RuntimeError("viewer support lacks positive common terms")
+        numerator = row.get("support_ratio_numerator")
+        denominator = row.get("support_ratio_denominator")
+        if (
+            numerator is None or denominator is None
+            or pd.isna(numerator) or pd.isna(denominator)
+            or float(denominator) <= 0
+            or not math.isclose(
+                float(numerator) / float(denominator),
+                float(terms.common_ratio),
+                rel_tol=0,
+                abs_tol=5e-13,
+            )
+        ):
+            raise RuntimeError("viewer support ratio mismatch")
+        parsed_record_date = date.fromisoformat(terms.record_date)
+        if action_type == "bonus_issue":
+            expected = row.get("support_expected_price_factor")
+            expected_factor = 1.0 / (1.0 + float(terms.common_ratio))
+            if expected is None or pd.isna(expected) or not math.isclose(
+                float(expected), expected_factor, rel_tol=0, abs_tol=5e-13,
+            ):
+                raise RuntimeError("viewer bonus expected factor mismatch")
+            support_effective_date = row.get("support_ex_date")
+            if (
+                support_effective_date is None
+                or pd.isna(support_effective_date)
+                or pd.Timestamp(support_effective_date).date()
+                != parsed_record_date
+                or (
+                    row.get("support_record_date") is not None
+                    and not pd.isna(row.get("support_record_date"))
+                )
+            ):
+                raise RuntimeError("viewer bonus record-date parity failed")
+        elif (
+            row.get("support_ex_date") is not None
+            and not pd.isna(row.get("support_ex_date"))
+        ) or row.get("support_record_date") != parsed_record_date or (
+            row.get("support_expected_price_factor") is not None
+            and not pd.isna(row.get("support_expected_price_factor"))
+        ):
+            raise RuntimeError("viewer stock-dividend date/factor parity failed")
+        if (
+            row.get("support_entitlement_security_class") != "COMMON"
+            or row.get("support_distributed_security_class") != "COMMON"
+        ):
+            raise RuntimeError("viewer support security-class semantics changed")
     elif source == "KRX_KIND":
         role = str(row.get("support_semantic_role") or "")
         if role == "CORROBORATION":
@@ -827,7 +1312,7 @@ def _verify_support_body(
                 "ex_dividend", "rights_detachment", "combined_detachment",
             }:
                 raise RuntimeError("KIND corroboration action type changed")
-            notice = parse_kind_reference_notice(path.read_bytes())
+            notice = parse_kind_reference_notice(raw_body)
             reference = row.get("support_reference_price")
             expected_report_name = (
                 KIND_REFERENCE_REPORT_NAME_99311
@@ -861,10 +1346,17 @@ def _verify_support_body(
                 or raw_report_name != expected_report_name
             ):
                 raise RuntimeError("KIND reference notice semantics changed")
+            _assert_frozen_body_unchanged(root, body)
             return
-        if role != "ADJUSTMENT_COMPONENT" or action_type != "stock_dividend":
-            raise RuntimeError("KIND cash-scale component must be stock_dividend")
-        component = parse_kind_stock_dividend_component(path.read_bytes())
+        if role != "ADJUSTMENT_COMPONENT" or action_type not in {
+            "stock_dividend", "paid_increase",
+        }:
+            raise RuntimeError("KIND cash-scale component type changed")
+        component = (
+            parse_kind_stock_dividend_component(raw_body)
+            if action_type == "stock_dividend"
+            else parse_kind_paid_increase_component(raw_body)
+        )
         numerator = row.get("support_ratio_numerator")
         denominator = row.get("support_ratio_denominator")
         if (
@@ -886,12 +1378,16 @@ def _verify_support_body(
             != component.entitlement_security_class
             or row.get("support_distributed_security_class")
             != component.distributed_security_class
-            or raw_report_name != KIND_COMPONENT_REPORT_NAME_61474
-            or component.report_name != KIND_COMPONENT_REPORT_NAME_61474
+            or raw_report_name != component.report_name
+            or component.report_name not in {
+                KIND_COMPONENT_REPORT_NAME_61474,
+                KIND_COMPONENT_REPORT_NAME_11306,
+            }
         ):
             raise RuntimeError("KIND stock-dividend semantics changed")
     else:
         raise RuntimeError(f"unsupported cash-scale support source: {source}")
+    _assert_frozen_body_unchanged(root, body)
 
 
 def _visible_bytes(raw: bytes) -> str:
@@ -906,42 +1402,54 @@ def _visible_bytes(raw: bytes) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text))
 
 
-def _verify_cash_bodies(root: Path, row: dict[str, object]) -> None:
-    action_body = _require_relative_body(
+def _verify_cash_bodies(
+    root: Path,
+    row: dict[str, object],
+    *,
+    read_set: _EvidenceReadSet | None = None,
+) -> None:
+    action_body = _require_frozen_relative_body(
         root,
         row,
         path_field="cash_action_body_path",
         sha_field="cash_action_body_sha256",
+        read_set=read_set,
     )
-    economic_body = _require_relative_body(
+    economic_body = _require_frozen_relative_body(
         root,
         row,
         path_field="cash_economic_body_path",
         sha_field="cash_economic_sha256",
+        read_set=read_set,
     )
     status = str(row.get("cash_source_evidence_status") or "")
     schema = str(row.get("cash_economic_body_schema") or "")
     if status == "VERIFIED_OPENDART_DOCUMENT":
         if schema != "OPENDART_DOCUMENT_ZIP_V1":
             raise RuntimeError("OpenDART cash body schema mismatch")
-        if action_body != economic_body or not zipfile.is_zipfile(economic_body):
+        if (
+            action_body.rendered_path != economic_body.rendered_path
+            or action_body.expected_sha256 != economic_body.expected_sha256
+            or action_body.payload != economic_body.payload
+            or not zipfile.is_zipfile(io.BytesIO(economic_body.payload))
+        ):
             raise RuntimeError("OpenDART cash evidence must bind the exact ZIP")
     elif status == "VERIFIED_DART_VIEWER_BODY":
         if schema != "DART_VIEWER_HTML_V1":
             raise RuntimeError("DART viewer cash body schema mismatch")
-        if zipfile.is_zipfile(economic_body):
+        if zipfile.is_zipfile(io.BytesIO(economic_body.payload)):
             raise RuntimeError("DART viewer economic body cannot be a ZIP")
-        visible = _visible_html(economic_body)
+        visible = _visible_html(economic_body.payload)
         if "배당" not in visible or not re.search(r"현금|원", visible):
             raise RuntimeError("DART viewer body lacks cash-dividend semantics")
     elif status == "VERIFIED_REVIEWED_SOURCE_ERRATUM":
         if schema != "REVIEWED_PERIODIC_JSON_V1":
             raise RuntimeError("reviewed cash body schema mismatch")
-        if not zipfile.is_zipfile(action_body):
+        if not zipfile.is_zipfile(io.BytesIO(action_body.payload)):
             raise RuntimeError("reviewed cash evidence lacks its source ZIP")
         try:
-            payload = json.loads(economic_body.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            payload = json.loads(economic_body.payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RuntimeError("reviewed cash economic body is invalid JSON") from exc
         if not isinstance(payload.get("list"), list):
             raise RuntimeError("reviewed cash economic response has no list")
@@ -949,9 +1457,17 @@ def _verify_cash_bodies(root: Path, row: dict[str, object]) -> None:
         raise RuntimeError(
             f"unsupported terminal cash evidence status: {status}"
         )
+    _assert_frozen_body_unchanged(root, action_body)
+    if economic_body.rendered_path != action_body.rendered_path:
+        _assert_frozen_body_unchanged(root, economic_body)
 
 
-def _validate_manifest_row(root: Path, row: dict[str, object]) -> dict[str, object]:
+def _validate_manifest_row(
+    root: Path,
+    row: dict[str, object],
+    *,
+    read_set: _EvidenceReadSet | None = None,
+) -> dict[str, object]:
     missing = sorted(set(MANIFEST_ROW_COLUMNS) - set(row))
     if missing:
         raise RuntimeError(f"cash-scale evidence row fields missing: {missing}")
@@ -977,8 +1493,8 @@ def _validate_manifest_row(root: Path, row: dict[str, object]) -> dict[str, obje
     adjustment_date = pd.Timestamp(row["adjustment_trade_date"]).date()
     if previous_date >= adjustment_date:
         raise RuntimeError("cash-scale previous date must precede adjustment date")
-    _verify_cash_bodies(root, row)
-    _verify_price_bodies(root, row)
+    _verify_cash_bodies(root, row, read_set=read_set)
+    _verify_price_bodies(root, row, read_set=read_set)
     normalized = dict(row)
     normalized["previous_trade_date"] = previous_date
     normalized["adjustment_trade_date"] = adjustment_date
@@ -1002,6 +1518,8 @@ def _validate_support_row(
     root: Path,
     parent: dict[str, object],
     row: dict[str, object],
+    *,
+    read_set: _EvidenceReadSet | None = None,
 ) -> dict[str, object]:
     missing = sorted(set(MANIFEST_SUPPORT_ACTION_COLUMNS) - set(row))
     if missing:
@@ -1038,7 +1556,7 @@ def _validate_support_row(
             None if value is None or pd.isna(value)
             else _number(value, field=field)
         )
-    _verify_support_body(root, parent, row)
+    _verify_support_body(root, parent, row, read_set=read_set)
     expected_row_sha = _manifest_support_row_sha(row)
     if str(row.get("manifest_support_row_sha256") or "") != expected_row_sha:
         raise RuntimeError(
@@ -1103,6 +1621,37 @@ def _validate_support_groups(
     memberships: dict[str, list[int]] = {}
     for index, row in support.iterrows():
         groups = _support_groups(row["support_semantic_group_keys"])
+        if row["support_action_source"] == "DART_VIEWER":
+            try:
+                numerator = float(row["support_ratio_numerator"])
+                denominator = float(row["support_ratio_denominator"])
+                ratio = numerator / denominator
+                group_date_field = (
+                    "support_ex_date"
+                    if row["support_action_type"] == "bonus_issue"
+                    else "support_record_date"
+                )
+                effective = pd.Timestamp(row[group_date_field]).date()
+            except (TypeError, ValueError, ZeroDivisionError) as exc:
+                raise RuntimeError(
+                    "viewer semantic group economics are invalid"
+                ) from exc
+            expected_group = (
+                f"{parent['ticker']}|{effective.isoformat()}|BONUS_ISSUE|"
+                f"{format(ratio, '.12g')}"
+            )
+            expected_group = expected_group.replace(
+                "|BONUS_ISSUE|",
+                f"|{str(row['support_action_type']).upper()}|",
+            )
+            if (
+                not math.isfinite(ratio)
+                or ratio <= 0
+                or groups != (expected_group,)
+            ):
+                raise RuntimeError(
+                    "viewer semantic group does not bind ticker/date/ratio"
+                )
         if (
             row["support_semantic_role"] == "ADJUSTMENT_COMPONENT"
             and len(groups) != 1
@@ -1123,6 +1672,81 @@ def _validate_support_groups(
                 f"adjustment component: group={group_key} "
                 f"components={component_count}"
             )
+        corroboration_count = int(group[
+            "support_semantic_role"
+        ].eq("CORROBORATION").sum())
+        if corroboration_count == 0:
+            components = group[
+                group["support_semantic_role"].eq("ADJUSTMENT_COMPONENT")
+            ]
+            if len(components) != 1:
+                raise RuntimeError("uncorroborated support group is ambiguous")
+            component = components.iloc[0]
+            identity = (
+                str(parent["ticker"]).zfill(6),
+                str(parent["cash_receipt_no"]),
+                pd.Timestamp(parent["adjustment_trade_date"]).date().isoformat(),
+                str(component["support_action_key"]),
+                pd.Timestamp(component["support_record_date"]).date().isoformat(),
+                format(
+                    float(component["support_ratio_numerator"])
+                    / float(component["support_ratio_denominator"]),
+                    ".12g",
+                ),
+                str(parent["previous_price_source_content_sha256"]),
+                str(parent["adjustment_price_source_content_sha256"]),
+                format(float(parent["raw_reference_price"]), ".12g"),
+            )
+            bonus_identity = (
+                str(parent["ticker"]).zfill(6),
+                str(parent["cash_receipt_no"]),
+                pd.Timestamp(parent["adjustment_trade_date"]).date().isoformat(),
+                str(component["support_action_key"]),
+                format(
+                    float(component["support_ratio_numerator"])
+                    / float(component["support_ratio_denominator"]),
+                    ".12g",
+                ),
+            )
+            paid_identity = (
+                str(parent["ticker"]).zfill(6),
+                str(parent["cash_receipt_no"]),
+                pd.Timestamp(parent["adjustment_trade_date"]).date().isoformat(),
+                str(component["support_action_key"]),
+                pd.Timestamp(component["support_record_date"]).date().isoformat(),
+                format(
+                    float(component["support_ratio_numerator"])
+                    / float(component["support_ratio_denominator"]),
+                    ".12g",
+                ),
+            )
+            if (
+                not (
+                    component["support_action_source"] in {
+                        "DART_STRUCTURED", "DART_VIEWER",
+                    }
+                    and component["support_action_type"] == "bonus_issue"
+                    and bonus_identity in NO_NOTICE_BONUS_ISSUE
+                )
+                and not (
+                    component["support_action_source"] == "KRX_KIND"
+                    and component["support_action_type"] == "paid_increase"
+                    and paid_identity == PAID_RIGHTS_IDENTITY
+                )
+                and (
+                    component["support_action_source"] != "DART_VIEWER"
+                    or component["support_action_type"] != "stock_dividend"
+                    or identity not in NO_NOTICE_STOCK_DIVIDEND
+                )
+            ):
+                raise RuntimeError(
+                    "support group lacks an exact official corroboration: "
+                    f"ticker={parent['ticker']} "
+                    f"cash={parent['cash_receipt_no']} group={group_key} "
+                    f"source={component['support_action_source']} "
+                    f"type={component['support_action_type']} "
+                    f"key={component['support_action_key']}"
+                )
     expected_count = len(support)
     expected_groups = len(memberships)
     expected_digest = support_manifest_digest(support)
@@ -1138,10 +1762,13 @@ def _validate_support_family_bindings(
     root: Path,
     parents: pd.DataFrame,
     support: pd.DataFrame,
-) -> None:
+    *,
+    required_start: date | None,
+    required_end: date | None,
+) -> object | None:
     """Rebind every DART adjustment child to an admissible official family."""
     if support.empty:
-        return
+        return None
     components = support[
         support["support_semantic_role"].eq("ADJUSTMENT_COMPONENT")
         & (
@@ -1150,14 +1777,26 @@ def _validate_support_family_bindings(
                 & support["support_action_type"].eq("stock_dividend")
             )
             | (
-                support["support_action_source"].eq("DART_STRUCTURED")
+                support["support_action_source"].isin({
+                    "DART_STRUCTURED", "DART_VIEWER",
+                })
                 & support["support_action_type"].eq("bonus_issue")
+            )
+            | (
+                support["support_action_source"].eq("DART_VIEWER")
+                & support["support_action_type"].eq("stock_dividend")
             )
         )
     ]
     if components.empty:
-        return
-    verified = verify_support_action_families(root)
+        return None
+    if required_start is None or required_end is None:
+        raise RuntimeError(
+            "DART support-family verification requires exact coverage bounds"
+        )
+    verified = verify_support_action_families(
+        root, required_start=required_start, required_end=required_end,
+    )
     parent_by_key = {
         str(row["evidence_key"]): row for row in parents.to_dict("records")
     }
@@ -1167,12 +1806,28 @@ def _validate_support_family_bindings(
             raise RuntimeError("DART support-family child has no parent")
         receipt = str(child["support_action_key"])
         action_type = str(child["support_action_type"])
+        action_source = str(child["support_action_source"])
         ticker = str(parent["ticker"])
         matches = [
             entry for entry in verified.entries
             if entry.ticker == ticker
             and entry.action_type == action_type
             and entry.terminal_economic_receipt_no == receipt
+            and any(
+                source.receipt_no == receipt
+                and (
+                    (
+                        action_source == "DART_STRUCTURED"
+                        and source.structured_path is not None
+                    )
+                    or (
+                        action_source == "DART_VIEWER"
+                        and source.structured_path is None
+                    )
+                    or action_type == "stock_dividend"
+                )
+                for source in entry.sources
+            )
         ]
         if len(matches) != 1:
             raise RuntimeError(
@@ -1216,7 +1871,7 @@ def _validate_support_family_bindings(
             )
         body_path = str(child["support_action_body_path"])
         body_sha = str(child["support_action_body_sha256"])
-        if action_type == "bonus_issue":
+        if action_source == "DART_STRUCTURED":
             if (
                 family_source.structured_path is None
                 or family_source.structured_sha256 is None
@@ -1225,6 +1880,15 @@ def _validate_support_family_bindings(
             ):
                 raise RuntimeError(
                     "bonus adjustment child/family structured-body parity failed"
+                )
+        elif action_source == "DART_VIEWER":
+            if (
+                family_source.structured_path is not None
+                or body_path != family_source.body_path
+                or body_sha != family_source.body_sha256
+            ):
+                raise RuntimeError(
+                    "adjustment child/family viewer-body parity failed"
                 )
         else:
             expected_path = (
@@ -1235,18 +1899,19 @@ def _validate_support_family_bindings(
                 raise RuntimeError(
                     "stock-dividend child/family exact ZIP identity failed"
                 )
+    return verified
 
 
 def _validate_kind_support_bindings(
     root: Path,
     parents: pd.DataFrame,
     support: pd.DataFrame,
-) -> None:
+) -> list[dict[str, object]]:
     """Rebind every KRX child to the immutable KIND support manifest."""
     declared = verify_kind_support_manifest(root)
     children = support[support["support_action_source"].eq("KRX_KIND")]
     if not declared and children.empty:
-        return
+        return declared
     parent_identity = {
         str(row["evidence_key"]): (
             str(row["ticker"]), str(row["cash_receipt_no"]),
@@ -1341,9 +2006,15 @@ def _validate_kind_support_bindings(
                     "KIND manifest/source child parity failed: "
                     f"identity={identity} field={field}"
                 )
+    return declared
 
 
-def verify_source_evidence_manifest(base: str) -> VerifiedScaleSourceEvidence:
+def verify_source_evidence_manifest(
+    base: str,
+    *,
+    required_start: date | None = None,
+    required_end: date | None = None,
+) -> VerifiedScaleSourceEvidence:
     """Verify every source body and return stable evidence rows.
 
     A missing manifest is represented by an empty, content-addressed row set.
@@ -1353,8 +2024,11 @@ def verify_source_evidence_manifest(base: str) -> VerifiedScaleSourceEvidence:
     """
     root = Path(base).expanduser().resolve()
     path = root / MANIFEST_RELATIVE_PATH
+    read_set: _EvidenceReadSet = {}
     empty = pd.DataFrame(columns=SOURCE_EVIDENCE_COLUMNS)
     empty_support = pd.DataFrame(columns=SUPPORT_ACTION_COLUMNS)
+    if path.is_symlink():
+        raise RuntimeError("cash-scale evidence manifest cannot be a symlink")
     if not path.is_file():
         digest = source_manifest_digest(empty)
         return VerifiedScaleSourceEvidence(
@@ -1365,7 +2039,19 @@ def verify_source_evidence_manifest(base: str) -> VerifiedScaleSourceEvidence:
             row_count=0,
             row_digest=digest,
         )
-    raw = path.read_bytes()
+    manifest_body = _freeze_unhashed_relative_path(
+        root, MANIFEST_RELATIVE_PATH, read_set=read_set,
+    )
+    support_manifest_state = _freeze_optional_relative_path(
+        root, SUPPORT_FAMILY_MANIFEST_RELATIVE_PATH, read_set=read_set,
+    )
+    kind_manifest_state = _freeze_optional_relative_path(
+        root, KIND_SUPPORT_MANIFEST_RELATIVE_PATH, read_set=read_set,
+    )
+    corp_code_state = _freeze_optional_relative_path(
+        root, Path("financials/dart/corpCode.xml"), read_set=read_set,
+    )
+    raw = manifest_body.payload
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -1408,7 +2094,9 @@ def verify_source_evidence_manifest(base: str) -> VerifiedScaleSourceEvidence:
         ):
             raise RuntimeError("cash-scale support row fields changed")
         normalized_support = [
-            _validate_support_row(root, raw_parent, dict(support))
+            _validate_support_row(
+                root, raw_parent, dict(support), read_set=read_set,
+            )
             for support in raw_support
         ]
         support_frame = pd.DataFrame(normalized_support)
@@ -1417,7 +2105,9 @@ def verify_source_evidence_manifest(base: str) -> VerifiedScaleSourceEvidence:
                 support_frame[column] = None
         support_frame = support_frame[list(SUPPORT_ACTION_COLUMNS)]
         _validate_support_groups(raw_parent, support_frame)
-        rows.append(_validate_manifest_row(root, raw_parent))
+        rows.append(_validate_manifest_row(
+            root, raw_parent, read_set=read_set,
+        ))
         support_rows.extend(normalized_support)
     frame = pd.DataFrame(rows)
     for column in SOURCE_EVIDENCE_COLUMNS:
@@ -1429,8 +2119,35 @@ def verify_source_evidence_manifest(base: str) -> VerifiedScaleSourceEvidence:
         if column not in support_frame:
             support_frame[column] = None
     support_frame = support_frame[list(SUPPORT_ACTION_COLUMNS)]
-    _validate_support_family_bindings(root, frame, support_frame)
-    _validate_kind_support_bindings(root, frame, support_frame)
+    support_family_snapshot = _validate_support_family_bindings(
+        root,
+        frame,
+        support_frame,
+        required_start=required_start,
+        required_end=required_end,
+    )
+    kind_snapshot = _validate_kind_support_bindings(root, frame, support_frame)
+    support_base_closure_paths = _freeze_closure_paths(
+        root,
+        _support_upstream_closure_paths(root, support_family_snapshot),
+        read_set=read_set,
+    )
+    support_disclosure_closure_paths = _freeze_closure_paths(
+        root,
+        _support_relevant_disclosure_paths(root, read_set=read_set),
+        read_set=read_set,
+    )
+    support_closure_paths = tuple(sorted({
+        *support_base_closure_paths,
+        *support_disclosure_closure_paths,
+    }))
+    kind_closure_paths = _freeze_closure_paths(
+        root,
+        _kind_upstream_closure_paths(
+            kind_snapshot, kind_manifest_state, read_set=read_set,
+        ),
+        read_set=read_set,
+    )
     if frame["evidence_key"].astype(str).duplicated().any():
         raise RuntimeError("duplicate cash-scale evidence keys")
     identity = [
@@ -1458,6 +2175,65 @@ def verify_source_evidence_manifest(base: str) -> VerifiedScaleSourceEvidence:
         _support_group_count(support_frame)
     ):
         raise RuntimeError("cash-scale manifest support-group count mismatch")
+    for state in (
+        support_manifest_state, kind_manifest_state, corp_code_state,
+    ):
+        _assert_optional_path_state_unchanged(
+            root, state, read_set=read_set,
+        )
+    _assert_frozen_read_set_unchanged(root, read_set)
+    # Re-run both upstream semantic closures immediately before publication.
+    # Their top-level manifest presence and bytes were frozen before the first
+    # pass, so a missing->present replacement or current-pointer retarget is
+    # rejected as well as ordinary content drift.
+    support_family_snapshot_again = _validate_support_family_bindings(
+        root,
+        frame,
+        support_frame,
+        required_start=required_start,
+        required_end=required_end,
+    )
+    kind_snapshot_again = _validate_kind_support_bindings(
+        root, frame, support_frame,
+    )
+    if support_family_snapshot_again != support_family_snapshot:
+        raise RuntimeError(
+            "support-family normalized snapshot changed during verification"
+        )
+    if kind_snapshot_again != kind_snapshot:
+        raise RuntimeError("KIND normalized snapshot changed during verification")
+    support_closure_paths_again = tuple(sorted({
+        *(
+            path.as_posix()
+            for path in _support_upstream_closure_paths(
+                root, support_family_snapshot_again,
+            )
+        ),
+        *(
+            path.as_posix()
+            for path in _support_relevant_disclosure_paths(
+                root, read_set=read_set,
+            )
+        ),
+    }))
+    if support_closure_paths_again != support_closure_paths:
+        raise RuntimeError(
+            "support-family read-set changed during verification"
+        )
+    if tuple(
+        path.as_posix()
+        for path in _kind_upstream_closure_paths(
+            kind_snapshot_again, kind_manifest_state, read_set=read_set,
+        )
+    ) != kind_closure_paths:
+        raise RuntimeError("KIND read-set changed during verification")
+    for state in (
+        support_manifest_state, kind_manifest_state, corp_code_state,
+    ):
+        _assert_optional_path_state_unchanged(
+            root, state, read_set=read_set,
+        )
+    _assert_frozen_read_set_unchanged(root, read_set)
     return VerifiedScaleSourceEvidence(
         frame=frame,
         support_frame=support_frame,
@@ -1468,9 +2244,16 @@ def verify_source_evidence_manifest(base: str) -> VerifiedScaleSourceEvidence:
     )
 
 
-def external_evidence_paths(base: str) -> tuple[Path, ...]:
+def external_evidence_paths(
+    base: str,
+    *,
+    required_start: date | None = None,
+    required_end: date | None = None,
+) -> tuple[Path, ...]:
     """Return every body declared by a successfully verified manifest."""
-    verified = verify_source_evidence_manifest(base)
+    verified = verify_source_evidence_manifest(
+        base, required_start=required_start, required_end=required_end,
+    )
     if verified.frame.empty:
         return ()
     root = Path(base).expanduser().resolve()
@@ -1492,12 +2275,16 @@ def external_evidence_paths(base: str) -> tuple[Path, ...]:
             "ADJUSTMENT_COMPONENT"
         )
         & verified.support_frame["support_action_source"].isin(
-            {"DART_DISCLOSURE", "DART_STRUCTURED"}
+            {"DART_DISCLOSURE", "DART_STRUCTURED", "DART_VIEWER"}
         )
     ).any():
         paths.update(
             root / relative
-            for relative in support_family_external_evidence_paths(root)
+            for relative in support_family_external_evidence_paths(
+                root,
+                required_start=required_start,
+                required_end=required_end,
+            )
         )
     if verified.support_frame["support_action_source"].eq("KRX_KIND").any():
         paths.update(kind_external_evidence_paths(root))
@@ -1749,15 +2536,6 @@ def bind_source_evidence(
                         "cash-scale support action snapshot-field parity failed: "
                         f"{evidence_field}"
                     )
-            if (
-                support_raw["support_action_type"] == "stock_dividend"
-                and _canonical_value(
-                    "support_record_date", support_raw["support_record_date"]
-                ) != _canonical_value("support_record_date", receipt["record_date"])
-            ):
-                raise RuntimeError(
-                    "stock-dividend support/cash record-date parity failed"
-                )
             bound_support = dict(support_raw)
             bound_support.update({
                 "action_snapshot_run_id": action_snapshot_run_id,

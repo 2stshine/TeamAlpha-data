@@ -779,6 +779,159 @@ def _kind_corroboration_frames(**changes):
     return parent_frame, support_frame
 
 
+def _viewer_bonus_frames(**changes):
+    state = _safe_state()
+    parent = dict(zip(
+        SOURCE_EVIDENCE_COLUMNS, state["scale_parent_rows"][0], strict=True,
+    ))
+    support = dict(zip(
+        SUPPORT_ACTION_COLUMNS, state["scale_support_rows"][0], strict=True,
+    ))
+    body_sha = "6" * 64
+    group = "005930|2026-01-30|BONUS_ISSUE|0.111111111111"
+    support.update({
+        "support_action_source": "DART_VIEWER",
+        "support_action_body_path": (
+            "corporate_actions/dart/support_action_families/objects/"
+            f"sha256={body_sha}.html"
+        ),
+        "support_action_body_sha256": body_sha,
+        "support_report_name": "주요사항보고서(무상증자결정)",
+        "support_record_date": None,
+        "support_semantic_group_keys": json.dumps(
+            [group], separators=(",", ":"),
+        ),
+    })
+    support.update(changes)
+    support_frame = pd.DataFrame([support], columns=SUPPORT_ACTION_COLUMNS)
+    parent["support_action_digest"] = support_manifest_digest(support_frame)
+    parent_frame = pd.DataFrame([parent], columns=SOURCE_EVIDENCE_COLUMNS)
+    return parent_frame, support_frame
+
+
+def _viewer_stock_dividend_frames(**changes):
+    parents, supports = _viewer_bonus_frames()
+    group = "032960|2015-12-31|STOCK_DIVIDEND|0.05"
+    support = supports.iloc[0].to_dict()
+    support.update({
+        "support_action_key": "20151228900387",
+        "support_action_type": "stock_dividend",
+        "support_report_name": "[기재정정]주식배당결정",
+        "support_ex_date": None,
+        "support_record_date": date(2015, 12, 31),
+        "support_ratio_numerator": 0.05,
+        "support_ratio_denominator": 1.0,
+        "support_expected_price_factor": None,
+        "support_semantic_group_keys": json.dumps(
+            [group], separators=(",", ":"),
+        ),
+    })
+    support.update(changes)
+    support_frame = pd.DataFrame([support], columns=SUPPORT_ACTION_COLUMNS)
+    parent = parents.iloc[0].to_dict()
+    parent["ticker"] = "032960"
+    parent["support_action_digest"] = support_manifest_digest(support_frame)
+    return (
+        pd.DataFrame([parent], columns=SOURCE_EVIDENCE_COLUMNS),
+        support_frame,
+    )
+
+
+def test_scale_source_audit_accepts_exact_viewer_bonus_component():
+    parents, supports = _viewer_bonus_frames()
+
+    valid, group_count = _validate_scale_source_rows(parents, supports)
+
+    assert valid is True
+    assert group_count == 1
+
+
+def test_scale_source_audit_accepts_exact_viewer_stock_dividend_component():
+    parents, supports = _viewer_stock_dividend_frames()
+
+    valid, group_count = _validate_scale_source_rows(parents, supports)
+
+    assert valid is True
+    assert group_count == 1
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"support_semantic_role": "CORROBORATION"},
+        {"support_distributed_security_class": "PREFERRED"},
+        {"support_expected_price_factor": 0.8},
+        {"support_report_name": "주식배당"},
+        {"support_ex_date": date(2026, 1, 30)},
+        {"support_record_date": date(2026, 2, 1)},
+        {"support_action_body_path": "corporate_actions/dart/viewer.html"},
+        {"support_action_key": "not-a-receipt"},
+        {
+            "support_semantic_group_keys": (
+                '["005930|2026-01-31|STOCK_DIVIDEND|0.1"]'
+            ),
+        },
+    ],
+)
+def test_scale_source_audit_rejects_viewer_stock_dividend_drift(changes):
+    parents, supports = _viewer_stock_dividend_frames(**changes)
+
+    valid, _ = _validate_scale_source_rows(parents, supports)
+
+    assert valid is False
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"support_semantic_role": "CORROBORATION"},
+        {"support_distributed_security_class": "PREFERRED"},
+        {"support_expected_price_factor": 0.8},
+        {"support_report_name": "무상증자결정"},
+        {"support_record_date": date(2026, 1, 31)},
+        {"support_action_body_path": "corporate_actions/dart/viewer.html"},
+        {"support_action_key": "not-a-receipt"},
+    ],
+)
+def test_scale_source_audit_rejects_viewer_bonus_semantic_drift(changes):
+    parents, supports = _viewer_bonus_frames(**changes)
+
+    valid, _ = _validate_scale_source_rows(parents, supports)
+
+    assert valid is False
+
+
+def test_scale_source_audit_rejects_viewer_bonus_effective_date_drift():
+    parents, supports = _viewer_bonus_frames(
+        support_ex_date=date(2026, 1, 31),
+    )
+
+    valid, _ = _validate_scale_source_rows(parents, supports)
+
+    assert valid is False
+
+
+@pytest.mark.parametrize(
+    "group",
+    [
+        "000660|2026-01-30|BONUS_ISSUE|0.111111111111",
+        "005930|2026-01-31|BONUS_ISSUE|0.111111111111",
+        "005930|2026-01-30|BONUS_ISSUE|0.11",
+        "bonus-common",
+    ],
+)
+def test_scale_source_audit_rejects_viewer_bonus_group_drift(group):
+    parents, supports = _viewer_bonus_frames(
+        support_semantic_group_keys=json.dumps(
+            [group], separators=(",", ":"),
+        ),
+    )
+
+    valid, _ = _validate_scale_source_rows(parents, supports)
+
+    assert valid is False
+
+
 @pytest.mark.parametrize(
     ("action_type", "security_class", "report_name"),
     [

@@ -1,9 +1,9 @@
-"""Bounded, fail-closed KRX gross-total-return rebuild.
+"""Bounded, fail-closed KRX gross-total-return rebuild preview.
 
-The command is deliberately a dry run unless ``--apply`` is supplied.  It
-only reads certified KRX stock prices and certified issuer-scope DART actions,
-reconstructs each asset in bounded batches, and promotes the return contract
-only after every batch has passed the same transaction-wide validation.
+The standalone command is read-only.  Direct ``--apply`` is disabled because
+it cannot close the complete DART publish, rebuild, and independent-audit
+transaction.  Production writes are available only through the closed
+``pipeline.daily_full`` or ``pipeline.dart_silver_backfill_ecs`` orchestrator.
 
 Examples
 --------
@@ -17,19 +17,11 @@ publishing actions, DQ state, or the return contract::
     uv run python -m pipeline.silver.total_return_rebuild \
         --actions-base /complete/dart/snapshot
 
-Apply migration 009 first, then explicitly publish the certified rebuild::
-
-    uv run python -m pipeline.silver_quality.migrate
-    uv run python -m pipeline.silver.dart_extra_load \
-        --base /complete/dart/snapshot --total-return-actions-only --apply \
-        --expected-coverage-end YYYY-MM-DD
-    uv run python -m pipeline.silver.total_return_rebuild --apply
-
-For the apply path, the complete DART snapshot re-upsert is a prerequisite:
-it populates ``action_scope`` for old rows.  The runner selects the latest
-certified ``dart_dividend_action_backfill`` run as one immutable action
-snapshot; it never mixes pre-migration UNKNOWN-scope history into that
-snapshot.  ``--actions-base`` is preview-only and never performs that upsert.
+Do not compose standalone ``dart_extra_load --apply`` and
+``total_return_rebuild --apply`` commands.  The closed orchestrator supplies
+one verified action snapshot and performs the required DART re-upsert, return
+rebuild, contract promotion, and audit under its certification lock.
+``--actions-base`` remains preview-only and never performs that upsert.
 """
 from __future__ import annotations
 
@@ -1132,21 +1124,31 @@ def _prepare_local_action_snapshot(
         required_start=CONTRACT_COVERAGE_START,
         required_end=required_end,
     )
-    scale_evidence = verify_source_evidence_manifest(verified.base)
+    scale_evidence = verify_source_evidence_manifest(
+        verified.base,
+        required_start=verified.coverage_start,
+        required_end=verified.coverage_end,
+    )
     if getattr(
         verified,
         "cash_adjustment_scale_source_evidence",
         scale_evidence.metadata,
     ) != scale_evidence.metadata:
         raise RuntimeError("local action/cash-scale manifest metadata mismatch")
-    candidates, _ = corporate_actions.prepare(verified.base)
+    candidates, _ = corporate_actions.prepare(
+        verified.base,
+        coverage_start=verified.coverage_start,
+        coverage_end=verified.coverage_end,
+    )
     from pipeline.silver.dart_extra_load import (
         _manifest_support_action_candidates,
         _total_return_actions,
     )
-    kind_support = _manifest_support_action_candidates(scale_evidence)
-    if not kind_support.empty:
-        candidates = pd.concat([candidates, kind_support], ignore_index=True)
+    manifest_support = _manifest_support_action_candidates(scale_evidence)
+    if not manifest_support.empty:
+        candidates = pd.concat(
+            [candidates, manifest_support], ignore_index=True,
+        )
     required = {
         "identifier", "source", "rcept_no", "event_type", "action_scope",
     }
@@ -2556,7 +2558,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     write_mode.add_argument(
         "--apply",
         action="store_true",
-        help="검증된 전체 rebuild를 원자적으로 Silver에 반영",
+        help=(
+            "standalone apply는 비활성화됨; 쓰기는 daily_full 또는 "
+            "dart_silver_backfill_ecs closed orchestrator 전용"
+        ),
     )
     write_mode.add_argument(
         "--actions-base",
@@ -2582,11 +2587,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    run(
-        apply=args.apply,
-        batch_size=args.batch_size,
-        max_dividend_yield=args.max_dividend_yield,
-        actions_base=args.actions_base,
+    if not args.apply:
+        run(
+            apply=False,
+            batch_size=args.batch_size,
+            max_dividend_yield=args.max_dividend_yield,
+            actions_base=args.actions_base,
+        )
+        return
+    raise RuntimeError(
+        "direct total-return --apply is disabled: it cannot prove parity with "
+        "the latest raw DART action generation; use pipeline.daily_full or "
+        "pipeline.dart_silver_backfill_ecs --phase dart-extras"
     )
 
 

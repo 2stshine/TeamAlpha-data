@@ -86,13 +86,23 @@ def _stored_scale_interval(
     return low - ulp, high + ulp
 
 
-def _stored_price_factor_interval(
+def stored_price_factor_interval(
     *,
     previous_close: float,
     previous_adj_close: float,
     applied_close: float,
     applied_adj_close: float,
 ) -> tuple[float, float]:
+    """Return every price factor compatible with four-decimal stored prices.
+
+    Silver persists ``adj_close`` at four decimal places.  Each stored value
+    therefore represents a closed half-quantum interval around the unknown
+    unrounded value.  Price factors are positive, so their extrema are the
+    previous-scale low divided by the applied-scale high and vice versa.
+    Only one float ULP is added at the computed endpoints; this is not a
+    business tolerance and cannot conceal a factor outside the rounding
+    interval.
+    """
     previous_low, previous_high = _stored_scale_interval(
         close=previous_close, adjusted_close=previous_adj_close,
     )
@@ -687,7 +697,7 @@ def apply_dividends_to_prices(
                 raise RuntimeError(
                     "cash-scale expected factor/source-price parity failed"
                 )
-            factor_low, factor_high = _stored_price_factor_interval(
+            factor_low, factor_high = stored_price_factor_interval(
                 previous_close=previous_close,
                 previous_adj_close=previous_adj_close,
                 applied_close=applied_close,

@@ -2,23 +2,34 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import boto3
+from botocore.exceptions import ClientError
 
+from pipeline.bronze import (
+    dart_support_action_families,
+    dart_viewer_corrections,
+)
 from pipeline.common import db
 from pipeline.silver import (
     cash_adjustment_scale_evidence,
+    dart_action_snapshot,
     dart_extra_load,
-    load,
+    reviewed_dividend_corrections,
+    return_contract,
     total_return_audit,
     total_return_rebuild,
 )
+from pipeline.silver_quality import freshness as quality_freshness
 
 
 DATA_ROOT = Path("/app/data")
@@ -26,6 +37,91 @@ _PRICE_EVIDENCE_KEY = re.compile(
     r"^stock/(?:marcap|krxapi)/date=[0-9]{4}-[0-9]{2}-[0-9]{2}/"
     r"[^/]+\.parquet$"
 )
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SNAPSHOT_POINTER_SCHEMA = "dart_total_return_snapshot_pointer_v1"
+_SNAPSHOT_PUBLISH_ROOT = "quality/dart-total-return-snapshots"
+_SNAPSHOT_CURRENT_KEY = f"{_SNAPSHOT_PUBLISH_ROOT}/current.json"
+# Stable, distinct from RETURN_WRITER_LOCK_KEY.  Hold this session lock across
+# the entire Bronze-observation -> snapshot -> Silver rebuild epoch so two ECS
+# tasks cannot certify against different action generations.
+DAILY_CERTIFICATION_LOCK_KEY = 5_248_954_287_015_002
+
+
+@dataclass(frozen=True)
+class _PublishedSnapshotPointer:
+    etag: str
+    coverage_end: date
+    action_manifest_sha256: str
+    bundle_prefix: str
+
+
+def acquire_daily_certification_lock():
+    """Fail fast unless this task can own the complete certification epoch."""
+    connection = db.connect()
+    try:
+        # Session advisory locks do not need a transaction.  Autocommit avoids
+        # leaving an hours-long ``idle in transaction`` session while DART/S3
+        # network work runs.
+        connection.autocommit = True
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT pg_try_advisory_lock(%s)",
+                (DAILY_CERTIFICATION_LOCK_KEY,),
+            )
+            row = cur.fetchone()
+        if not row or row[0] is not True:
+            raise RuntimeError(
+                "another daily/backfill certification epoch is active; "
+                "refusing overlapping ECS task"
+            )
+        print("[dart-silver-ecs] daily certification lock acquired", flush=True)
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def assert_daily_certification_lock(connection) -> None:
+    """Prove that the owning session is alive and still holds the epoch lock."""
+    class_id = (DAILY_CERTIFICATION_LOCK_KEY >> 32) & 0xFFFF_FFFF
+    object_id = DAILY_CERTIFICATION_LOCK_KEY & 0xFFFF_FFFF
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_locks
+                WHERE locktype='advisory'
+                  AND pid=pg_backend_pid()
+                  AND granted
+                  AND classid::bigint=%s
+                  AND objid::bigint=%s
+                  AND objsubid=1
+            )
+            """,
+            (class_id, object_id),
+        )
+        held = cur.fetchone()
+    if not held or held[0] is not True:
+        raise RuntimeError(
+            "daily certification epoch lock was lost; refusing mutation"
+        )
+
+
+def release_daily_certification_lock(connection) -> None:
+    """Release the epoch lock explicitly, then close its owning session."""
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_unlock(%s)",
+                (DAILY_CERTIFICATION_LOCK_KEY,),
+            )
+            row = cur.fetchone()
+        if not row or row[0] is not True:
+            raise RuntimeError("daily certification advisory lock was not held")
+        print("[dart-silver-ecs] daily certification lock released", flush=True)
+    finally:
+        connection.close()
 
 
 def _list_keys(s3, bucket: str, prefix: str) -> list[str]:
@@ -48,21 +144,435 @@ def _download(bucket: str, keys: list[str], root: Path) -> int:
         destination.parent.mkdir(parents=True, exist_ok=True)
         client.download_file(bucket, key, str(destination))
     done = 0
+    # Keep the future set bounded.  A complete action snapshot currently has
+    # ~150k objects; submitting all of them at once needlessly consumes ECS
+    # memory before the first download completes.
+    chunk_size = 512
     with ThreadPoolExecutor(max_workers=32) as executor:
-        futures = [executor.submit(one, key) for key in unique]
+        for start in range(0, len(unique), chunk_size):
+            chunk = unique[start:start + chunk_size]
+            futures = [executor.submit(one, key) for key in chunk]
+            for future in as_completed(futures):
+                future.result()
+                done += 1
+                if done % 500 == 0 or done == len(unique):
+                    print(
+                        f"[dart-silver-ecs] downloaded={done}/{len(unique)}",
+                        flush=True,
+                    )
+    return done
+
+
+def _generated_snapshot_paths(root: Path) -> tuple[Path, ...]:
+    """Return locally generated evidence that must survive the ECS task.
+
+    Core OpenDART and KRX objects are written to S3 by their own collectors.
+    Viewer/family evidence and the enclosing v5 manifest are local, verified
+    derivatives. The canonical v5 object list is the sole authority on which
+    generated bodies belong to this snapshot: directory membership must never
+    publish legacy receipt caches or orphan content-addressed objects.
+    """
+    root = root.resolve()
+    action_manifest = root / dart_action_snapshot.MANIFEST_RELATIVE_PATH
+    try:
+        raw = action_manifest.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"generated DART action manifest is missing/invalid: "
+            f"{action_manifest}"
+        ) from exc
+    if raw != _canonical_json(payload):
+        raise RuntimeError("generated DART action manifest is not canonical")
+    objects = payload.get("objects")
+    if (
+        payload.get("schema_version") != dart_action_snapshot.SCHEMA_VERSION
+        or payload.get("complete") is not True
+        or not isinstance(objects, list)
+    ):
+        raise RuntimeError("generated DART action manifest contract is invalid")
+    candidates: set[Path] = {action_manifest}
+    seen: set[str] = set()
+    for entry in objects:
+        if not isinstance(entry, dict):
+            raise RuntimeError("generated DART action object entry is invalid")
+        relative = str(entry.get("path") or "")
+        if not _generated_relative_allowed(relative):
+            continue
+        digest = str(entry.get("sha256") or "")
+        try:
+            length = int(entry.get("content_length", -1))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"generated DART action object length is invalid: {relative}"
+            ) from exc
+        if (
+            relative in seen
+            or _SHA256.fullmatch(digest) is None
+            or length < 0
+        ):
+            raise RuntimeError(
+                f"generated DART action object identity is invalid: {relative}"
+            )
+        seen.add(relative)
+        path = (root / relative).resolve()
+        if (
+            root not in path.parents
+            or not path.is_file()
+            or path.stat().st_size != length
+            or _sha256_path(path) != digest
+        ):
+            raise RuntimeError(
+                f"generated DART action object changed: {relative}"
+            )
+        candidates.add(path)
+    reviewed_manifest = root / reviewed_dividend_corrections.MANIFEST_RELATIVE_PATH
+    component_manifests = {
+        root / dart_viewer_corrections.MANIFEST_RELATIVE_PATH,
+        root / dart_support_action_families.MANIFEST_RELATIVE_PATH,
+        reviewed_manifest,
+    }
+
+    def publication_order(path: Path) -> tuple[int, str]:
+        # Leaf evidence first, component pointers second, enclosing v5 pointer
+        # last.  S3 has no multi-object transaction; this order ensures a crash
+        # can never publish a new enclosing manifest before its referenced
+        # bodies exist remotely.
+        if path == action_manifest:
+            priority = 2
+        elif path in component_manifests:
+            priority = 1
+        else:
+            priority = 0
+        return priority, path.relative_to(root).as_posix()
+
+    return tuple(sorted(candidates, key=publication_order))
+
+
+def _canonical_json(payload: object) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _snapshot_object_digest(entries: list[dict]) -> str:
+    return hashlib.sha256(_canonical_json(entries)).hexdigest()
+
+
+def _generated_relative_allowed(relative: str) -> bool:
+    candidate = Path(relative)
+    if (
+        not relative
+        or candidate.is_absolute()
+        or ".." in candidate.parts
+        or candidate.as_posix() != relative
+    ):
+        return False
+    exact = {
+        dart_action_snapshot.MANIFEST_RELATIVE_PATH.as_posix(),
+        reviewed_dividend_corrections.MANIFEST_RELATIVE_PATH.as_posix(),
+    }
+    roots = (
+        dart_viewer_corrections.MANIFEST_RELATIVE_PATH.parent.as_posix()
+        + "/",
+        dart_support_action_families.MANIFEST_RELATIVE_PATH.parent.as_posix()
+        + "/",
+    )
+    return relative in exact or relative.startswith(roots)
+
+
+def _client_error_code(exc: ClientError) -> str:
+    return str(exc.response.get("Error", {}).get("Code") or "")
+
+
+def _is_missing_object(exc: ClientError) -> bool:
+    return _client_error_code(exc) in {"NoSuchKey", "404", "NotFound"}
+
+
+def _is_precondition_failure(exc: ClientError) -> bool:
+    return _client_error_code(exc) in {
+        "PreconditionFailed", "412", "ConditionalRequestConflict", "409",
+    }
+
+
+def _restore_published_snapshot(
+    client,
+    bucket: str,
+    root: Path,
+) -> _PublishedSnapshotPointer | None:
+    """Overlay the last atomically published generated-evidence bundle."""
+    try:
+        response = client.get_object(Bucket=bucket, Key=_SNAPSHOT_CURRENT_KEY)
+    except ClientError as exc:
+        if _is_missing_object(exc):
+            return None
+        raise
+    body = response["Body"]
+    try:
+        raw = body.read()
+    finally:
+        close = getattr(body, "close", None)
+        if close is not None:
+            close()
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("published DART snapshot pointer is invalid JSON") from exc
+    if raw != _canonical_json(payload):
+        raise RuntimeError("published DART snapshot pointer is not canonical")
+    action_sha = str(payload.get("action_manifest_sha256") or "")
+    bundle_prefix = str(payload.get("bundle_prefix") or "")
+    expected_bundle = (
+        f"{_SNAPSHOT_PUBLISH_ROOT}/bundles/"
+        f"action-manifest-sha256={action_sha}"
+    )
+    try:
+        coverage_end = date.fromisoformat(str(payload.get("coverage_end") or ""))
+    except ValueError as exc:
+        raise RuntimeError("published DART snapshot coverage_end is invalid") from exc
+    entries = payload.get("objects")
+    if (
+        payload.get("schema_version") != _SNAPSHOT_POINTER_SCHEMA
+        or payload.get("complete") is not True
+        or _SHA256.fullmatch(action_sha) is None
+        or bundle_prefix != expected_bundle
+        or not isinstance(entries, list)
+        or int(payload.get("object_count", -1)) != len(entries)
+        or payload.get("object_digest") != _snapshot_object_digest(entries)
+    ):
+        raise RuntimeError("published DART snapshot pointer contract is invalid")
+    normalized: list[dict] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError("published DART snapshot object is invalid")
+        relative = str(entry.get("path") or "")
+        digest = str(entry.get("sha256") or "")
+        length = int(entry.get("content_length", -1))
+        if (
+            not _generated_relative_allowed(relative)
+            or relative in seen
+            or _SHA256.fullmatch(digest) is None
+            or length < 0
+        ):
+            raise RuntimeError(
+                f"published DART snapshot object identity is invalid: {relative}"
+            )
+        seen.add(relative)
+        normalized.append({
+            "path": relative,
+            "content_length": length,
+            "sha256": digest,
+        })
+    if entries != sorted(normalized, key=lambda item: item["path"]):
+        raise RuntimeError("published DART snapshot object order is invalid")
+    action_entry = next(
+        (
+            entry for entry in normalized
+            if entry["path"]
+            == dart_action_snapshot.MANIFEST_RELATIVE_PATH.as_posix()
+        ),
+        None,
+    )
+    if action_entry is None or action_entry["sha256"] != action_sha:
+        raise RuntimeError("published DART action manifest binding is invalid")
+
+    def download_one(entry: dict) -> None:
+        relative = entry["path"]
+        destination = (root / relative).resolve()
+        if root not in destination.parents:
+            raise RuntimeError(
+                f"published DART snapshot path escaped root: {relative}"
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".download",
+            dir=destination.parent,
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            key = f"{bundle_prefix}/{relative}"
+            client.download_file(bucket, key, str(temporary))
+            if (
+                temporary.stat().st_size != entry["content_length"]
+                or _sha256_path(temporary) != entry["sha256"]
+            ):
+                raise RuntimeError(
+                    f"published DART snapshot object changed: {relative}"
+                )
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        futures = [executor.submit(download_one, entry) for entry in normalized]
         for future in as_completed(futures):
             future.result()
-            done += 1
-            if done % 500 == 0 or done == len(unique):
-                print(f"[dart-silver-ecs] downloaded={done}/{len(unique)}", flush=True)
-    return done
+    etag = str(response.get("ETag") or "")
+    if not etag:
+        raise RuntimeError("published DART snapshot pointer has no ETag")
+    print(
+        "[dart-silver-ecs] restored generated snapshot "
+        f"coverage_end={coverage_end.isoformat()} objects={len(normalized)}",
+        flush=True,
+    )
+    return _PublishedSnapshotPointer(
+        etag=etag,
+        coverage_end=coverage_end,
+        action_manifest_sha256=action_sha,
+        bundle_prefix=bundle_prefix,
+    )
+
+
+def _put_immutable_snapshot_object(
+    client,
+    bucket: str,
+    key: str,
+    path: Path,
+    entry: dict,
+) -> None:
+    try:
+        with path.open("rb") as body:
+            client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=body,
+                ContentLength=entry["content_length"],
+                Metadata={"sha256": entry["sha256"]},
+                IfNoneMatch="*",
+            )
+    except ClientError as exc:
+        if not _is_precondition_failure(exc):
+            raise
+        existing = client.head_object(Bucket=bucket, Key=key)
+        if (
+            int(existing.get("ContentLength", -1))
+            != entry["content_length"]
+            or (existing.get("Metadata") or {}).get("sha256")
+            != entry["sha256"]
+        ):
+            raise RuntimeError(
+                f"immutable DART snapshot object collision: {key}"
+            ) from exc
+
+
+def _publish_generated_snapshot(
+    bucket: str,
+    root: Path,
+    snapshot: dart_action_snapshot.VerifiedActionSnapshot,
+    previous: _PublishedSnapshotPointer | None,
+    *,
+    certification_lock,
+) -> int:
+    """Publish one immutable bundle, then CAS its single current pointer."""
+    root = root.resolve()
+    client = boto3.client("s3")
+    paths = _generated_snapshot_paths(root)
+    action_sha = snapshot.manifest_sha256
+    if _SHA256.fullmatch(action_sha) is None:
+        raise RuntimeError("generated DART action manifest SHA is invalid")
+    if snapshot.coverage_end < (
+        previous.coverage_end if previous is not None else snapshot.coverage_end
+    ):
+        raise RuntimeError(
+            "refusing to regress published DART snapshot coverage: "
+            f"current={previous.coverage_end.isoformat()} "
+            f"candidate={snapshot.coverage_end.isoformat()}"
+        )
+    entries = sorted(({
+        "path": path.relative_to(root).as_posix(),
+        "content_length": path.stat().st_size,
+        "sha256": _sha256_path(path),
+    } for path in paths), key=lambda item: item["path"])
+    action_entry = next(
+        entry for entry in entries
+        if entry["path"] == dart_action_snapshot.MANIFEST_RELATIVE_PATH.as_posix()
+    )
+    if action_entry["sha256"] != action_sha:
+        raise RuntimeError("generated DART action manifest SHA changed")
+    entries_by_path = {entry["path"]: entry for entry in entries}
+    bundle_prefix = (
+        f"{_SNAPSHOT_PUBLISH_ROOT}/bundles/"
+        f"action-manifest-sha256={action_sha}"
+    )
+
+    def upload_one(path: Path) -> None:
+        relative = path.relative_to(root).as_posix()
+        _put_immutable_snapshot_object(
+            client,
+            bucket,
+            f"{bundle_prefix}/{relative}",
+            path,
+            entries_by_path[relative],
+        )
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        futures = [executor.submit(upload_one, path) for path in paths]
+        for future in as_completed(futures):
+            future.result()
+    pointer = {
+        "schema_version": _SNAPSHOT_POINTER_SCHEMA,
+        "complete": True,
+        "coverage_end": snapshot.coverage_end.isoformat(),
+        "action_manifest_sha256": action_sha,
+        "bundle_prefix": bundle_prefix,
+        "object_count": len(entries),
+        "object_digest": _snapshot_object_digest(entries),
+        "objects": entries,
+    }
+    conditions = (
+        {"IfMatch": previous.etag}
+        if previous is not None else {"IfNoneMatch": "*"}
+    )
+    # Immutable bundle objects may take minutes to upload. The K2 session was
+    # valid before that work began, but a lost PostgreSQL session releases its
+    # advisory lock automatically. Re-prove ownership immediately before the
+    # only mutable publication step. Failure leaves harmless orphan bundle
+    # objects and the certified current pointer unchanged.
+    assert_daily_certification_lock(certification_lock)
+    try:
+        client.put_object(
+            Bucket=bucket,
+            Key=_SNAPSHOT_CURRENT_KEY,
+            Body=_canonical_json(pointer),
+            ContentType="application/json",
+            **conditions,
+        )
+    except ClientError as exc:
+        if _is_precondition_failure(exc):
+            raise RuntimeError(
+                "published DART snapshot pointer changed concurrently; "
+                "refusing stale retry"
+            ) from exc
+        raise
+    print(
+        "[dart-silver-ecs] published immutable generated snapshot "
+        f"objects={len(paths)} manifest={action_sha}",
+        flush=True,
+    )
+    return len(paths)
 
 
 def _cash_scale_price_keys(root: Path) -> list[str]:
     """Read only the exact KRX price objects named by the frozen manifest."""
     path = root / cash_adjustment_scale_evidence.MANIFEST_RELATIVE_PATH
     if not path.is_file():
-        return []
+        raise RuntimeError(
+            "missing frozen cash-scale evidence manifest; daily Silver write "
+            "is not allowed"
+        )
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -100,8 +610,24 @@ def _cash_scale_price_keys(root: Path) -> list[str]:
     return sorted(keys)
 
 
-def run_dart_extras() -> None:
-    bucket = os.environ["S3_BRONZE_BUCKET"]
+def prepare_total_return_snapshot(
+    coverage_end: date,
+    *,
+    bucket: str | None = None,
+    root: Path | None = None,
+    publish: bool = True,
+    certification_lock=None,
+) -> dart_action_snapshot.VerifiedActionSnapshot:
+    """Build a current, complete v5 action snapshot before any Silver write.
+
+    The daily task first writes its native OpenDART interval to S3.  This
+    preflight then downloads the complete historical source set, refreshes the
+    official viewer/family evidence, and builds the v5 manifest through the
+    requested calendar date.  If any source family or frozen cash-scale input
+    is incomplete, the function raises before the daily KRX price transaction.
+    """
+    bucket = bucket or os.environ["S3_BRONZE_BUCKET"]
+    root = (root or DATA_ROOT).resolve()
     s3 = boto3.client("s3")
     prefixes = (
         "dividends/dart/",
@@ -112,29 +638,159 @@ def run_dart_extras() -> None:
         "corporate_actions/krx/",
     )
     keys = [key for prefix in prefixes for key in _list_keys(s3, bucket, prefix)]
-    count = _download(bucket, keys, DATA_ROOT)
-    price_keys = _cash_scale_price_keys(DATA_ROOT)
+    count = _download(bucket, keys, root)
+    previous = _restore_published_snapshot(s3, bucket, root)
+    price_keys = _cash_scale_price_keys(root)
     if price_keys:
-        count += _download(bucket, price_keys, DATA_ROOT)
+        count += _download(bucket, price_keys, root)
     if count == 0:
         raise RuntimeError("no DART dividend/corporate-action Bronze objects")
-    expected_end = os.environ.get("DART_SNAPSHOT_EXPECTED_END")
-    if not expected_end:
-        raise RuntimeError(
-            "DART_SNAPSHOT_EXPECTED_END=YYYY-MM-DD is required for apply"
+    dart_viewer_corrections.collect_viewer_corrections(
+        str(root),
+        coverage_start=dart_action_snapshot.DEFAULT_COVERAGE_START,
+        coverage_end=coverage_end,
+        apply=True,
+    )
+    dart_support_action_families.collect_support_action_families(
+        root,
+        coverage_start=dart_action_snapshot.DEFAULT_COVERAGE_START,
+        coverage_end=coverage_end,
+        apply=True,
+    )
+    snapshot = dart_action_snapshot.build_snapshot_manifest(
+        str(root), coverage_end=coverage_end,
+    )
+    if publish:
+        if certification_lock is None:
+            raise RuntimeError(
+                "publishing a generated action snapshot requires the daily "
+                "certification epoch lock"
+            )
+        assert_daily_certification_lock(certification_lock)
+        _publish_generated_snapshot(
+            bucket,
+            root,
+            snapshot,
+            previous,
+            certification_lock=certification_lock,
         )
-    coverage_end = date.fromisoformat(expected_end)
-    # Publish the exact TR action/source-receipt snapshot, then close the
-    # derived-label workflow in the same ECS invocation.  Any failure after
-    # source publication leaves the contract BUILDING (fail closed).
+    print(
+        "[dart-silver-ecs] v5 action snapshot prepared "
+        f"coverage_end={coverage_end.isoformat()} "
+        f"manifest={snapshot.manifest_sha256}",
+        flush=True,
+    )
+    return snapshot
+
+
+def preview_total_return_actions(
+    coverage_end: date,
+    *,
+    root: Path | None = None,
+    conn=None,
+) -> None:
+    """Read-only DB preview of the freshly prepared action snapshot."""
+    root = (root or DATA_ROOT).resolve()
+    dart_extra_load.run(
+        src="local",
+        apply=False,
+        total_return_actions_only=True,
+        expected_coverage_end=coverage_end,
+        base_override=str(root),
+        conn=conn,
+    )
+
+
+def total_return_contract_ready(*, conn=None) -> bool:
+    """Read the exact research-readiness contract without mutating RDS."""
+    owns_connection = conn is None
+    connection = conn or db.connect()
+    try:
+        with connection.transaction():
+            with connection.cursor() as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
+            report = quality_freshness.total_return_contract_report(connection)
+        return bool(report["ready"])
+    finally:
+        if owns_connection:
+            connection.close()
+
+
+def invalidate_total_return_for_observed_action(
+    coverage_end: date,
+    *,
+    conn=None,
+) -> bool:
+    """Demote the return label before a new Bronze action object is visible.
+
+    S3 and PostgreSQL cannot share one transaction.  The safe publication
+    direction is therefore DB invalidation first, immutable S3 source second.
+    A failed callback publishes no new source object; a later S3 failure may
+    leave BUILDING, which the next daily retry detects and repairs.
+    """
+    owns_connection = conn is None
+    connection = conn or db.connect()
+    try:
+        with connection.transaction():
+            return_contract.acquire_return_writer_transaction_lock(connection)
+            changed = return_contract.invalidate_krx_total_return(
+                connection,
+                reason=(
+                    "DART_BRONZE_ACTION_CHANGE_OBSERVED_BEFORE_PUBLICATION:"
+                    f"{coverage_end.isoformat()}"
+                ),
+                quality_run_id=None,
+            )
+        print(
+            "[dart-silver-ecs] observed-action contract invalidation "
+            f"changed={changed}",
+            flush=True,
+        )
+        return changed
+    finally:
+        if owns_connection:
+            connection.close()
+
+
+def close_total_return_contract(
+    coverage_end: date,
+    *,
+    root: Path | None = None,
+    certification_lock=None,
+) -> dict:
+    """Close preview -> action publish -> rebuild -> fatal audit in order.
+
+    This is called immediately after the daily KRX transaction.  The first
+    preview sees the newly certified raw price day together with local actions,
+    so an unseen price-scale overlap fails before action publication.  Because
+    the raw price transaction already invalidated the old label, any such
+    failure remains visibly BUILDING instead of silently stale-CERTIFIED.
+    """
+    root = (root or DATA_ROOT).resolve()
+    if certification_lock is None:
+        raise RuntimeError(
+            "total-return certification requires the daily epoch lock"
+        )
+    assert_daily_certification_lock(certification_lock)
+    # Validate local actions and cash-scale evidence against the just-published
+    # KRX price coverage before mutating the persisted action snapshot.
+    total_return_rebuild.run(
+        actions_base=str(root),
+        conn=certification_lock,
+    )
     dart_extra_load.run(
         src="local",
         apply=True,
         total_return_actions_only=True,
         expected_coverage_end=coverage_end,
+        base_override=str(root),
+        conn=certification_lock,
     )
-    total_return_rebuild.run(apply=True)
-    report = total_return_audit.audit()
+    # Re-resolve the exact persisted snapshot in a DB-enforced read-only
+    # transaction before the single atomic rebuild/certification transaction.
+    total_return_rebuild.run(conn=certification_lock)
+    total_return_rebuild.run(apply=True, conn=certification_lock)
+    report = total_return_audit.audit(conn=certification_lock)
     if not report.get("safe_for_research"):
         failed = sorted(
             key for key, passed in (report.get("checks") or {}).items()
@@ -148,43 +804,50 @@ def run_dart_extras() -> None:
         "[dart-silver-ecs] DART TR actions/rebuild certified",
         flush=True,
     )
+    return report
 
 
-def _silver_krx_dates() -> set[str]:
-    conn = db.connect()
+def _run_dart_extras_locked(certification_lock=None) -> None:
+    expected_end = os.environ.get("DART_SNAPSHOT_EXPECTED_END")
+    if not expected_end:
+        raise RuntimeError(
+            "DART_SNAPSHOT_EXPECTED_END=YYYY-MM-DD is required for apply"
+        )
+    coverage_end = date.fromisoformat(expected_end)
+    # The one-off and the scheduled daily path share the exact same closed
+    # workflow.  A successful process therefore always ends at an independently
+    # audited CERTIFIED contract; no partial writer can return exit code zero.
+    prepare_total_return_snapshot(
+        coverage_end,
+        certification_lock=certification_lock,
+    )
+    preview_total_return_actions(coverage_end, conn=certification_lock)
+    if certification_lock is not None:
+        assert_daily_certification_lock(certification_lock)
+    close_total_return_contract(
+        coverage_end,
+        certification_lock=certification_lock,
+    )
+
+
+def run_dart_extras() -> None:
+    certification_lock = acquire_daily_certification_lock()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT DISTINCT trade_date FROM price_daily WHERE source='KRX'"
-            )
-            return {row[0].isoformat() for row in cur.fetchall()}
+        _run_dart_extras_locked(certification_lock)
     finally:
-        conn.close()
+        release_daily_certification_lock(certification_lock)
 
 
 def run_krx_gap() -> None:
-    bucket = os.environ["S3_BRONZE_BUCKET"]
-    s3 = boto3.client("s3")
-    stock_keys = _list_keys(s3, bucket, "stock/krxapi/date=")
-    dates = sorted({
-        key.split("date=", 1)[1].split("/", 1)[0]
-        for key in stock_keys
-        if "/" in key.split("date=", 1)[1]
-    } - _silver_krx_dates())
-    root = DATA_ROOT
-    for day in dates:
-        keys = [key for key in stock_keys if f"date={day}/" in key]
-        keys += _list_keys(s3, bucket, f"index/krxapi/date={day}/")
-        keys += ["financials/dart/corpCode.xml"]
-        _download(bucket, keys, root)
-        load.incremental(
-            datetime.strptime(day, "%Y-%m-%d").strftime("%Y%m%d"),
-            "local",
-            financial_files=[],
-            dividend_files=[],
-            market_closed=False,
-        )
-    print(f"[dart-silver-ecs] KRX gap dates completed={len(dates)}", flush=True)
+    raise RuntimeError(
+        "krx-gap is disabled: incremental gap publication leaves the "
+        "total-return contract BUILDING; replay each date through the closed "
+        "daily snapshot -> action -> rebuild -> audit orchestrator"
+    )
+
+
+def _run_krx_gap_locked() -> None:
+    raise RuntimeError("unsafe krx-gap implementation is disabled")
 
 
 def main() -> None:

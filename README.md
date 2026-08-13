@@ -26,8 +26,9 @@ KRX OpenAPI / OpenDART / marcap / FMP stable API
   source-aware 품질 게이트를 통과한 데이터만 publish합니다.
 - **gold**: 팩터 정의·버전·평가와 종목별 값·순위, 팩터 간 상관관계를 저장합니다.
   현재 12-1 모멘텀 계산 SQL이 구현되어 있으며 평가 기준은 아직 확정 전입니다.
-- **운영 스케줄**: 화~토 오전 08:30 KST에 실행해 전날 KRX와 완료된 FMP
-  세션 데이터를 적재합니다.
+- **운영 스케줄**: 화~토 오전 08:30 KST cron을 사용합니다. 총수익 복구 기간에는
+  Scheduler를 `DISABLED`로 유지하며, 새 closed-flow 이미지의 실운영 one-off soak와
+  독립 audit을 통과한 뒤에만 별도 운영 승인으로 활성화합니다.
 - **자동 배포**: `main` 브랜치에 push하면 GitHub Actions가 ECR/ECS/Scheduler를 갱신합니다.
 - **결과 알림**: daily ECS task가 종료되면 SNS 이메일로 성공/실패 결과를 받습니다.
 
@@ -90,15 +91,16 @@ GitHub main push
   -> ECS task definition 새 revision 등록
      - 새 revision은 태그가 아니라 방금 push한 이미지의 SHA-256 digest를 바라봄
   -> EventBridge Scheduler target 갱신
-     - 다음 스케줄 실행부터 새 task definition 사용
-     - 기존 Scheduler가 DISABLED면 그대로 DISABLED를 유지
+     - Scheduler가 이미 DISABLED일 때만 갱신
+     - 새 task definition target도 DISABLED로 유지
 ```
 
 즉, GitHub에 코드를 push하면 새 Docker 이미지가 ECR에 올라가고, ECS는 다음 실행부터 그 이미지를 받아 실행합니다.
 
 ### 스케줄 실행 흐름
 
-매일 실행은 EventBridge Scheduler가 시작합니다.
+활성화가 승인된 뒤의 매일 실행은 EventBridge Scheduler가 시작합니다. 배포 workflow는
+Scheduler를 자동으로 활성화하지 않습니다.
 
 ```text
 EventBridge Scheduler
@@ -107,8 +109,12 @@ EventBridge Scheduler
   -> 컨테이너에서 python -m pipeline.daily_full 실행
   -> KRX/DART/FMP API 호출
   -> S3 bronze 저장
-  -> 필요한 S3 객체를 /app/data로 다운로드
-  -> RDS silver 적재
+  -> 전체 DART/KRX 증거를 /app/data로 동기화
+  -> viewer/support family 갱신 및 v5 action snapshot 사전검증
+  -> RDS raw silver 적재 (총수익 계약 BUILDING)
+  -> local action/신규 가격 scale preview
+  -> action-only 적재 -> v3 전체 총수익 rebuild -> 독립 audit
+  -> fatal freshness 검사 (CERTIFIED가 아니면 exit nonzero)
   -> ECS task 종료
   -> EventBridge rule이 STOPPED 이벤트 감지
   -> SNS 이메일 알림
@@ -251,6 +257,9 @@ bronze 원칙:
 - `financials/dart/corpCode.xml`은 bronze에 저장하고 silver에서 재사용합니다.
 - DART 공시 목록과 유상·무상증자, 감자, 합병·분할, 주식교환의
   구조화 API 응답은 JSON 원문으로 저장합니다.
+- 무상증자 issuer family가 공식 viewer에는 존재하지만 OpenDART 구조화 endpoint에서
+  누락된 경우, 구조화 행을 꾸며내지 않습니다. 검증된 terminal viewer HTML을
+  content-addressed로 고정하고 별도 semantic source `DART_VIEWER`로만 게시합니다.
 - 액면분할·병합, 권리락·배당락과 현금·현물배당결정처럼 효력일·금액 확인에
   원문이 필요한 공시는 `document.xml` 응답인 ZIP도 함께 저장합니다.
   변경상장, 거래정지·상장폐지는 목록 JSON만 보존합니다.
@@ -301,7 +310,7 @@ asset
 | `dividend_source_receipt` | DART 현금배당 접수 원문·정정 family·PIT 매핑의 append-only 영수증 | `(quality_run_id, receipt_no)` |
 | `dart_action_snapshot_contract` | v5 원문·receipt·게시 action·scale evidence snapshot | `quality_run_id` |
 | `cash_adjustment_scale_source_evidence` | 조정계수 변경일 현금배당의 content-addressed parent 증거 | `(action_snapshot_run_id, evidence_key)` |
-| `cash_adjustment_scale_support_action` | parent가 참조한 주식배당·무상증자·권배락 공식 증거 | `(action_snapshot_run_id, evidence_key, support_action_source, support_action_key, support_action_type)` |
+| `cash_adjustment_scale_support_action` | parent가 참조한 주식배당·무상증자·권배락 공식 증거. 구조화 API 누락 무상증자는 `DART_VIEWER`로 구분 | `(action_snapshot_run_id, evidence_key, support_action_source, support_action_key, support_action_type)` |
 | `dividend_event_resolution` | 원천 현금배당별 canonical/제외·배당락일·실제 적용일 감사 | `(quality_run_id, asset_id, source, action_key, resolution_version)` |
 | `price_return_contract` | 자산군별 총수익 방법론과 현재 인증 상태 | `(source, asset_type, field_name)` |
 
@@ -402,16 +411,23 @@ python -m pipeline.daily_full
 
 실행 순서:
 
-1. 대상 날짜의 KRX 주식/지수 Bronze를 S3에 저장합니다.
-2. 당해 연도 DART 재무·정기보고서 배당과 기업행사를 확인하고 변경 원문만 저장합니다.
-3. 필요한 S3 객체만 ECS 컨테이너의 `/app/data`로 다운로드합니다.
-4. KRX/DART Silver 후보를 생성하고 자동 품질 검사를 수행합니다.
-5. Critical/Error가 없을 때만 대상 날짜 교체와 upsert를 하나의 transaction으로 반영합니다.
-6. 완료된 직전 미국 세션의 FMP 주식·재무·기업행사·USDKRW와 원자재 28종을
+1. 공통 PostgreSQL session advisory lock을 먼저 잡아 다른 daily/one-off 인증
+   epoch와 전체 실행을 직렬화합니다.
+2. 대상 날짜의 KRX 주식/지수 Bronze를 S3에 저장합니다.
+3. 당해 연도 DART 재무·정기보고서 배당과 기업행사를 확인하고 변경 원문만 저장합니다.
+   새 action 객체는 S3 PUT 전에 총수익 계약을 `BUILDING`으로 먼저 내립니다.
+4. complete DART/KRX 증거를 ECS 컨테이너의 `/app/data`로 동기화하고, official
+   viewer/support family와 v5 action snapshot을 재생성·검증합니다.
+5. KRX/DART Silver 후보를 생성하고 자동 품질 검사와 read-only preview를 수행합니다.
+6. Critical/Error가 없을 때만 대상 날짜 교체와 upsert를 하나의 transaction으로
+   반영하고, 즉시 action-only publish -> v3 전체 rebuild -> 독립 audit을 닫습니다.
+7. 완료된 직전 미국 세션의 FMP 주식·재무·기업행사·USDKRW와 원자재 28종을
    Bronze/Silver 별도 transaction으로 처리합니다. 월요일 target에는 일요일 야간
    선물 세션도 함께 조회·교체합니다.
-7. 실패하면 이미 인증된 Silver는 유지하고 `dq_run`·`dq_result`에 원인을 기록합니다.
-8. 인증된 증분 warning은 `dq_warning_state`에 누적하고, 같은 변경 파티션의 재검사가
+8. final freshness가 총수익 `CERTIFIED`를 포함한 모든 계약을 확인한 뒤 session
+   advisory lock을 해제합니다. 실패는 exit nonzero이며, 이미 관측·게시된 새
+   가격/action이 있으면 총수익 계약은 의도적으로 `BUILDING`에 남습니다.
+9. 인증된 증분 warning은 `dq_warning_state`에 누적하고, 같은 변경 파티션의 재검사가
    PASS일 때만 해소합니다. 미해결 warning은 `dq_open_warning`에서 바로 조회합니다.
 
 Critical/Error 중 단일 행 불변조건은 RDS CHECK·PK·UNIQUE·FK로도 강제합니다.
@@ -472,14 +488,32 @@ uv run python -m pipeline.silver_quality.migrate
 미적용 DDL을 자동 실행하지 않습니다. 최초 v2 전환은 대형 `price_daily`·
 `fundamental`의 타입/PK 변경을 포함하므로 스케줄을 중지하고 RDS snapshot을 만든
 maintenance window에서 위 명령을 one-off로 먼저 실행해야 합니다.
+일일 task는 KRX 가격 transaction 전에 최신 DART viewer/support family와 v5 action
+snapshot을 완성하고 read-only preview를 통과시킨다. 가격 적재로 총수익 계약이
+`BUILDING`이 되면 같은 ECS invocation에서 local scale preview, action-only 적재,
+v3 전체 rebuild와 독립 audit까지 닫는다. freshness 오류는 경고로 삼키지 않으므로
+성공 exit는 `CERTIFIED` 계약을 뜻한다.
+새 DART action 객체는 S3 PUT 직전 PostgreSQL 계약을 먼저 `BUILDING`으로 강등한다.
+따라서 새 정정을 관측한 뒤 viewer/family preflight가 실패해도 과거 label을
+`CERTIFIED`로 계속 노출하지 않는다. viewer 공식 selector는 매 실행 다시 조회하고,
+응답 body는 SHA-256 경로에 불변 저장한다. 생성된 viewer/support/action 산출물은
+versioned bundle에 먼저 올린 뒤 단일 `quality/dart-total-return-snapshots/current.json`
+pointer만 이전 ETag CAS로 전환하므로 중간 종료나 겹친 retry가 기존 snapshot을
+부분 덮어쓰거나 coverage를 되돌릴 수 없다.
+이전 task가 신규 가격 적재 뒤 실패해 계약이 이미 `BUILDING`이면 다음 task는 그 기존
+가격 범위를 먼저 재인증한다. 재인증할 수 없으면 새 거래일을 적재하기 전에 중단한다.
 
-최초 Silver backfill:
+직접 Silver backfill CLI는 비활성화되어 있습니다. 다음 두 진입점은 KRX
+가격/기업행사를 쓴 뒤 v3 총수익 계약을 다시 `CERTIFIED`로 닫는
+검증된 오케스트레이터가 없어, base·S3·RDS 접근 전에 즉시 실패합니다.
 
-```bash
-uv run python -m pipeline.silver_quality.s3_backfill
-# 실패 원인을 수정한 뒤 같은 S3 candidate에서 재개
-uv run python -m pipeline.silver_quality.s3_backfill --resume <dq-run-uuid>
-```
+- `pipeline.silver_quality.backfill`
+- `pipeline.silver_quality.s3_backfill`
+
+일별 적재는 K2 인증 세션에서 원천 적재·action snapshot·총수익
+재인증을 함께 닫는 `pipeline.daily_full`만 사용합니다. 최초/전체
+backfill은 동일한 closed recertification 계약을 구현한 전용 운영
+오케스트레이터가 추가될 때까지 금지됩니다.
 
 기존 Silver 품질 감사:
 
@@ -487,11 +521,9 @@ uv run python -m pipeline.silver_quality.s3_backfill --resume <dq-run-uuid>
 uv run python -m pipeline.silver_quality.audit --scope all
 ```
 
-최초 backfill은 연도별 Silver 후보를 S3
-`quality/candidates/silver-backfill/run=<run-id>/`에 Parquet으로 고정합니다.
-연도 내부와 전체 기간 검사를 모두 통과한 뒤에만 RDS Silver를 월·연도 단위의
-제한된 트랜잭션으로 적재하고 `CERTIFIED`로 변경합니다. RDS `quality_stage`에는
-전체 후보를 누적하지 않습니다. 일별 `pipeline.daily_full`과 수동 incremental도
+보존된 legacy backfill 구현은 연도별 Silver 후보를 S3
+`quality/candidates/silver-backfill/run=<run-id>/`에 고정하는 내부 함수를 유지하지만,
+직접 CLI로는 실행할 수 없습니다. 일별 `pipeline.daily_full`과 수동 incremental도
 동일한 품질 게이트를 자동 실행하며 우회 옵션은 없습니다. 규칙과 severity는
 [`pipeline/silver_quality/README.md`](pipeline/silver_quality/README.md)에 정리되어 있습니다.
 현재 운영 RDS의 인증 실행·OPEN warning·DB guard 결과 스냅샷은
@@ -512,7 +544,8 @@ uv run python -m pipeline.bronze.index --from 20260713 --to 20260713 --dest s3
 uv run python -m pipeline.bronze.financials --from 2026 --to 2026 --dest s3
 uv run python -m pipeline.bronze.financials_full \
   --scope 004990:2015:11011:CFS --dest s3
-uv run python -m pipeline.bronze.corporate_actions --from 20150101 --to 20260713 --dest s3
+# 운영 S3 기업행사 직접 publication은 금지됩니다. pipeline.daily_full의
+# fail-closed invalidation -> recertification 경로만 사용합니다.
 uv run python -m pipeline.bronze.dividends --from 2015 --to 2026 --dest s3 --reports annual
 uv run python -m pipeline.bronze.fmp --mode dividends --from 2015 --to 2026 --dest s3
 uv run python -m pipeline.bronze.fmp --mode commodities --from 2015 --to 2026 --dest s3
@@ -538,15 +571,23 @@ Scheduler를 잠시 one-off task definition으로 바꿔 한 번 실행한 뒤 �
 스케줄로 복원합니다. workflow 성공은 **제출과 스케줄 복원 성공**을 뜻하며, 실제
 적재 완료는 ECS exit code, SNS 알림과 `dq_run`의 `CERTIFIED` 상태로 확인합니다.
 
-기존 DART 배당·기업행사 Bronze와 KRX 누락일을 Silver에 반영하는 ECS용 진입점:
+기존 DART 배당·기업행사 Bronze를 Silver 총수익에 반영하고 계약을 닫는 ECS용
+단일 진입점:
 
 ```bash
 uv run python -m pipeline.dart_silver_backfill_ecs --phase dart-extras
-uv run python -m pipeline.dart_silver_backfill_ecs --phase krx-gap
 ```
+
+`krx-gap`은 가격을 쓴 뒤 총수익 계약을 `BUILDING`에 남길 수 있어 비활성화됐다.
+누락 거래일은 날짜별 closed daily 흐름으로 재생해야 한다.
 
 `dart-extras`는 총수익에 필요한 `cash_dividend`/실제일 `ex_dividend`와 scale-change가
 참조하는 정확한 주식배당·무상증자·권배락 support action/source body까지 한정한다.
+`DART_VIEWER/bonus_issue`는 official family 전 receipt에 구조화 행이 없고 terminal
+issuer `주요사항보고서(무상증자결정)` body에서 보통주→보통주 양수 비율과
+신주배정기준일을 정확히 하나씩 읽은 경우에만 `ADJUSTMENT_COMPONENT`가 된다.
+body 경로·SHA, receipt/date/ratio와 `1/(1+r)` 계수는 family manifest와 Silver child,
+synthetic `corporate_action` 사이에서 exact parity로 다시 검증한다.
 TR 전용 v5 snapshot을 발행한 뒤
 `total_return_close` 전체 rebuild와 독립 audit까지 성공해야 종료하며, 중간 실패 시
 총수익 계약은 `BUILDING`에 남는다. `dividends/dart/alot-matter`의 정기보고서 배당
@@ -578,10 +619,14 @@ uv run python -m pipeline.bronze.corporate_actions \
   --base /complete/dart/snapshot
 
 uv run python -m pipeline.bronze.dart_viewer_corrections \
-  --base /complete/dart/snapshot --apply
+  --base /complete/dart/snapshot \
+  --coverage-start 2015-01-01 --coverage-end 2026-08-10 \
+  --apply
 
 uv run python -m pipeline.bronze.dart_support_action_families \
-  --base /complete/dart/snapshot --apply
+  --base /complete/dart/snapshot \
+  --coverage-start 2015-01-01 --coverage-end 2026-08-10 \
+  --apply
 ```
 
 종료일 전체를 덮는 v3/v3/v5 marker, viewer correction manifest, support-action
@@ -613,30 +658,24 @@ uv run python -m pipeline.silver.cash_adjustment_scale_builder \
   --s3-root s3://<bronze-bucket>/<optional-prefix>
 ```
 
-KRX gross 배당재투자 총수익의 최초 구축·복구는 maintenance window에서 아래
-순서로 실행한다. 첫 preview는 로컬 complete Bronze와 RDS 가격을 DB-level
-read-only transaction으로 대조한다. 그 뒤 총수익에 필요한 ISSUER 현금배당·
-배당락만 Silver에 적재하고, 두 번째 preview가 같은 인증 snapshot으로 재현되는지
-확인한 후에만 `--apply`한다.
+KRX gross 배당재투자 총수익의 최초 구축·복구는 Scheduler가 `DISABLED`인
+maintenance window에서 closed orchestrator 한 번으로 실행한다. orchestrator는
+동일 PostgreSQL session advisory lock을 전체 epoch 동안 보유한 채 현재 v5 snapshot
+준비·로컬 preview·action-only 적재·persisted preview·v3 전체 rebuild·독립 audit을
+순서대로 수행한다. 어느 단계든 실패하면 exit nonzero이고 계약은 `BUILDING`에
+남는다.
 
 ```bash
 uv run python -m pipeline.silver_quality.migrate
-uv run python -m pipeline.silver.dart_action_snapshot \
-  --base /complete/dart/snapshot --coverage-end 2026-08-10
-uv run python -m pipeline.silver.dart_extra_load \
-  --base /complete/dart/snapshot --total-return-actions-only \
-  --expected-coverage-end 2026-08-10
-uv run python -m pipeline.silver.total_return_rebuild \
-  --actions-base /complete/dart/snapshot
-uv run python -m pipeline.silver.dart_extra_load \
-  --base /complete/dart/snapshot --total-return-actions-only --apply \
-  --expected-coverage-end 2026-08-10
-uv run python -m pipeline.silver.total_return_rebuild
-uv run python -m pipeline.silver.total_return_rebuild --apply
-uv run python -m pipeline.silver.total_return_audit
+DART_SNAPSHOT_EXPECTED_END=2026-08-10 \
+  uv run python -m pipeline.dart_silver_backfill_ecs --phase dart-extras
 ```
 
-두 loader 모두 기본은 dry-run이며 `--apply`만 RDS를 변경한다. DART snapshot은
+`pipeline.silver.dart_extra_load --apply`와
+`pipeline.silver.total_return_rebuild --apply`의 단독 CLI는 action generation parity와
+최종 audit까지 원자적으로 보장하지 못하므로 비활성화됐다. 진단용 read-only preview는
+계속 사용할 수 있지만 운영 write는 위 closed orchestrator 또는 `pipeline.daily_full`
+안에서만 수행한다. DART snapshot은
 generic 기업행사 전체가 아니라 총수익에 필요한 `cash_dividend`/실제일
 `ex_dividend`와 manifest가 정확히 참조한 scale-support action의 완전성 계약이다.
 2015-01-01부터 지정 종료일까지 native atomic
@@ -665,9 +704,12 @@ parent/child support action exact parity digest,
 PIT asset identity digest와 모든 2015+ 행의 run parity가 들어간다.
 
 새 KRX 주가 또는 ISSUER `cash_dividend`/`ex_dividend`/참조 support action이 들어오면 계약은
-`BUILDING`이 되므로, 다음 팩터 연구 전에 최신 complete action snapshot으로 위
-재구축을 다시 완료해야 한다. writer와 rebuild는 같은 PostgreSQL advisory lock을
-사용해 동시에 입력과 파생값을 변경하지 않는다.
+즉시 `BUILDING`이 된다. 정기 `daily_full` 성공 경로는 같은 task 안에서 최신 complete
+action snapshot으로 재구축과 audit을 완료해 다시 `CERTIFIED`로 닫는다. 신규 가격-scale
+겹침에 대한 exact KIND/DART/KRX 증거가 아직 없으면 local preview에서 task가 실패하고
+계약은 `BUILDING`으로 남으므로, 성공처럼 보이거나 과거 인증을 계속 노출하지 않는다.
+writer와 rebuild는 같은 PostgreSQL advisory lock을 사용해 동시에 입력과 파생값을
+변경하지 않는다.
 `total_return_audit`는 언제나 `REPEATABLE READ, READ ONLY`이며 rebuild/action DQ run,
 실제 첫·마지막 거래일의 정확한 일치, 총수익 전행 양수·비NULL, 원 가격 인증,
 행별 총수익 run parity, append-only resolution의 버전·적용/제외 의미, snapshot
@@ -683,21 +725,30 @@ v1/v2 `CERTIFIED` 계약을 자동으로 `BUILDING`으로
 
 완료된 `response.*`/`manifest.json` 파티션은 재호출하지 않으므로 같은 범위로
 재실행해도 이어서 진행합니다. 운영에서는 daily task와 겹치지 않도록 Scheduler를
-중지한 maintenance window에서 one-off ECS task로 실행합니다.
+중지한 maintenance window에서 one-off ECS task로 실행합니다. 전체 snapshot은 약
+15만 파일을 동기화하고 official viewer/support family를 다시 확인하므로 수 시간이
+걸릴 수 있다. structured DART 장애 시 대기열은 첫 terminal failure에 취소하고,
+동시에 실행 중인 bounded worker만 종료를 기다린다. 배포 task는 120초 ECS
+`stopTimeout`, 8 vCPU·48GiB memory·120GiB ephemeral storage를 사용하고 Scheduler
+retry는 0회다. 이는 기존 전체 KRX rebuild envelope를 보수적으로 재사용한 값이며,
+실제 digest의 최대 RSS·disk·벽시계 soak를 확인하기 전에는 Scheduler를 활성화하지
+않는다. 실측 뒤 여유를 남겨 right-size한다.
 
-로컬 `./data`에서 silver 적재:
+로컬 `./data` 진단 및 source-scoped FMP 적재:
 
 ```bash
-uv run python -m pipeline.silver.load --mode backfill
-uv run python -m pipeline.silver.load --mode incremental --date 20260713
 uv run python -m pipeline.silver.fmp_load --mode backfill --from 2015 --to 2026
 uv run python -m pipeline.silver.fmp_load --mode backfill --resume <dq-run-uuid>
 uv run python -m pipeline.silver.fmp_load --mode daily --date 20260713
 uv run python -m pipeline.silver.fmp_load --mode commodities --from 2015 --to 2026
 uv run python -m pipeline.silver.dart_extra_load \
   --total-return-actions-only --expected-coverage-end YYYY-MM-DD  # TR preview
-# TR write는 위 명령에 --apply를 추가한다. generic fundamental apply는 비활성화됨.
+# standalone --apply는 비활성화됨. write는 closed orchestrator만 사용한다.
 ```
+
+KRX `pipeline.silver.load`의 직접 backfill/incremental CLI와 legacy
+`pipeline.jobs`는 가격/action을 쓴 뒤 총수익 계약을 닫지 않으므로 비활성화됐다.
+날짜별 KRX 적재는 `pipeline.daily_full`만 사용한다.
 
 Gold schema 생성:
 
@@ -764,8 +815,9 @@ bit-for-bit 동일한 digest가 나온다고 보장하지는 않는다. 공식 u
 3. `linux/amd64` Docker 이미지를 빌드합니다.
 4. ECR에 commit SHA 태그와 `latest` 태그를 push하고 image digest를 확인합니다.
 5. ECS task definition 새 revision을 digest URI로 등록합니다.
-6. EventBridge Scheduler target을 새 task definition으로 갱신하되 기존
-   `ENABLED`/`DISABLED` 상태를 그대로 보존합니다.
+6. 배포 전과 target 갱신 직전에 EventBridge Scheduler가 `DISABLED`인지 강제하고,
+   새 task definition target도 `DISABLED` 상태로만 등록합니다. 이 workflow는
+   Scheduler를 자동 재활성화하지 않습니다.
 
 필요한 GitHub secret:
 

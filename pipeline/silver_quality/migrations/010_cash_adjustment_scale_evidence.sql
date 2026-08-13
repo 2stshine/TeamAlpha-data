@@ -192,11 +192,39 @@ CREATE TABLE IF NOT EXISTS cash_adjustment_scale_support_action (
         OR support_expected_price_factor > 0
     ),
     CHECK (support_reference_price IS NULL OR support_reference_price > 0),
+    CHECK (
+        support_action_source<>'DART_VIEWER'
+        OR (
+            support_action_key ~ '^[0-9]{14}$'
+            AND support_action_body_path ~
+                '^corporate_actions/dart/support_action_families/objects/'
+                'sha256=[0-9a-f]{64}\.html$'
+            AND support_action_body_path=
+                'corporate_actions/dart/support_action_families/objects/'
+                'sha256=' || support_action_body_sha256 || '.html'
+            AND (
+                (support_action_type='bonus_issue'
+                 AND support_ex_date IS NOT NULL
+                 AND support_record_date IS NULL
+                 AND support_expected_price_factor IS NOT NULL)
+                OR
+                (support_action_type='stock_dividend'
+                 AND support_ex_date IS NULL
+                 AND support_record_date IS NOT NULL
+                 AND support_expected_price_factor IS NULL
+                 AND support_ratio_numerator IS NOT NULL
+                 AND support_entitlement_security_class='COMMON'
+                 AND support_distributed_security_class='COMMON')
+            )
+        )
+    ),
     CHECK (length(btrim(support_report_name)) > 0),
     CHECK (support_action_scope='ISSUER'),
     CONSTRAINT cash_scale_support_source_type_check CHECK (
         (support_action_source='DART_STRUCTURED'
          AND support_action_type='bonus_issue')
+        OR (support_action_source='DART_VIEWER'
+            AND support_action_type IN ('bonus_issue','stock_dividend'))
         OR (support_action_source='DART_DISCLOSURE'
             AND support_action_type IN (
                 'stock_dividend','ex_dividend','rights_detachment',
@@ -207,18 +235,34 @@ CREATE TABLE IF NOT EXISTS cash_adjustment_scale_support_action (
                 'stock_dividend','ex_dividend','rights_detachment',
                 'combined_detachment'
             ))
+        OR (support_action_source='KRX_KIND'
+            AND support_action_type='paid_increase'
+            AND support_action_key='20180201000086'
+            AND support_action_body_sha256=
+                'cf15168b7b9f16f7808252be7dc2a81a06dc23b30d0d14e41cebf8674ebf35c9')
     ),
     CONSTRAINT cash_scale_support_role_semantics_check CHECK (
         (
             support_semantic_role='ADJUSTMENT_COMPONENT'
             AND (
-                (support_action_source='DART_STRUCTURED'
+                (support_action_source IN (
+                    'DART_STRUCTURED','DART_VIEWER'
+                 )
                  AND support_action_type='bonus_issue'
                  AND support_ratio_numerator IS NOT NULL
                  AND support_entitlement_security_class='COMMON'
-                 AND support_distributed_security_class='COMMON')
+                 AND support_distributed_security_class='COMMON'
+                 AND support_expected_price_factor IS NOT NULL
+                 AND support_expected_price_factor=round(
+                     1::numeric / (
+                         1::numeric + support_ratio_numerator /
+                         support_ratio_denominator
+                     ), 12
+                 ))
                 OR (
-                    support_action_source IN ('DART_DISCLOSURE','KRX_KIND')
+                    support_action_source IN (
+                        'DART_DISCLOSURE','DART_VIEWER','KRX_KIND'
+                    )
                     AND support_action_type='stock_dividend'
                     AND support_ratio_numerator IS NOT NULL
                     AND (
@@ -230,6 +274,19 @@ CREATE TABLE IF NOT EXISTS cash_adjustment_scale_support_action (
                          AND support_distributed_security_class=
                             'NEW_PREFERRED')
                     )
+                )
+                OR (
+                    support_action_source='KRX_KIND'
+                    AND support_action_type='paid_increase'
+                    AND support_action_key='20180201000086'
+                    AND support_action_body_sha256=
+                        'cf15168b7b9f16f7808252be7dc2a81a06dc23b30d0d14e41cebf8674ebf35c9'
+                    AND support_ratio_numerator=0.1456981704
+                    AND support_ratio_denominator=1
+                    AND support_entitlement_security_class='COMMON'
+                    AND support_distributed_security_class='COMMON'
+                    AND support_expected_price_factor IS NULL
+                    AND support_record_date=DATE '2017-12-31'
                 )
             )
         ) OR (
@@ -261,6 +318,9 @@ CREATE TABLE IF NOT EXISTS cash_adjustment_scale_support_action (
     )),
     CHECK (manifest_support_row_sha256 ~ '^[0-9a-f]{64}$')
 );
+
+COMMENT ON COLUMN cash_adjustment_scale_support_action.support_action_source IS
+    'DART_VIEWER is an official content-addressed viewer-body bonus or stock-dividend component; it is distinct from an OpenDART structured API/disclosure row.';
 
 ALTER TABLE dividend_event_resolution
     ADD COLUMN IF NOT EXISTS previous_trade_date DATE;

@@ -1,7 +1,7 @@
 # Machine-readable field reliability contract for the research agent / guardrails.
 # Human companion: DATA_CONTRACT.md. Keep both in sync.
-version: "2026-08-11"
-ruleset_version: "1.27.0"
+version: "2026-08-12"
+ruleset_version: "1.28.0"
 
 coverage:
   krx_equity: {from: "1995-05-02", assets: 6677, survivorship_bias: false}
@@ -42,23 +42,33 @@ tables:
       high: {meaning: "raw high; NULL on zero-volume no-trade days", validated: true}
       low: {meaning: "raw low; NULL on zero-volume no-trade days", validated: true}
       adj_close:
-        meaning: "split/rights adjusted close (PRICE return only, NO dividends); back-adjusted so latest == raw close"
+        meaning: "source price-adjustment series; KRX is reconstructed from official reference-price/previous-difference adjustment factors"
         unit: currency
         validated: true
         reliability: high
         safe_for: [price_momentum, reversal, volatility, technical, beta]
         unsafe_for: [total_return, dividend_yield, carry]
-        note: "dividends are NOT reflected; use total_return_close for total return"
+        note: "Not by itself a certified cash total-return label; v3 separately adds audited adjusted cash dividends to forward gross returns"
       total_return_close:
-        meaning: "dividend-reinvested total return; latest == adj_close (back-adjusted)"
+        meaning: "KRX gross total-return index: anchor each listing episode at its first adj_close, then forward-compound (adj_close[t]+adjusted_cash[t])/adj_close[t-1]; latest-corrected ex-post forward label"
         unit: currency
-        validated: true
-        reliability: high
-        safe_for: [total_return, dividend_yield, carry, momentum]
-        unsafe_for: []
+        validated: conditional
+        reliability: certified_label_only
+        certification:
+          source: KRX
+          required_status: CERTIFIED
+          methodology_version: krx_gross_dividend_reinvested_v3
+          action_snapshot_schema: dart_total_return_action_snapshot_v5
+          action_vintage: latest_corrected_action_snapshot
+          research_role: ex_post_realized_forward_return_label
+          feature_pit_safe: false
+        safe_for: [forward_return_label, realized_performance_evaluation]
+        unsafe_for: [factor_feature, historical_candidate_input, momentum, dividend_yield, dividend_growth, dividend_frequency, carry]
         caveats:
-          - "KRX ex-date derived from record_date (approx +/-1-2 trading days); cumulative return exact, only intra-window daily returns may shift by a day"
-          - "FMP uses native dividend-adjusted adjClose"
+          - "Use only when price_return_contract is CERTIFIED and every row is bound to the certified total-return run"
+          - "The v5 action snapshot applies latest corrections retroactively; without bitemporal action vintages this is not a PIT feature"
+          - "Dividend application dates are audited in append-only dividend_event_resolution; research code must not derive them from record_date"
+          - "FMP uses vendor-native dividend-adjusted adjClose and does not inherit the KRX v3/v5 certification"
       volume: {meaning: "traded shares; 0 == no-trade (OHLC NULL)", validated: true}
       trading_value: {meaning: "traded value", unit: currency, validated: true}
       shares:
@@ -94,12 +104,30 @@ tables:
       note: "US only; not internally validated"
 
   corporate_action:
+    feature_pit_certified: false
+    action_vintage:
+      krx_dart_total_return_subset: latest_corrected_action_snapshot
+      historical_as_of: unavailable
+    safe_for: [source_audit, certified_label_lineage]
+    unsafe_for: [factor_feature, dividend_yield, dividend_growth, dividend_frequency, carry]
+    note: "Not bitemporal: direct corporate-action history does not reproduce what was known at each historical as-of date"
     fields:
       action_type: {values: [cash_dividend, stock_split, reverse_split, capital_reduction, bonus_issue, merger, rights_detachment, listing_change, delisting, trading_halt]}
-      ex_date: {meaning: "ex-date", note: "NULL for KRX cash dividends (derived from record_date); present for FMP"}
+      ex_date: {meaning: "ex-date", note: "May be NULL on KRX cash source rows; never infer it in research code—use certified dividend_event_resolution"}
       record_date: {meaning: "baedang gijunil (KRX dividend anchor)"}
       cash_amount: {meaning: "cash dividend per share", coverage: "partial for KRX (~17761/19880)"}
       adjusted_cash_amount: {meaning: "split-adjusted per-share dividend"}
+
+  dividend_history:
+    type: view
+    source: corporate_action
+    feature_pit_certified: false
+    action_vintage:
+      krx_dart_total_return_subset: latest_corrected_action_snapshot
+      historical_as_of: unavailable
+    safe_for: [source_audit, certified_label_lineage_inspection]
+    unsafe_for: [factor_feature, dividend_yield, dividend_growth, dividend_frequency, carry]
+    note: "Latest-corrected event view, not an as-of action-vintage history"
 
   asset:
     fields:
@@ -120,10 +148,19 @@ quality_guarantees:
     - adj_close_reconciliation_consistent
     - no_duplicate_price_rows
     - no_active_security_identifier_collision
+  conditional:
+    krx_total_return_v3_v5:
+      when: "price_return_contract.status == CERTIFIED"
+      guarantees: [methodology_v3, action_snapshot_v5, latest_corrected_action_binding, append_only_resolution, action_body_price_digest_parity, per_row_run_parity]
+      research_role: ex_post_realized_forward_return_label
+      feature_pit_safe: false
   not_guaranteed:
     - un_encoded_error_types
     - warning_severity_items
     - fmp_fundamental_accuracy
+    - corporate_action_feature_pit_safety
+    - dividend_history_feature_pit_safety
+    - fmp_total_return_krx_v3_v5_certification
     - anything_in_not_provided
 
 outlier_policy:
@@ -133,7 +170,8 @@ outlier_policy:
 
 factor_guidance:
   price_momentum_reversal_volatility: {use: [adj_close], avoid: [close]}
-  total_return_dividend_carry: {use: [total_return_close, corporate_action.cash_dividend], avoid: [adj_close]}
+  forward_return_label: {use: [total_return_close], role: ex_post_realized_forward_return_label, feature_pit_safe: false}
+  dividend_yield_growth_frequency_carry: {buildable: false, avoid: [corporate_action.cash_dividend, dividend_history], reason: "direct dividend history is not bitemporal/PIT-certified for features"}
   value_quality_kr: {use: [fundamental.dart.bs, fundamental.dart.is, market_cap], avoid: [detailed_cashflow_lines, fmp_mixing]}
   liquidity_size: {use: [trading_value, market_cap, shares], note: "shares != free float"}
   us_factors: {use: [fmp_price, fmp_fundamental], note: "vendor-trusted"}

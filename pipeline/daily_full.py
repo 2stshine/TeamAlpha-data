@@ -32,6 +32,8 @@ EXPECTED_STOCK_FILES = {"kospi.parquet", "kosdaq.parquet"}
 EXPECTED_INDEX_FILES = {"krx.parquet", "kospi.parquet", "kosdaq.parquet"}
 CORPORATE_ACTION_DISCOVERY_LOOKBACK_DAYS = 14
 CORPORATE_ACTION_EVIDENCE_LOOKBACK_DAYS = 180
+ACTION_DISCLOSURE_MANIFEST_NAME = "disclosures_v3.json"
+LEGACY_ACTION_DISCLOSURE_MANIFEST_NAME = "disclosures.json"
 
 
 def _target_day() -> str:
@@ -56,6 +58,26 @@ def _fmp_target_day(krx_day: str) -> str:
 
 def _key_from_s3_uri(uri: str) -> str:
     return uri.removeprefix(base_uri("s3") + "/")
+
+
+def _action_disclosure_manifest_key(action_from: str, day: str) -> str:
+    return (
+        "corporate_actions/dart/manifests/"
+        f"from={action_from}/to={day}/{ACTION_DISCLOSURE_MANIFEST_NAME}"
+    )
+
+
+def _reject_legacy_action_manifests(keys: list[str]) -> None:
+    legacy = [
+        key for key in keys
+        if key.endswith(f"/{LEGACY_ACTION_DISCLOSURE_MANIFEST_NAME}")
+        and "/corporate_actions/dart/manifests/" in f"/{key}"
+    ]
+    if legacy:
+        raise RuntimeError(
+            "legacy corporate-action disclosure manifests cannot authenticate "
+            f"the v3 collector universe: {sorted(legacy)}"
+        )
 
 
 def _list_prefix(bucket: str, prefix: str) -> list[str]:
@@ -214,9 +236,10 @@ def _main_locked(certification_lock) -> None:
     changed_action_keys = [
         _key_from_s3_uri(uri) for uri in changed_action_uris
     ]
-    action_disclosure_manifest = (
-        "corporate_actions/dart/manifests/"
-        f"from={action_from}/to={day}/disclosures.json"
+    _reject_legacy_action_manifests(changed_action_keys)
+    action_disclosure_manifest = _action_disclosure_manifest_key(
+        action_from,
+        day,
     )
     if action_disclosure_manifest not in changed_action_keys:
         changed_action_keys.append(action_disclosure_manifest)

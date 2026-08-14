@@ -9,6 +9,10 @@ import pandas as pd
 from pipeline.common import db
 from pipeline.common.paths import base_uri
 from pipeline.silver import assets, corporate_actions, dividends, financials, prices
+from pipeline.silver.dart_action_snapshot import DEFAULT_COVERAGE_START
+from pipeline.silver.return_contract import (
+    acquire_return_writer_transaction_lock,
+)
 from pipeline.silver_quality.models import (
     CandidateBundle,
     CheckResult,
@@ -35,6 +39,8 @@ def _build_candidates(
     base: str,
     *,
     target_date: date | None,
+    action_coverage_start: date,
+    action_coverage_end: date,
     financial_files: list[str] | None,
     dividend_files: list[str] | None,
 ) -> CandidateBundle:
@@ -85,6 +91,8 @@ def _build_candidates(
     action_df, action_stats = corporate_actions.prepare(
         base,
         target_date=target_date,
+        coverage_start=action_coverage_start,
+        coverage_end=action_coverage_end,
     )
     action_df, inherited_action_stats = corporate_actions.inherit_issuer_events(
         action_df,
@@ -141,16 +149,40 @@ def incremental(
     dividend_files: list[str] | None = None,
     market_closed: bool = False,
     has_action_change: bool = False,
+    action_coverage_start: date | None = None,
+    action_coverage_end: date | None = None,
+    conn=None,
 ) -> None:
+    """Publish one daily Silver partition.
+
+    The production closed-flow passes the PostgreSQL session that owns the
+    outer certification advisory lock.  Reusing that exact connection fences
+    the raw price transaction: if the lock session is lost, this writer cannot
+    continue on a different session and later race a stale certification.
+    """
     target_date = _parse_day(day)
+    if action_coverage_start != DEFAULT_COVERAGE_START:
+        raise ValueError(
+            "daily Silver requires the certified DART action coverage start "
+            f"{DEFAULT_COVERAGE_START.isoformat()}"
+        )
+    if action_coverage_end != target_date:
+        raise ValueError(
+            "daily Silver DART action coverage end must equal target_date: "
+            f"coverage_end={action_coverage_end} target_date={target_date}"
+        )
     base = base_uri(src)
-    conn = db.connect()
+    owns_connection = conn is None
+    connection = conn or db.connect()
     context = None
     results = []
     try:
-        repository.assert_schema(conn)
+        repository.assert_schema(connection)
         context = repository.start_run(
-            conn, mode="daily", target_date=target_date, status="RUNNING",
+            connection,
+            mode="daily",
+            target_date=target_date,
+            status="RUNNING",
         )
         if (
             market_closed
@@ -158,7 +190,7 @@ def incremental(
             and not dividend_files
             and not has_action_change
         ):
-            repository.finish_run(conn, context, "SKIPPED", [])
+            repository.finish_run(connection, context, "SKIPPED", [])
             print(
                 f"[silver-quality] skipped market holiday date={target_date}",
                 flush=True,
@@ -168,6 +200,8 @@ def incremental(
             bundle = _build_candidates(
                 base,
                 target_date=target_date,
+                action_coverage_start=action_coverage_start,
+                action_coverage_end=action_coverage_end,
                 financial_files=financial_files,
                 dividend_files=dividend_files,
             )
@@ -182,17 +216,17 @@ def incremental(
                 failed_count=1,
             )
             repository.finish_run(
-                conn, context, "FAILED", [transform_failure],
+                connection, context, "FAILED", [transform_failure],
                 error_message=str(exc),
             )
             raise
         bundle.stats["_existing_krx_identifiers"] = (
-            repository.existing_krx_identifiers(conn)
+            repository.existing_krx_identifiers(connection)
         )
         bundle.stats["_market_closed"] = market_closed
         bundle.stats.setdefault("price_daily", {})["coverage_baseline"] = (
             repository.recent_market_coverage_baseline(
-                conn, "KRX", ["KOSPI", "KOSDAQ"], target_date,
+                connection, "KRX", ["KOSPI", "KOSDAQ"], target_date,
             )
         )
         candidate_krx_identifiers = set(
@@ -210,29 +244,40 @@ def incremental(
             bundle.stats["_unsupported_market_identifiers"],
         )
         history = repository.recent_price_history(
-            conn,
+            connection,
             bundle.prices["identifier"].astype(str).unique().tolist()
             if not bundle.prices.empty else [],
             target_date,
         )
-        conn.commit()
+        connection.commit()
         results = evaluate(bundle, target_date=target_date, history=history)
         print_summary(results)
         try:
             assert_publishable(results)
         except QualityGateError as exc:
             repository.finish_run(
-                conn, context, "FAILED", results, error_message=str(exc),
+                connection,
+                context,
+                "FAILED",
+                results,
+                error_message=str(exc),
             )
             raise
 
         try:
-            with conn.transaction():
+            with connection.transaction():
+                # The total-return rebuild holds the same advisory key while
+                # reading asset/price inputs.  Acquire it before *any* KRX
+                # identity or price mutation, including the daily DELETE.
+                acquire_return_writer_transaction_lock(connection)
                 krx_map = assets.publish(
-                    conn, bundle.assets, bundle.identifiers, context.run_id,
+                    connection,
+                    bundle.assets,
+                    bundle.identifiers,
+                    context.run_id,
                 )
                 if not bundle.prices.empty:
-                    with conn.cursor() as cur:
+                    with connection.cursor() as cur:
                         cur.execute(
                             "DELETE FROM price_daily "
                             "WHERE source='KRX' AND trade_date=%s",
@@ -244,23 +289,37 @@ def incremental(
                             flush=True,
                         )
                     prices.publish(
-                        conn, bundle.prices, krx_map, context.run_id, target_date,
+                        connection,
+                        bundle.prices,
+                        krx_map,
+                        context.run_id,
+                        target_date,
                     )
                 financials.publish(
-                    conn, bundle.fundamentals, krx_map, context.run_id,
+                    connection,
+                    bundle.fundamentals,
+                    krx_map,
+                    context.run_id,
                 )
                 corporate_actions.publish(
-                    conn, bundle.actions, krx_map, context.run_id,
+                    connection,
+                    bundle.actions,
+                    krx_map,
+                    context.run_id,
                 )
-                repository.save_metrics(conn, context.run_id, bundle)
+                repository.save_metrics(connection, context.run_id, bundle)
                 repository.finish_run(
-                    conn, context, "CERTIFIED", results, commit=False,
+                    connection,
+                    context,
+                    "CERTIFIED",
+                    results,
+                    commit=False,
                 )
                 open_scopes, open_rows = repository.open_warning_counts(
-                    conn, context.mode,
+                    connection, context.mode,
                 )
         except Exception as exc:
-            conn.rollback()
+            connection.rollback()
             publish_failure = CheckResult(
                 rule_code="PUBLISH_TRANSACTION",
                 dataset="silver",
@@ -271,7 +330,7 @@ def incremental(
                 failed_count=1,
             )
             repository.finish_run(
-                conn,
+                connection,
                 context,
                 "FAILED",
                 results + [publish_failure],
@@ -289,7 +348,8 @@ def incremental(
             flush=True,
         )
     finally:
-        conn.close()
+        if owns_connection:
+            connection.close()
 
 
 def backfill(src: str = "local", resume: str | None = None) -> None:
@@ -310,10 +370,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.mode == "backfill":
-        backfill(args.src, args.resume)
-    else:
-        incremental(args.date, args.src)
+    raise RuntimeError(
+        "direct Silver price load is disabled because it can leave the "
+        "total-return contract BUILDING; use pipeline.daily_full for an "
+        "incremental day. Destructive history rebuild remains disabled until "
+        "its authenticated DART fundamental reload is implemented."
+    )
 
 
 if __name__ == "__main__":

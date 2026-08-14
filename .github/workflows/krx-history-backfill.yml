@@ -1,10 +1,8 @@
 name: Rebuild KRX Silver history
 
-# 파괴적: Silver 5개 테이블을 TRUNCATE 하고 1995~현재 전체를 재구축한다.
-# 반드시 (1) 코드가 배포된 최신 이미지에서 실행되고, (2) 실행 전에 RDS 스냅샷을
-# 수동으로 만든 뒤 그 스냅샷 ID를 입력으로 넘겨야 하며, (3) confirm 에 REBUILD 를
-# 정확히 입력해야 동작한다. 재구축은 수 시간 걸릴 수 있어 daily 스케줄과 겹치지
-# 않도록 이 워크플로는 daily 스케줄을 DISABLED 로 남긴다(완료 검증 후 수동 재개).
+# 안전 차단됨: 이 작업은 Silver 5개 테이블을 TRUNCATE 하지만 현재 인증된
+# DART 정기보고서 DIVIDEND/REPORTED fundamental reload가 없다. 그 completeness
+# 계약이 구현되기 전에는 아래 guard가 AWS credential 취득 전에 항상 실패한다.
 on:
   workflow_dispatch:
     inputs:
@@ -56,7 +54,8 @@ jobs:
           if [[ -z "${SNAPSHOT_ID}" ]]; then
             echo "snapshot_id is required: create an RDS snapshot first" >&2; exit 1
           fi
-          echo "Confirmed rebuild; recorded pre-rebuild snapshot ${SNAPSHOT_ID}"
+          echo "KRX history rebuild is disabled: authenticated DART DIVIDEND/REPORTED reload is not implemented" >&2
+          exit 1
 
       - uses: actions/checkout@v4
 
@@ -147,7 +146,7 @@ jobs:
               --flexible-time-window '{"Mode":"OFF"}' \
               --target file://target.json \
               --state DISABLED > /dev/null
-            echo "::warning::daily schedule ${SCHEDULE_NAME} left DISABLED. Re-enable it after verifying the rebuild is CERTIFIED."
+            echo "::warning::daily schedule ${SCHEDULE_NAME} left DISABLED. Do not re-enable this saved target; deploy and verify the closed daily revision first."
           }
           trap leave_disabled EXIT
 
@@ -167,4 +166,4 @@ jobs:
           echo "Scheduled one-off KRX rebuild at ${RUN_AT} UTC"
           sleep 150
           leave_disabled
-          echo "Rebuild submitted. Watch the ECS task, its DQ run (CERTIFIED) and the SNS notification, then re-enable the daily schedule."
+          echo "Rebuild submitted. Verify ECS/DQ/SNS, deploy the closed daily revision, run its live certification check, and only then explicitly re-enable that new target."

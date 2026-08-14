@@ -33,22 +33,23 @@ import io
 import json
 import os
 import re
+import tempfile
 import time
 import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Iterator
+from pathlib import Path
+from typing import Callable, Iterable, Iterator, Mapping
 
 import requests
+from botocore.exceptions import ClientError
 
 from pipeline.bronze import financials
 from pipeline.common.paths import base_uri
 from pipeline.common.sink import (
     exists,
     read_bytes,
-    write_bytes,
-    write_text_if_changed,
 )
 
 API_ROOT = "https://opendart.fss.or.kr/api"
@@ -87,8 +88,15 @@ class EventApi:
 class _BronzeWriter:
     """로컬은 동기 저장, S3는 기존 key 인덱스와 병렬 PUT을 사용한다."""
 
-    def __init__(self, base: str, *, workers: int = 16):
+    def __init__(
+        self,
+        base: str,
+        *,
+        workers: int = 16,
+        before_change: Callable[[str], None] | None = None,
+    ):
         self.base = base
+        self._before_change = before_change
         self._existing: set[str] = set()
         self._futures: dict[Future, str] = {}
         self._executor: ThreadPoolExecutor | None = None
@@ -124,7 +132,31 @@ class _BronzeWriter:
     def _put_s3(self, path: str, data: bytes) -> None:
         assert self._s3 is not None
         key = path.removeprefix(f"s3://{self._bucket}/")
-        self._s3.put_object(Bucket=self._bucket, Key=key, Body=data)
+        try:
+            self._s3.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=data,
+                IfNoneMatch="*",
+            )
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code") or "")
+            if code not in {
+                "PreconditionFailed", "412",
+                "ConditionalRequestConflict", "409",
+            }:
+                raise
+            response = self._s3.get_object(Bucket=self._bucket, Key=key)
+            body = response["Body"]
+            try:
+                existing = body.read()
+            finally:
+                body.close()
+            if existing != data:
+                raise RuntimeError(
+                    "immutable DART Bronze object was published concurrently "
+                    f"with different bytes: s3://{self._bucket}/{key}"
+                ) from exc
 
     def _read_s3_json(self, path: str) -> dict:
         assert self._s3 is not None
@@ -198,11 +230,46 @@ class _BronzeWriter:
     def _submit(self, path: str, data: bytes) -> bool:
         if path in self._existing:
             return False
+        if self._before_change is not None:
+            # The callback completes before a new S3 object becomes visible.
+            # daily_full uses this boundary to demote the derived return
+            # contract before publishing any new action observation.
+            self._before_change(path)
         assert self._executor is not None
         self._existing.add(path)
         future = self._executor.submit(self._put_s3, path, data)
         self._futures[future] = path
         return True
+
+    @staticmethod
+    def _atomic_local_write(path: str, data: bytes) -> None:
+        """Durably replace one local object without exposing partial bytes."""
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+            # Persist the directory entry as well as the file contents.  Some
+            # platforms/filesystems do not permit directory fsync; an atomic
+            # replace has still completed safely in that case.
+            try:
+                directory_fd = os.open(target.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
 
     def save_json(self, row: object, path: str) -> bool:
         rendered = json.dumps(
@@ -212,14 +279,23 @@ class _BronzeWriter:
         )
         if self._executor is not None:
             return self._submit(path, rendered.encode("utf-8"))
-        return write_text_if_changed(rendered, path)
+        encoded = rendered.encode("utf-8")
+        target = Path(path)
+        if target.is_file() and target.read_bytes() == encoded:
+            return False
+        if self._before_change is not None:
+            self._before_change(path)
+        self._atomic_local_write(path, encoded)
+        return True
 
     def save_bytes(self, data: bytes, path: str) -> bool:
         if self._executor is not None:
             return self._submit(path, data)
         if exists(path):
             return False
-        write_bytes(data, path)
+        if self._before_change is not None:
+            self._before_change(path)
+        self._atomic_local_write(path, data)
         return True
 
     def close(self) -> None:
@@ -253,9 +329,12 @@ DOCUMENT_KEYWORDS = (
     "주식분할",
     "액면병합",
     "주식병합",
+    "권배락",
     "권리락",
     "배당락",
     "현금현물배당결정",
+    "주식배당결정",
+    "무상증자결정",
 )
 
 # 목록 JSON만으로 공시 발생과 접수일을 보존한다. 가격조정 효력일·비율을
@@ -287,6 +366,99 @@ def _event_api_for_title(title: object) -> EventApi | None:
 def _needs_document(title: object) -> bool:
     compact = _compact_title(title)
     return any(keyword in compact for keyword in DOCUMENT_KEYWORDS)
+
+
+def _listed_disclosure_ticker(
+    row: Mapping[str, object],
+    corp_to_stock: Mapping[str, str],
+) -> str:
+    """Resolve the exact listed ticker used by the Bronze producer.
+
+    OpenDART list rows occasionally omit ``stock_code``.  The producer has
+    always fallen back to the immutable ``corpCode.xml`` snapshot before
+    deciding whether such a row belongs to its listed-action candidate set.
+    Completion-marker verifiers must use this same resolution rule: counting
+    title matches alone also counts unlisted issuers and exchange-wide notices
+    for which the producer deliberately downloads no document.
+    """
+    direct = str(row.get("stock_code") or "").strip()
+    if direct:
+        return direct
+    return str(
+        corp_to_stock.get(str(row.get("corp_code") or ""), "") or ""
+    ).strip()
+
+
+def _is_listed_disclosure_candidate(
+    row: object,
+    corp_to_stock: Mapping[str, str],
+) -> bool:
+    """Return whether ``run`` can materialize this disclosure by receipt."""
+    if not isinstance(row, Mapping):
+        return False
+    return (
+        re.fullmatch(r"\d{14}", str(row.get("rcept_no") or "")) is not None
+        and bool(_listed_disclosure_ticker(row, corp_to_stock))
+    )
+
+
+def _document_candidate_receipts(
+    rows: Iterable[object],
+    corp_to_stock: Mapping[str, str],
+) -> set[str]:
+    """Canonical receipt set certified by ``documents_complete_v5``."""
+    return {
+        str(row.get("rcept_no") or "")
+        for row in rows
+        if isinstance(row, Mapping)
+        and _is_listed_disclosure_candidate(row, corp_to_stock)
+        and _needs_document(row.get("report_nm"))
+    }
+
+
+def _structured_query_keys(
+    rows: Iterable[object],
+    corp_to_stock: Mapping[str, str],
+) -> set[tuple[str, str]]:
+    """Canonical query identities certified by ``structured_complete_v3``."""
+    queries: set[tuple[str, str]] = set()
+    for row in rows:
+        if not isinstance(row, Mapping) or not _is_listed_disclosure_candidate(
+            row, corp_to_stock
+        ):
+            continue
+        corp_code = str(row.get("corp_code") or "")
+        event_api = _event_api_for_title(row.get("report_nm"))
+        if corp_code and event_api is not None:
+            queries.add((event_api.slug, corp_code))
+    return queries
+
+
+def _candidate_corp_to_stock(
+    base: str,
+    rows: Iterable[object],
+) -> dict[str, str]:
+    """Load the listing snapshot only when a candidate needs its fallback.
+
+    Direct ``stock_code`` rows are self-identifying.  If a document or
+    structured candidate omits that field, however, absence of the exact
+    ``corpCode.xml`` snapshot is ambiguous (listed fallback versus unlisted)
+    and therefore fails closed through ``load_listed_corps_from_bronze``.
+    """
+    requires_fallback = any(
+        isinstance(row, Mapping)
+        and re.fullmatch(r"\d{14}", str(row.get("rcept_no") or ""))
+        is not None
+        and not str(row.get("stock_code") or "").strip()
+        and (
+            _needs_document(row.get("report_nm"))
+            or _event_api_for_title(row.get("report_nm")) is not None
+        )
+        for row in rows
+    )
+    if not requires_fallback:
+        return {}
+    return dict(financials.load_listed_corps_from_bronze(base))
 
 
 def _is_relevant_disclosure(title: object) -> bool:
@@ -322,8 +494,12 @@ def _fetch_json(
     *,
     tries: int = 4,
 ) -> dict:
-    last_error: Exception | None = None
+    endpoint = url.split("?", 1)[0].split("#", 1)[0].rsplit("/", 1)[-1]
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", endpoint):
+        endpoint = "unknown"
+    last_failure: tuple[str, int | None] | None = None
     for attempt in range(tries):
+        failure: tuple[str, int | None] | None = None
         try:
             response = requests.get(url, params=params, timeout=60)
             response.raise_for_status()
@@ -331,7 +507,7 @@ def _fetch_json(
             status = str(payload.get("status") or "")
             if status == "020":
                 raise QuotaExceeded(
-                    f"OpenDART quota exceeded: endpoint={url.rsplit('/', 1)[-1]}"
+                    f"OpenDART quota exceeded: endpoint={endpoint}"
                 )
             if status == "800" and attempt + 1 < tries:
                 time.sleep(2 * (attempt + 1))
@@ -339,8 +515,8 @@ def _fetch_json(
             if status not in {"000", "013"}:
                 raise DartApiError(
                     "OpenDART error: "
-                    f"endpoint={url.rsplit('/', 1)[-1]}, "
-                    f"status={status}, message={payload.get('message')}"
+                    f"endpoint={endpoint}, "
+                    f"status={status}"
                 )
             return payload
         except QuotaExceeded:
@@ -348,15 +524,40 @@ def _fetch_json(
         except DartApiError:
             raise
         except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            if attempt + 1 < tries:
-                time.sleep(2 * (attempt + 1))
-    raise DartApiError(f"OpenDART JSON request failed: {url}") from last_error
+            # Never retain or chain requests exceptions.  Their URL includes
+            # ``crtfc_key`` and therefore their string/repr/traceback can expose
+            # the DART secret.  Only non-secret failure metadata survives.
+            raw_status = getattr(
+                getattr(exc, "response", None),
+                "status_code",
+                None,
+            )
+            status_code = raw_status if isinstance(raw_status, int) else None
+            failure = (
+                type(exc).__name__,
+                status_code,
+            )
+            response = None
+        assert failure is not None
+        last_failure = failure
+        if attempt + 1 < tries:
+            time.sleep(2 * (attempt + 1))
+    # Do not retain the caller's secret-bearing params in this traceback frame.
+    del params, url
+    failure_name, status_code = last_failure or ("UnknownError", None)
+    status = f", http_status={status_code}" if status_code is not None else ""
+    # This raise deliberately occurs outside the ``except`` block and suppresses
+    # implicit chaining, so even ``__context__`` cannot retain a secret URL.
+    raise DartApiError(
+        "OpenDART JSON request failed: "
+        f"endpoint={endpoint}, failure={failure_name}{status}"
+    ) from None
 
 
 def _fetch_document(rcept_no: str, *, tries: int = 4) -> bytes:
-    last_error: Exception | None = None
+    last_failure: tuple[str, int | None] | None = None
     for attempt in range(tries):
+        failure: tuple[str, int | None] | None = None
         try:
             response = requests.get(
                 DOCUMENT_URL,
@@ -379,19 +580,34 @@ def _fetch_document(rcept_no: str, *, tries: int = 4) -> bytes:
                 raise DocumentUnavailable(rcept_no, rendered)
             raise DartApiError(
                 f"OpenDART document is not ZIP: rcept_no={rcept_no}, "
-                f"response={rendered[:200]}"
+                f"response_bytes={len(content)}"
             )
         except QuotaExceeded:
             raise
         except DartApiError:
             raise
         except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            if attempt + 1 < tries:
-                time.sleep(2 * (attempt + 1))
+            raw_status = getattr(
+                getattr(exc, "response", None),
+                "status_code",
+                None,
+            )
+            status_code = raw_status if isinstance(raw_status, int) else None
+            failure = (
+                type(exc).__name__,
+                status_code,
+            )
+            response = None
+        assert failure is not None
+        last_failure = failure
+        if attempt + 1 < tries:
+            time.sleep(2 * (attempt + 1))
+    failure_name, status_code = last_failure or ("UnknownError", None)
+    status = f", http_status={status_code}" if status_code is not None else ""
     raise DartApiError(
-        f"OpenDART document request failed: rcept_no={rcept_no}"
-    ) from last_error
+        "OpenDART document request failed: "
+        f"rcept_no={rcept_no}, failure={failure_name}{status}"
+    ) from None
 
 
 def _disclosure_path(base: str, row: dict, ticker: str) -> str:
@@ -506,6 +722,12 @@ def _fetch_structured(
             "bgn_de": STRUCTURED_API_START,
             "end_de": todate,
         },
+        # A complete historical snapshot makes thousands of independent
+        # structured calls.  A brief DART connection flap must not discard
+        # the whole phase after the default four attempts; discovery and
+        # immutable bodies remain resumable, while quota/status failures are
+        # still raised immediately by ``_fetch_json``.
+        tries=8,
     )
     time.sleep(CALL_GAP_SEC)
     return corp_code, event_api, payload
@@ -522,6 +744,8 @@ def run(
     document_shard_index: int | None = None,
     document_shard_count: int | None = None,
     changed_sink: list[str] | None = None,
+    base_override: str | None = None,
+    before_change: Callable[[str], None] | None = None,
 ) -> list[str]:
     """기간 내 기업행사 원본을 수집하고 Silver 입력 URI를 반환한다.
 
@@ -532,6 +756,10 @@ def run(
     ``changed_sink`` 리스트를 넘기면 이번 실행에서 실제로 새로 쓰이거나
     변경된 경로만(의존성 재다운로드 제외) 채워 준다. 호출자는 이를 이용해
     "이번 기간에 진짜 기업행사 변경이 있었는지"를 판정할 수 있다.
+
+    ``before_change``는 새 Bronze 객체를 쓰기 직전에 동기 호출된다. 콜백이
+    실패하면 해당 객체는 게시되지 않는다. 파생 계약을 먼저 fail-closed로
+    전환해야 하는 daily orchestration 전용 경계다.
     """
     api_key = os.environ.get("DART_API_KEY")
     if not api_key:
@@ -544,10 +772,24 @@ def run(
         or not 0 <= document_shard_index < document_shard_count
     ):
         raise ValueError("invalid document shard index/count")
-    base = base_uri(dest)
+    if base_override is not None:
+        requested_base = Path(base_override).expanduser()
+        if dest != "local":
+            raise ValueError("base_override is mutually exclusive with S3 dest")
+        if not requested_base.is_absolute():
+            raise ValueError("base_override must be an absolute local path")
+        base = str(requested_base.resolve())
+    else:
+        if dest == "s3" and before_change is None:
+            raise RuntimeError(
+                "direct S3 corporate-action publication is disabled: every "
+                "new raw action must invalidate and recertify the "
+                "total-return contract inside pipeline.daily_full"
+            )
+        base = base_uri(dest)
     corps = financials.ensure_corp_code_xml(base)
     corp_to_stock = dict(corps)
-    writer = _BronzeWriter(base)
+    writer = _BronzeWriter(base, before_change=before_change)
 
     changed_paths: list[str] = []
     dependency_paths: set[str] = set()
@@ -564,17 +806,20 @@ def run(
                 dependency_fromdate or fromdate,
                 todate,
             ))
+        # v3 discovery re-runs the list API after adding 권배락.  Neither the
+        # older discovery body nor its completion markers may be reused: they
+        # prove completeness only for the earlier keyword sets.
         structured_marker = _manifest_path(
             base,
             fromdate,
             todate,
-            "structured_complete",
+            "structured_complete_v3",
         )
         discovery_manifest_path = _manifest_path(
             base,
             fromdate,
             todate,
-            "disclosures",
+            "disclosures_v3",
         )
         manifest_bytes = read_bytes(discovery_manifest_path)
         if manifest_bytes is not None:
@@ -585,46 +830,39 @@ def run(
                 flush=True,
             )
         else:
-            discovered_rows = []
-            if writer.exists(structured_marker):
-                discovered_rows = writer.recover_disclosures(
-                    fromdate,
-                    todate,
-                )
-            if not discovered_rows:
-                windows = list(_month_windows(fromdate, todate))
-                discovered_by_receipt: dict[str, dict] = {}
-                with ThreadPoolExecutor(max_workers=API_WORKERS) as executor:
-                    discovery_futures = [
-                        executor.submit(
-                            _discover_window,
-                            api_key,
-                            window_start,
-                            window_end,
-                        )
-                        for window_start, window_end in windows
-                    ]
-                    for completed_windows, future in enumerate(
-                        as_completed(discovery_futures),
-                        start=1,
-                    ):
-                        window_end, rows, calls = future.result()
-                        list_calls += calls
-                        for row in rows:
-                            rcept_no = str(row.get("rcept_no") or "")
-                            if re.fullmatch(r"\d{14}", rcept_no):
-                                discovered_by_receipt[rcept_no] = row
-                        print(
-                            "[corporate-actions] discovery "
-                            f"{completed_windows}/{len(windows)} "
-                            f"window_end={window_end.isoformat()} "
-                            f"rows={len(discovered_by_receipt)}",
-                            flush=True,
-                        )
-                discovered_rows = [
-                    discovered_by_receipt[key]
-                    for key in sorted(discovered_by_receipt)
+            windows = list(_month_windows(fromdate, todate))
+            discovered_by_receipt: dict[str, dict] = {}
+            with ThreadPoolExecutor(max_workers=API_WORKERS) as executor:
+                discovery_futures = [
+                    executor.submit(
+                        _discover_window,
+                        api_key,
+                        window_start,
+                        window_end,
+                    )
+                    for window_start, window_end in windows
                 ]
+                for completed_windows, future in enumerate(
+                    as_completed(discovery_futures),
+                    start=1,
+                ):
+                    window_end, rows, calls = future.result()
+                    list_calls += calls
+                    for row in rows:
+                        rcept_no = str(row.get("rcept_no") or "")
+                        if re.fullmatch(r"\d{14}", rcept_no):
+                            discovered_by_receipt[rcept_no] = row
+                    print(
+                        "[corporate-actions] discovery "
+                        f"{completed_windows}/{len(windows)} "
+                        f"window_end={window_end.isoformat()} "
+                        f"rows={len(discovered_by_receipt)}",
+                        flush=True,
+                    )
+            discovered_rows = [
+                discovered_by_receipt[key]
+                for key in sorted(discovered_by_receipt)
+            ]
             if writer.save_json(discovered_rows, discovery_manifest_path):
                 changed_paths.append(discovery_manifest_path)
 
@@ -633,10 +871,7 @@ def run(
             report_name = row.get("report_nm")
             needs_document = _needs_document(report_name)
             corp_code = str(row.get("corp_code") or "")
-            ticker = (
-                str(row.get("stock_code") or "").strip()
-                or corp_to_stock.get(corp_code, "")
-            )
+            ticker = _listed_disclosure_ticker(row, corp_to_stock)
             rcept_no = str(row.get("rcept_no") or "")
             if not ticker or not re.fullmatch(r"\d{14}", rcept_no):
                 continue
@@ -667,6 +902,9 @@ def run(
             flush=True,
         )
 
+        structured_query_keys = _structured_query_keys(
+            discovered_rows, corp_to_stock,
+        )
         structured_queries: dict[tuple[str, str], EventApi] = {}
         for candidate in candidates.values():
             event_api = candidate["event_api"]
@@ -674,7 +912,7 @@ def run(
                 continue
             row = candidate["row"]
             corp_code = str(row.get("corp_code") or "")
-            if corp_code:
+            if corp_code and (event_api.slug, corp_code) in structured_query_keys:
                 structured_queries[(event_api.slug, corp_code)] = event_api
 
         if writer.exists(structured_marker):
@@ -683,7 +921,15 @@ def run(
                 flush=True,
             )
         else:
-            with ThreadPoolExecutor(max_workers=API_WORKERS) as executor:
+            # Do not use the executor context manager here.  Its implicit
+            # ``shutdown(wait=True)`` would wait for every queued multi-minute
+            # retry after the first terminal DART outage.  On failure we stop
+            # accepting work and cancel everything that has not started; at
+            # most the bounded ``API_WORKERS`` requests already in flight can
+            # finish before process exit.
+            executor = ThreadPoolExecutor(max_workers=API_WORKERS)
+            structured_futures = []
+            try:
                 structured_futures = [
                     executor.submit(
                         _fetch_structured,
@@ -729,6 +975,13 @@ def run(
                             f"{query_no}/{len(structured_queries)}",
                             flush=True,
                         )
+            except BaseException:
+                for future in structured_futures:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True)
             marker = {
                 "status": "COMPLETE",
                 "fromdate": fromdate,
@@ -739,13 +992,14 @@ def run(
                 changed_paths.append(structured_marker)
 
         if download_documents:
-            # v2는 현금·현물배당결정 원문을 추가한다. 기존 v1 완료 marker가
-            # 있어도 한 번 더 후보를 검사하되 이미 받은 ZIP은 재사용한다.
+            # v5는 무상증자 결정/정정 원문까지 추가한다. 기존 v4 완료
+            # marker는 더 좁은 후보집합만 증명하므로 재사용하지 않는다.
+            # 이미 받은 immutable ZIP 자체는 content body로 재사용한다.
             documents_marker = _manifest_path(
                 base,
                 fromdate,
                 todate,
-                "documents_complete_v2",
+                "documents_complete_v5",
             )
             if writer.exists(documents_marker):
                 print(
@@ -753,10 +1007,13 @@ def run(
                     flush=True,
                 )
             else:
+                document_candidate_receipts = _document_candidate_receipts(
+                    discovered_rows, corp_to_stock,
+                )
                 document_candidates = [
                     (rcept_no, candidate)
                     for rcept_no, candidate in sorted(candidates.items())
-                    if candidate["needs_document"]
+                    if rcept_no in document_candidate_receipts
                 ]
                 missing_documents = []
                 for rcept_no, candidate in document_candidates:
@@ -824,7 +1081,7 @@ def run(
                     time.sleep(CALL_GAP_SEC)
                 # Shards deliberately do not claim global completion.  A final
                 # unsharded resume sees no missing documents and writes the
-                # single authoritative v2 marker.
+                # single authoritative v5 marker.
                 if document_shard_count is None:
                     marker = {
                         "status": "COMPLETE",
@@ -853,7 +1110,7 @@ def run(
     return sorted(set(changed_paths) | dependency_paths)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -862,13 +1119,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--to", dest="todate", required=True, help="YYYYMMDD")
     parser.add_argument("--dest", choices=["local", "s3"], default="local")
     parser.add_argument(
+        "--base",
+        help="absolute local snapshot root (cannot be combined with --dest s3)",
+    )
+    parser.add_argument(
         "--no-documents",
         action="store_true",
         help="전용 API 없는 공시의 ZIP 원문 다운로드 생략",
     )
     parser.add_argument("--document-shard-index", type=int)
     parser.add_argument("--document-shard-count", type=int)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -880,6 +1141,7 @@ def main() -> None:
         download_documents=not args.no_documents,
         document_shard_index=args.document_shard_index,
         document_shard_count=args.document_shard_count,
+        base_override=args.base,
     )
 
 

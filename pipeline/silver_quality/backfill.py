@@ -1,8 +1,8 @@
-"""최초 Silver backfill: 영구 staging → 전체 검증 → 원자적 승격.
+"""Legacy staged Silver backfill implementation (direct CLI disabled).
 
-사용:
-  uv run python -m pipeline.silver_quality.backfill
-  uv run python -m pipeline.silver_quality.backfill --resume <dq-run-uuid>
+The retained helpers are useful for tests and a future closed orchestrator,
+but the direct entrypoint can publish KRX/action inputs without completing the
+v3 total-return contract.  ``main`` therefore fails before base or DB access.
 """
 from __future__ import annotations
 
@@ -16,6 +16,13 @@ import pandas as pd
 from pipeline.common import db
 from pipeline.common.paths import base_uri
 from pipeline.silver import assets, corporate_actions, financials, prices
+from pipeline.silver.dart_action_snapshot import (
+    DEFAULT_COVERAGE_START,
+    verify_snapshot_manifest,
+)
+from pipeline.silver.return_contract import (
+    acquire_return_writer_transaction_lock,
+)
 from pipeline.silver_quality import repository, staging
 from pipeline.silver_quality.models import (
     CandidateBundle,
@@ -27,6 +34,10 @@ from pipeline.silver_quality.models import (
 from pipeline.silver_quality.runner import assert_publishable, evaluate, print_summary
 
 PUBLISH_LOCK_ID = 7_226_494_898
+DIRECT_CLI_DISABLED_MESSAGE = (
+    "direct Silver quality backfill CLI is disabled: it can leave the "
+    "KRX total-return contract BUILDING without closed recertification"
+)
 
 
 def _fingerprint(base: str) -> str:
@@ -51,6 +62,9 @@ def _fingerprint(base: str) -> str:
 
 
 def _candidate_bundle(base: str) -> CandidateBundle:
+    action_snapshot = verify_snapshot_manifest(
+        base, required_start=DEFAULT_COVERAGE_START,
+    )
     asset_df, identifier_df = assets.prepare(base)
     price_df, price_stats = prices.prepare(base)
     all_price_identifiers = set(
@@ -75,7 +89,11 @@ def _candidate_bundle(base: str) -> CandidateBundle:
         supported_price_identifiers,
         all_price_identifiers - supported_price_identifiers,
     )
-    action_df, action_stats = corporate_actions.prepare(base)
+    action_df, action_stats = corporate_actions.prepare(
+        base,
+        coverage_start=action_snapshot.coverage_start,
+        coverage_end=action_snapshot.coverage_end,
+    )
     action_df, inherited_action_stats = corporate_actions.inherit_issuer_events(
         action_df,
         assets.preferred_share_issuer_map(asset_df),
@@ -241,6 +259,7 @@ def _publish(conn, context, bundle: CandidateBundle, results) -> None:
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (PUBLISH_LOCK_ID,))
+        acquire_return_writer_transaction_lock(conn)
         _assert_final_empty(conn)
         krx_map = assets.publish(
             conn, bundle.assets, bundle.identifiers, context.run_id,
@@ -461,6 +480,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Reject the unsafe direct write path before parsing or external access."""
+    raise RuntimeError(DIRECT_CLI_DISABLED_MESSAGE)
+
+
+def _unsafe_legacy_main() -> None:
+    """Retained for a future closed orchestrator; never dispatch directly."""
     args = parse_args()
     run(args.src, args.resume)
+
+
+if __name__ == "__main__":
+    main()

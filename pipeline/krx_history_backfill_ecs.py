@@ -8,9 +8,12 @@ RDS가 사설망이라 로컬에서 직접 적재할 수 없으므로 VPC 내부
   2. (다운로드 성공 후) Silver 5개 테이블을 TRUNCATE 하고
   3. s3_backfill.run() 으로 1995~현재 KRX/DART 전체를 재구축·인증하고
   4. TRUNCATE 로 함께 지워졌지만 s3_backfill 이 복구하지 않는 나머지 소스를
-     재적재한다: FMP(fmp_backfill_ecs.run_silver_range)와 DART 정기보고서 배당
-     (dart_silver_backfill_ecs.run_dart_extras). (3만 하고 4를 빠뜨리면 FMP·DART
-     DIVIDEND 가 통째로 사라진다.)
+     재적재해야 한다.
+
+현재 total-return ``dart-extras``는 인증된 action만 복구하고 정기보고서
+``DIVIDEND/REPORTED`` fundamental은 의도적으로 쓰지 않는다. 따라서 이 destructive
+entrypoint는 그 전용 completeness/reload 계약이 생길 때까지 apply를 fail-closed로
+차단한다. dry-run만 허용한다.
 
 파괴적 TRUNCATE는 반드시 실행 전에 RDS 스냅샷을 만든 뒤, ``--confirm REBUILD``
 (또는 env ``KRX_HISTORY_REBUILD_CONFIRM=REBUILD``)를 명시했을 때만 수행한다.
@@ -25,7 +28,11 @@ from pathlib import Path
 
 import boto3
 
+from pipeline import dart_silver_backfill_ecs
 from pipeline.common import db
+from pipeline.silver.return_contract import (
+    acquire_return_writer_transaction_lock,
+)
 from pipeline.silver_quality import s3_backfill
 
 _DOWNLOAD_WORKERS = 32
@@ -102,13 +109,14 @@ def _download_prefixes(bucket: str, root: Path, prefixes: tuple[str, ...]) -> in
 def _truncate_silver() -> None:
     conn = db.connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "TRUNCATE "
-                + ", ".join(SILVER_TABLES)
-                + " RESTART IDENTITY CASCADE"
-            )
-        conn.commit()
+        with conn.transaction():
+            acquire_return_writer_transaction_lock(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "TRUNCATE "
+                    + ", ".join(SILVER_TABLES)
+                    + " RESTART IDENTITY CASCADE"
+                )
         print(
             f"[krx-rebuild] truncated {', '.join(SILVER_TABLES)} (CASCADE)",
             flush=True,
@@ -168,6 +176,43 @@ def run(
             f"--confirm {CONFIRM_TOKEN} (or env KRX_HISTORY_REBUILD_CONFIRM="
             f"{CONFIRM_TOKEN}). Create an RDS snapshot first."
         )
+    if not dry_run:
+        raise RuntimeError(
+            "destructive KRX history rebuild is disabled: authenticated "
+            "DART regular-report DIVIDEND/REPORTED fundamental reload is "
+            "not implemented; refusing permanent data loss"
+        )
+    if dry_run:
+        _run_locked(
+            bucket=bucket,
+            resume=resume,
+            dry_run=True,
+            certification_lock=None,
+        )
+        return
+    certification_lock = (
+        dart_silver_backfill_ecs.acquire_daily_certification_lock()
+    )
+    try:
+        _run_locked(
+            bucket=bucket,
+            resume=resume,
+            dry_run=False,
+            certification_lock=certification_lock,
+        )
+    finally:
+        dart_silver_backfill_ecs.release_daily_certification_lock(
+            certification_lock,
+        )
+
+
+def _run_locked(
+    *,
+    bucket: str,
+    resume: str | None,
+    dry_run: bool,
+    certification_lock=None,
+) -> None:
     root = Path("/app/data")
 
     # 1) Bronze 전체를 먼저 확보한다. 다운로드가 실패하면 truncate 하지 않는다.
@@ -180,6 +225,10 @@ def run(
     if dry_run:
         _dry_run()
         return
+
+    dart_silver_backfill_ecs.assert_daily_certification_lock(
+        certification_lock,
+    )
 
     # resume 은 이미 truncate 된 상태에서 중단분을 이어가는 경로다.
     if not resume:
@@ -195,19 +244,20 @@ def run(
     #    - FMP: 미국주식·재무·기업행사·USDKRW·원자재
     #    - DART dart-extras: 정기보고서 배당(fundamental DIVIDEND/REPORTED) 등
     _reload_fmp()
-    _reload_dart_extras()
+    _reload_dart_extras(certification_lock)
 
 
-def _reload_dart_extras() -> None:
+def _reload_dart_extras(certification_lock=None) -> None:
     """Reload DART dividend-report fundamentals (DIVIDEND/REPORTED) etc.
 
     These come from dart_silver_backfill_ecs.run_dart_extras (dividends.py /
     alotMatter), not s3_backfill, so a full rebuild drops them otherwise.
     """
-    from pipeline import dart_silver_backfill_ecs
-
     print("[krx-rebuild] reloading DART dart-extras (DIVIDEND reports)", flush=True)
-    dart_silver_backfill_ecs.run_dart_extras()
+    # The encompassing destructive rebuild already holds the common session
+    # epoch lock.  Re-entering through the public wrapper would use another DB
+    # session and deadlock on ourselves.
+    dart_silver_backfill_ecs._run_dart_extras_locked(certification_lock)
     print("[krx-rebuild] DART dart-extras reload complete", flush=True)
 
 

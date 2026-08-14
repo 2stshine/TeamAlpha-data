@@ -31,6 +31,12 @@ env:
   SCHEDULE_EXPRESSION: "cron(30 8 ? * TUE-SAT *)"
   SCHEDULE_TIMEZONE: Asia/Seoul
   FMP_API_SECRET_ARN: ${{ vars.FMP_API_SECRET_ARN }}
+  # The closed daily path downloads the complete evidence snapshot and runs a
+  # full-history v3 return rebuild.  Start from the already established KRX
+  # rebuild envelope; right-size only after a measured production soak.
+  DAILY_CPU: '8192'
+  DAILY_MEMORY: '49152'
+  DAILY_EPHEMERAL_GIB: '120'
 
 jobs:
   test:
@@ -83,6 +89,21 @@ jobs:
             echo "SCHEDULE_NAME=${SCHEDULE_NAME}"
           } >> "${GITHUB_ENV}"
 
+      - name: Require daily Scheduler to be disabled
+        run: |
+          set -euo pipefail
+
+          CURRENT_SCHEDULE_STATE="$(
+            aws scheduler get-schedule \
+              --name "${SCHEDULE_NAME}" \
+              --query State \
+              --output text
+          )"
+          [[ "${CURRENT_SCHEDULE_STATE}" == "DISABLED" ]] || {
+            echo "Refusing deploy while daily Scheduler is ${CURRENT_SCHEDULE_STATE}. Disable it before replacing the task revision." >&2
+            exit 1
+          }
+
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
@@ -98,15 +119,34 @@ jobs:
           IMAGE_SHA="${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
           IMAGE_LATEST="${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
 
+          [[ "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "GITHUB_SHA must be a full 40-character commit SHA" >&2
+            exit 1
+          }
+
           docker buildx build \
             --platform linux/amd64 \
             -f deploy/Dockerfile \
+            --build-arg "SOURCE_COMMIT=${GITHUB_SHA}" \
+            --build-arg "SOURCE_REPOSITORY=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
             -t "${IMAGE_SHA}" \
             -t "${IMAGE_LATEST}" \
+            --metadata-file image-metadata.json \
             --push \
             .
 
-          echo "image_uri=${IMAGE_SHA}" >> "${GITHUB_OUTPUT}"
+          IMAGE_DIGEST="$(
+            jq -r '."containerimage.digest" // empty' image-metadata.json
+          )"
+          [[ "${IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "Buildx did not return an immutable image digest" >&2
+            exit 1
+          }
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
+
+          echo "image_uri=${IMAGE_URI}" >> "${GITHUB_OUTPUT}"
+          echo "image_tag_uri=${IMAGE_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "image_digest=${IMAGE_DIGEST}" >> "${GITHUB_OUTPUT}"
 
       - name: Register ECS task definition
         id: task
@@ -125,6 +165,9 @@ jobs:
             --arg image "${IMAGE_URI}" \
             --arg container "${CONTAINER_NAME}" \
             --arg fmp_secret "${FMP_API_SECRET_ARN}" \
+            --arg task_cpu "${DAILY_CPU}" \
+            --arg task_memory "${DAILY_MEMORY}" \
+            --argjson ephemeral_gib "${DAILY_EPHEMERAL_GIB}" \
             '
             {
               family,
@@ -145,10 +188,15 @@ jobs:
               inferenceAccelerators
             }
             | with_entries(select(.value != null and .value != [] and .value != {}))
+            | .cpu = $task_cpu
+            | .memory = $task_memory
+            | .ephemeralStorage = {"sizeInGiB": $ephemeral_gib}
             | .containerDefinitions |= map(
                 if .name == $container then
                   .image = $image
                   | .entryPoint = ["uv", "run", "python", "-m", "pipeline.daily_full"]
+                  | .stopTimeout = 120
+                  | del(.cpu, .memory, .memoryReservation)
                   | del(.command)
                   | if ($fmp_secret | length) > 0 then
                       .secrets = (
@@ -174,6 +222,19 @@ jobs:
               exit 1
             }
 
+          jq -e \
+            --arg cpu "${DAILY_CPU}" \
+            --arg memory "${DAILY_MEMORY}" \
+            --argjson ephemeral "${DAILY_EPHEMERAL_GIB}" \
+            '
+            .cpu == $cpu
+            and .memory == $memory
+            and .ephemeralStorage.sizeInGiB == $ephemeral
+            ' new-task-definition.json > /dev/null || {
+              echo "Closed daily task resource envelope is incomplete." >&2
+              exit 1
+            }
+
           TASK_DEFINITION_ARN="$(
             aws ecs register-task-definition \
               --cli-input-json file://new-task-definition.json \
@@ -191,21 +252,44 @@ jobs:
 
           aws scheduler get-schedule \
             --name "${SCHEDULE_NAME}" \
-            --query Target \
-            --output json > current-schedule-target.json
+            --output json > current-schedule.json
+
+          jq '.Target' current-schedule.json > current-schedule-target.json
+          CURRENT_SCHEDULE_STATE="$(jq -r '.State' current-schedule.json)"
+          SCHEDULE_GROUP="$(
+            jq -r '.GroupName // "default"' current-schedule.json
+          )"
+          [[ "${CURRENT_SCHEDULE_STATE}" == "DISABLED" ]] || {
+            echo "Scheduler changed during deploy: ${CURRENT_SCHEDULE_STATE}. Refusing target replacement." >&2
+            exit 1
+          }
 
           jq \
             --arg task_definition_arn "${TASK_DEFINITION_ARN}" \
-            '.EcsParameters.TaskDefinitionArn = $task_definition_arn' \
+            '.EcsParameters.TaskDefinitionArn = $task_definition_arn
+             | .EcsParameters.TaskCount = 1
+             | .RetryPolicy = {
+                 "MaximumEventAgeInSeconds": 86400,
+                 "MaximumRetryAttempts": 0
+               }' \
             current-schedule-target.json > new-schedule-target.json
+
+          jq -e '
+            .EcsParameters.TaskCount == 1
+            and .RetryPolicy.MaximumRetryAttempts == 0
+          ' new-schedule-target.json > /dev/null || {
+            echo "Daily Scheduler must launch one task with no Scheduler retry overlap." >&2
+            exit 1
+          }
 
           aws scheduler update-schedule \
             --name "${SCHEDULE_NAME}" \
+            --group-name "${SCHEDULE_GROUP}" \
             --schedule-expression "${SCHEDULE_EXPRESSION}" \
             --schedule-expression-timezone "${SCHEDULE_TIMEZONE}" \
             --flexible-time-window '{"Mode":"OFF"}' \
             --target file://new-schedule-target.json \
-            --state ENABLED
+            --state DISABLED
 
       - name: Show deployed version
         run: |

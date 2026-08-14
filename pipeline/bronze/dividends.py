@@ -230,8 +230,9 @@ def _fetch(candidate: Candidate, *, tries: int = 4) -> RawResponse:
         "bsns_year": str(candidate.year),
         "reprt_code": candidate.report_code,
     }
-    last_error: Exception | None = None
+    last_failure: tuple[str, int | None] | None = None
     for attempt in range(tries):
+        failure: tuple[str, int | None] | None = None
         try:
             response = requests.get(API_URL, params=params, timeout=60)
             response.raise_for_status()
@@ -245,7 +246,7 @@ def _fetch(candidate: Candidate, *, tries: int = 4) -> RawResponse:
             if status not in {"000", "013"}:
                 raise DividendApiError(
                     f"OpenDART dividend error: status={status} "
-                    f"message={payload.get('message')} ticker={candidate.ticker}"
+                    f"ticker={candidate.ticker}"
                 )
             return RawResponse(
                 body=response.content,
@@ -257,12 +258,31 @@ def _fetch(candidate: Candidate, *, tries: int = 4) -> RawResponse:
         except (QuotaExceeded, DividendApiError):
             raise
         except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            if attempt + 1 < tries:
-                time.sleep(2 * (attempt + 1))
+            # requests exceptions include the prepared URL and its DART key.
+            # Retain only safe failure metadata; never chain the exception.
+            raw_status = getattr(
+                getattr(exc, "response", None),
+                "status_code",
+                None,
+            )
+            status_code = raw_status if isinstance(raw_status, int) else None
+            failure = (
+                type(exc).__name__,
+                status_code,
+            )
+            response = None
+        assert failure is not None
+        last_failure = failure
+        if attempt + 1 < tries:
+            time.sleep(2 * (attempt + 1))
+    # Do not retain the secret-bearing request params in this traceback frame.
+    del params
+    failure_name, status_code = last_failure or ("UnknownError", None)
+    status = f", http_status={status_code}" if status_code is not None else ""
     raise DividendApiError(
-        f"OpenDART dividend request failed: ticker={candidate.ticker}"
-    ) from last_error
+        "OpenDART dividend request failed: "
+        f"ticker={candidate.ticker}, failure={failure_name}{status}"
+    ) from None
 
 
 def _receipt_partition(raw: RawResponse) -> tuple[str, list[str]]:

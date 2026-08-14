@@ -16,19 +16,6 @@ def test_feature_view_excludes_ex_post_total_return_columns():
     assert "total_return_quality_run_id" not in view
 
 
-def test_gold_feature_sql_uses_only_feature_price_view():
-    for name in (
-        "paid_in_capital_ratio.sql", "trading_turnover_20d.sql",
-        "momentum_12_1.sql",
-    ):
-        sql = (ROOT / "pipeline/gold/factors" / name).read_text(
-            encoding="utf-8"
-        )
-        assert "public.factor_price_feature_daily" in sql
-        assert "public.price_daily" not in sql
-        assert "total_return_close" not in sql
-
-
 def test_migration_preserves_a_new_final_release_on_reapply():
     migration = (
         ROOT

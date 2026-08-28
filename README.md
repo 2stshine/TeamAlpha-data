@@ -25,7 +25,7 @@ KRX OpenAPI / OpenDART / marcap / FMP stable API
 - **silver**: `asset` 중심으로 가격·재무·기업행사를 정규화하고, point-in-time 및
   source-aware 품질 게이트를 통과한 데이터만 publish합니다.
 - **gold**: 팩터 정의·버전·평가와 종목별 값·순위, 팩터 간 상관관계를 저장합니다.
-  레거시 12-1 모멘텀과 두 연구 후보 계산 SQL이 있으며, 임시 모멘텀 값은 제거된 상태입니다.
+  레거시 12-1 모멘텀과 여섯 연구 후보 계산 SQL이 있으며, 임시 모멘텀 값은 제거된 상태입니다.
 - **운영 스케줄**: 화~토 오전 08:30 KST cron을 사용합니다. 총수익 복구 기간에는
   Scheduler를 `DISABLED`로 유지하며, 새 closed-flow 이미지의 실운영 one-off soak와
   독립 audit을 통과한 뒤에만 별도 운영 승인으로 활성화합니다.
@@ -382,7 +382,9 @@ gold.factor
 `APPROVED` 버전은 하나만 허용합니다.
 
 레거시 첫 구현은 **12-1 모멘텀**이며, 연구 후보용 구현으로
-`trading_turnover_20d`와 `paid_in_capital_ratio`가 추가되어 있습니다.
+`trading_turnover_20d`, `paid_in_capital_ratio`, `market_leverage`,
+`operating_return_on_capital_employed`, `return_kurtosis_24m`,
+`turnover_volatility_12m`가 추가되어 있습니다.
 
 ```text
 value = adj_close[t-21 거래일] / adj_close[t-252 거래일] - 1

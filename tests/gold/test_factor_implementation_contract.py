@@ -12,7 +12,14 @@ MANIFEST = json.loads(
 
 
 def test_allowlisted_factor_sql_files_exist_and_have_stable_hashes():
-    assert set(MANIFEST) == {"trading_turnover_20d", "paid_in_capital_ratio"}
+    assert set(MANIFEST) == {
+        "market_leverage",
+        "operating_return_on_capital_employed",
+        "paid_in_capital_ratio",
+        "return_kurtosis_24m",
+        "trading_turnover_20d",
+        "turnover_volatility_12m",
+    }
     for spec in MANIFEST.values():
         path = ROOT / spec["sql"]
         assert path.is_file()
@@ -22,13 +29,28 @@ def test_allowlisted_factor_sql_files_exist_and_have_stable_hashes():
 
 
 def test_negative_sign_factors_return_raw_values_and_rank_low_raw_first():
-    for spec in MANIFEST.values():
+    for name in (
+        "paid_in_capital_ratio",
+        "return_kurtosis_24m",
+        "trading_turnover_20d",
+        "turnover_volatility_12m",
+    ):
+        spec = MANIFEST[name]
         sql = (ROOT / spec["sql"]).read_text(encoding="utf-8")
         assert spec["predicted_sign"] == -1
         assert "ORDER BY value ASC" in sql
         assert "%(start_month)s" in sql
         assert "%(end_month)s" in sql
         assert "INSERT INTO" not in sql
+        validate_query_sql(sql)
+
+
+def test_positive_sign_factors_rank_high_raw_first():
+    for name in ("market_leverage", "operating_return_on_capital_employed"):
+        spec = MANIFEST[name]
+        sql = (ROOT / spec["sql"]).read_text(encoding="utf-8")
+        assert spec["predicted_sign"] == 1
+        assert "ORDER BY value DESC" in sql
         validate_query_sql(sql)
 
 
@@ -68,12 +90,49 @@ def test_paid_in_capital_is_point_in_time_and_not_current_state():
     assert "fundamental_current" not in body
 
 
+def test_market_leverage_replays_pit_total_liabilities():
+    sql = (ROOT / MANIFEST["market_leverage"]["sql"]).read_text(
+        encoding="utf-8"
+    )
+    assert "f.available_date <= u.as_of_date" in sql
+    assert "f.metric = 'total_liabilities'" in sql
+    assert "value::double precision / market_cap AS value" in sql
+    assert "value >= 0" in sql
+    body = "\n".join(
+        line for line in sql.splitlines() if not line.lstrip().startswith("--")
+    )
+    assert "fundamental_current" not in body
+
+
 def test_turnover_uses_current_plus_previous_nineteen_rows():
     sql = (ROOT / MANIFEST["trading_turnover_20d"]["sql"]).read_text(
         encoding="utf-8"
     )
     assert "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW" in sql
     assert "adv20 > 0" not in sql
+
+
+def test_new_factors_preserve_pit_and_rolling_contracts():
+    roce = (ROOT / MANIFEST["operating_return_on_capital_employed"]["sql"]).read_text(
+        encoding="utf-8"
+    )
+    kurtosis = (ROOT / MANIFEST["return_kurtosis_24m"]["sql"]).read_text(
+        encoding="utf-8"
+    )
+    turnover_volatility = (
+        ROOT / MANIFEST["turnover_volatility_12m"]["sql"]
+    ).read_text(encoding="utf-8")
+
+    assert "f.available_date <= u.as_of_date" in roce
+    assert "fy.fy_end - interval '370 days'" in roce
+    assert "ROWS BETWEEN 11 PRECEDING AND CURRENT ROW" in turnover_volatility
+    assert "stddev_samp(log_turnover)" in turnover_volatility
+    assert "interval '23 months'" in kurtosis
+    assert "sample_variance" in kurtosis
+    assert "sample_variance = 0 THEN -3.0" in kurtosis
+    assert MANIFEST["return_kurtosis_24m"]["parity_atol"] == 5e-6
+    assert MANIFEST["return_kurtosis_24m"]["parity_rtol"] == 2e-7
+    assert MANIFEST["return_kurtosis_24m"]["allow_tolerance_equivalent_ranks"] is True
 
 
 def test_runner_accepts_structured_publisher_contract():

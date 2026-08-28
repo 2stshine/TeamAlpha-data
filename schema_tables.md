@@ -59,7 +59,9 @@ PK는 `(asset_id, source, identifier_type, identifier, valid_from)`이다. CIK�
 | `market` | 날짜별 주식시장 또는 `FX`. 원자재는 NULL |
 | `quality_run_id`, `loaded_at` | 인증 실행과 적재 시각 |
 
-KRX는 기존 가격조정 로직을 유지하고 `total_return_close=adj_close`로 둔다.
+KRX 주식은 인증된 `krx_gross_dividend_reinvested_v1` rebuild가 `adj_close`에 ISSUER
+현금배당을 배당락일 기준 gross 재투자해 `total_return_close`를 만든다. 계약이
+`CERTIFIED`가 아니면 연구 입력으로 사용할 수 없다.
 FMP EOD bulk에서는 `close`가 분할조정 값이고 `adjClose`가 배당조정 값이다.
 따라서 FMP `close→adj_close`, `adjClose→total_return_close`로 저장하며, 원 OHLC는
 Silver에서 이후 split ratio의 누적곱으로 복원한다. `USDKRW`도 `fx` asset의
@@ -109,6 +111,7 @@ fiscal_period, fs_type, revision_key, metric)`이다. `fundamental_current`는
 | `expected_price_factor` | 예상 가격 조정계수 |
 | `share_count_factor` | 예상 주식수 조정계수 |
 | `status`, `confidence`, `filing_id` | 상태·근거 신뢰도·공시 ID |
+| `report_name`, `action_scope` | 원 공시명과 발행회사/관계회사 범위 (`ISSUER`, `RELATED_COMPANY`, `UNKNOWN`) |
 | `quality_run_id`, `loaded_at` | 인증 실행과 적재 시각 |
 
 DART 구조화 공시와 공시 원문 증거뿐 아니라 FMP split/dividend calendar도
@@ -122,6 +125,13 @@ DART 구조화 공시와 공시 원문 증거뿐 아니라 FMP split/dividend ca
 
 배당 연구자는 물리 테이블을 하나 더 만들지 않고 `dividend_history` view를
 조회한다. 이 view는 `corporate_action`의 `cash_dividend`만 노출한다.
+
+KRX 주식 총수익은 `dividend_event_resolution`에 원천행별 canonical 선택,
+제외 사유, 추론/명시 배당락일과 실제 가격 적용일을 기록한다.
+`price_return_contract`가 `krx_gross_dividend_reinvested_v1` 방법론과 coverage,
+DQ run을 `CERTIFIED`로 선언한 경우에만 `price_daily.total_return_close`를
+배당 포함 연구 레이블로 사용할 수 있다. 새 가격이나 ISSUER 배당 입력이 들어오면
+계약은 `BUILDING`으로 강등된다.
 
 OpenDART `배당에 관한 사항`의 보고기간 단위 값은 기업행사가 아니라 공시 사실이므로
 기존 `fundamental`에 `statement_type='DIVIDEND'`, `data_basis='REPORTED'`로 저장한다.

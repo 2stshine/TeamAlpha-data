@@ -22,6 +22,7 @@ from uuid import UUID
 import pandas as pd
 
 from pipeline.common import db
+from pipeline.silver.return_contract import invalidate_krx_total_return
 
 
 COLUMNS = [
@@ -48,6 +49,7 @@ COLUMNS = [
     "confidence",
     "rcept_no",
     "report_name",
+    "action_scope",
     "source",
     "source_file",
 ]
@@ -336,6 +338,9 @@ def _structured_row(
         "confidence": "EFFECTIVE_DATE" if effective_date else "ANNOUNCEMENT_ONLY",
         "rcept_no": str(row.get("rcept_no") or ""),
         "report_name": report_name,
+        "action_scope": (
+            "RELATED_COMPANY" if related_company_event else "ISSUER"
+        ),
         "source": "DART_STRUCTURED",
         "source_file": path,
     }
@@ -343,6 +348,16 @@ def _structured_row(
 
 def _disclosure_type(report_name: object) -> tuple[str, bool, int] | None:
     title = _compact(report_name)
+    # A listed parent also files material events of an unlisted subsidiary.
+    # The disclosure row carries the parent's stock code, so treating those
+    # rows as the parent's own action silently assigns the subsidiary's DPS,
+    # split or delisting to the wrong security.  Bronze retains the source
+    # response; Silver admits issuer-level actions only.
+    if (
+        "자회사의주요경영사항" in title
+        or "종속회사의주요경영사항" in title
+    ):
+        return None
     if "권리락" in title:
         return "rights_detachment", True, 3
     if "배당락" in title:
@@ -472,27 +487,62 @@ def _cash_dividend_details(
         "adjusted_cash_amount": None,
         "currency": "KRW",
         "frequency": None,
+        "correction_origin_date": None,
+        "related_company_event": False,
     }
     for visible in _document_texts(
         base, ticker=ticker, rcept_no=rcept_no,
     ):
-        compact = _compact(visible)
-        amount = re.search(
-            r"1주당배당금원보통주(?:식)?([0-9,]+(?:\.[0-9]+)?)",
-            compact,
-        )
-        if amount:
-            details["cash_amount"] = _number(amount.group(1))
-        for label, field in (
-            ("배당기준일", "record_date"),
-            ("배당금지급예정일자", "payment_date"),
-        ):
-            match = re.search(
-                label + r"((?:19|20)\d{2}[년./-]?\d{1,2}[월./-]?\d{1,2}일?)",
-                compact,
+        # Keep field boundaries.  Compacting the entire correction document
+        # can concatenate the correction table's old/new values and nearby
+        # totals into one very large number.  Corrected disclosures contain a
+        # correction table first and the complete corrected body last, so the
+        # final body occurrence is the canonical common-share DPS.
+        normalized = re.sub(r"\s+", " ", visible).strip()
+        compact_document = _compact(normalized)
+        if (
+            re.search(
+                r"(?:자회사|종속회사)인.{0,120}의주요경영사항신고",
+                compact_document,
             )
-            if match:
-                details[field] = _parse_date(match.group(1))
+            is not None
+        ):
+            details["related_company_event"] = True
+        correction_dates = list(re.finditer(
+            r"정정관련\s*공시서류\s*제출일\s*[:：]?\s*"
+            r"((?:19|20)\d{2}\s*[년./-]?\s*"
+            r"\d{1,2}\s*[월./-]?\s*\d{1,2}\s*일?)",
+            normalized,
+        ))
+        if correction_dates:
+            details["correction_origin_date"] = _parse_date(
+                correction_dates[-1].group(1),
+            )
+        amount_matches = list(re.finditer(
+            r"1\s*주당\s*배당금\s*"
+            r"(?:\(\s*원\s*\)|원)?\s*"
+            r"보통주(?:식)?\s*[:：]?\s*"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+            normalized,
+        ))
+        if amount_matches:
+            details["cash_amount"] = _number(
+                amount_matches[-1].group(1),
+            )
+        for label_pattern, field in (
+            (r"배당\s*기준일", "record_date"),
+            (r"배당금\s*지급\s*예정일자", "payment_date"),
+        ):
+            matches = list(re.finditer(
+                label_pattern
+                + r"\s*[:：]?\s*"
+                + r"((?:19|20)\d{2}\s*[년./-]?\s*"
+                + r"\d{1,2}\s*[월./-]?\s*\d{1,2}\s*일?)",
+                normalized,
+            ))
+            if matches:
+                details[field] = _parse_date(matches[-1].group(1))
+        compact = compact_document
         if "분기배당" in compact:
             details["frequency"] = "quarterly"
         elif "중간배당" in compact:
@@ -504,6 +554,50 @@ def _cash_dividend_details(
         if details["cash_amount"] is not None:
             break
     return details
+
+
+def _related_cash_correction_signatures(
+    base: str,
+    disclosure_rows: list[tuple[str, dict]],
+) -> set[tuple[str, date, date, float]]:
+    """Identify original filings later corrected as subsidiary disclosures.
+
+    Some DART filings were first published without the subsidiary suffix and
+    corrected a few days later.  Looking at each title independently would
+    leave the original row attached to the listed parent.  The correction
+    document states the original submission date, record date and DPS, which
+    together form a narrow, auditable exclusion signature.
+    """
+    signatures: set[tuple[str, date, date, float]] = set()
+    for path, row in disclosure_rows:
+        title = _compact(row.get("report_nm"))
+        if not (
+            "현금현물배당결정" in title
+            and (
+                "자회사의주요경영사항" in title
+                or "종속회사의주요경영사항" in title
+            )
+        ):
+            continue
+        ticker = str(row.get("stock_code") or "").strip() or _ticker_from_path(path)
+        if not ticker:
+            continue
+        details = _cash_dividend_details(
+            base,
+            ticker=ticker,
+            rcept_no=str(row.get("rcept_no") or ""),
+        )
+        origin = details.get("correction_origin_date")
+        record_date = details.get("record_date")
+        amount = details.get("cash_amount")
+        if origin is not None and record_date is not None and amount is not None:
+            signatures.add((
+                str(ticker).zfill(6),
+                origin,
+                record_date,
+                float(amount),
+            ))
+    return signatures
 
 
 def _disclosure_row(base: str, path: str, row: dict) -> dict | None:
@@ -530,6 +624,8 @@ def _disclosure_row(base: str, path: str, row: dict) -> dict | None:
         if event_type == "cash_dividend"
         else {}
     )
+    if dividend_details.get("related_company_event"):
+        return None
     confirms_adjustment = expects_adjustment or event_type == "ex_dividend"
     effective_date = (
         document_date or announced
@@ -569,6 +665,7 @@ def _disclosure_row(base: str, path: str, row: dict) -> dict | None:
         ),
         "rcept_no": str(row.get("rcept_no") or ""),
         "report_name": row.get("report_nm"),
+        "action_scope": "ISSUER",
         "source": "DART_DISCLOSURE",
         "source_file": path,
     }
@@ -614,6 +711,10 @@ def prepare(
     """로컬 Bronze에서 기업행사 증거를 읽고 표준 DataFrame과 통계를 반환한다."""
     records: list[dict] = []
     disclosure_rows = _disclosure_rows(base)
+    related_cash_corrections = _related_cash_correction_signatures(
+        base,
+        disclosure_rows,
+    )
     disclosure_by_receipt = {
         str(row.get("rcept_no") or ""): row
         for _, row in disclosure_rows
@@ -637,9 +738,26 @@ def prepare(
             records.append(parsed)
 
     disclosure_count = 0
+    related_correction_excluded = 0
     for path, row in disclosure_rows:
         parsed = _disclosure_row(base, path, row)
         if parsed is not None:
+            signature = (
+                str(parsed["identifier"]).zfill(6),
+                parsed["announcement_date"],
+                parsed.get("record_date"),
+                (
+                    float(parsed["cash_amount"])
+                    if parsed.get("cash_amount") is not None
+                    else None
+                ),
+            )
+            if (
+                parsed["event_type"] == "cash_dividend"
+                and signature in related_cash_corrections
+            ):
+                related_correction_excluded += 1
+                continue
             records.append(parsed)
             disclosure_count += 1
 
@@ -648,6 +766,9 @@ def prepare(
             "row_count": 0,
             "structured_file_count": len(structured_files),
             "disclosure_event_count": 0,
+            "related_company_correction_excluded_count": (
+                related_correction_excluded
+            ),
         }
 
     events = pd.DataFrame(records, columns=COLUMNS)
@@ -673,6 +794,9 @@ def prepare(
         "expected_factor_count": int(events["expected_factor"].notna().sum()),
         "share_count_factor_count": int(
             events["share_count_factor"].notna().sum()
+        ),
+        "related_company_correction_excluded_count": (
+            related_correction_excluded
         ),
     }
 
@@ -795,6 +919,7 @@ PUBLISH_COLUMNS = [
     "adjusted_cash_amount", "currency", "frequency",
     "ratio_numerator", "ratio_denominator", "expected_price_factor",
     "share_count_factor", "status", "confidence", "filing_id",
+    "report_name", "action_scope",
     "quality_run_id",
 ]
 
@@ -846,6 +971,8 @@ def normalize_for_publish(candidates: pd.DataFrame) -> pd.DataFrame:
             ),
             "confidence": row.confidence,
             "filing_id": str(row.rcept_no or "") or None,
+            "report_name": getattr(row, "report_name", None),
+            "action_scope": getattr(row, "action_scope", None) or "UNKNOWN",
         })
     return pd.DataFrame(records)
 
@@ -883,9 +1010,24 @@ def publish(
             "payment_date", "cash_amount", "adjusted_cash_amount", "currency",
             "frequency", "ratio_numerator",
             "ratio_denominator", "expected_price_factor", "share_count_factor",
-            "status", "confidence", "filing_id", "quality_run_id", "loaded_at",
+            "status", "confidence", "filing_id", "report_name",
+            "action_scope", "quality_run_id", "loaded_at",
         ],
         temp_name="_stg_corporate_action_publish",
     )
     print(f"[corporate-actions] corporate_action upsert {count}행")
+    published_issuer_cash = (
+        count > 0
+        and (
+            frame["source"].eq("DART_DISCLOSURE")
+            & frame["action_type"].eq("cash_dividend")
+            & frame["action_scope"].eq("ISSUER")
+        ).any()
+    )
+    if published_issuer_cash:
+        invalidate_krx_total_return(
+            conn,
+            reason="ISSUER_CASH_DIVIDEND_PUBLISHED",
+            quality_run_id=quality_run_id,
+        )
     return count

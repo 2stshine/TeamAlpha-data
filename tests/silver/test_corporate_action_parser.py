@@ -241,6 +241,151 @@ def test_cash_dividend_decision_parses_common_amount_dates_and_frequency(tmp_pat
     published = corporate_actions.normalize_for_publish(events).iloc[0]
     assert published["cash_amount"] == pytest.approx(500)
     assert published["adjusted_cash_amount"] is None
+    assert published["action_scope"] == "ISSUER"
+    assert published["report_name"] == "현금ㆍ현물배당결정"
+
+
+def test_subsidiary_cash_dividend_is_not_assigned_to_parent_ticker(tmp_path):
+    manifest = (
+        tmp_path / "corporate_actions/dart/manifests"
+        / "from=20260312/to=20260312/disclosures.json"
+    )
+    _write_json(manifest, [{
+        "stock_code": "128940",
+        "rcept_no": "20260312800001",
+        "rcept_dt": "20260312",
+        "report_nm": "현금ㆍ현물배당 결정(자회사의 주요경영사항)",
+    }])
+    document = (
+        tmp_path / "corporate_actions/dart/documents/year=2026/corp=128940"
+        / "rcept=20260312800001.zip"
+    )
+    _write_document(
+        document,
+        "<document>자회사인 한미약품의 주요경영사항 "
+        "1주당 배당금(원) 보통주식 2,000 "
+        "배당기준일 2026-03-31</document>",
+    )
+
+    events, _ = corporate_actions.prepare(str(tmp_path))
+
+    assert events.empty
+
+
+def test_subsidiary_form_body_is_excluded_even_without_title_suffix(tmp_path):
+    manifest = (
+        tmp_path / "corporate_actions/dart/manifests"
+        / "from=20260312/to=20260312/disclosures.json"
+    )
+    _write_json(manifest, [{
+        "stock_code": "128940",
+        "rcept_no": "20260312800002",
+        "rcept_dt": "20260312",
+        "report_nm": "현금ㆍ현물배당 결정",
+    }])
+    document = (
+        tmp_path / "corporate_actions/dart/documents/year=2026/corp=128940"
+        / "rcept=20260312800002.zip"
+    )
+    _write_document(
+        document,
+        "<document>자회사인 한미약품 주식회사의 주요경영사항신고 "
+        "1주당 배당금(원) 보통주식 2,000 "
+        "배당기준일 2026-03-31</document>",
+    )
+
+    events, _ = corporate_actions.prepare(str(tmp_path))
+
+    assert events.empty
+
+
+def test_original_cash_filing_is_removed_when_correction_marks_subsidiary(
+    tmp_path,
+):
+    manifest = (
+        tmp_path / "corporate_actions/dart/manifests"
+        / "from=20230310/to=20230313/disclosures.json"
+    )
+    _write_json(manifest, [
+        {
+            "stock_code": "009440",
+            "rcept_no": "20230310801178",
+            "rcept_dt": "20230310",
+            "report_nm": "현금ㆍ현물배당 결정",
+        },
+        {
+            "stock_code": "009440",
+            "rcept_no": "20230313800096",
+            "rcept_dt": "20230313",
+            "report_nm": "[기재정정]현금ㆍ현물배당 결정(자회사의 주요경영사항)",
+        },
+    ])
+    original = (
+        tmp_path / "corporate_actions/dart/documents/year=2023/corp=009440"
+        / "rcept=20230310801178.zip"
+    )
+    correction = (
+        tmp_path / "corporate_actions/dart/documents/year=2023/corp=009440"
+        / "rcept=20230313800096.zip"
+    )
+    body = (
+        "1주당 배당금(원) 보통주식 2,949 "
+        "배당기준일 2022-12-31 배당금지급 예정일자 2023-04-28"
+    )
+    _write_document(original, f"<document>{body}</document>")
+    _write_document(
+        correction,
+        "<document>정정관련 공시서류제출일 2023-03-10 "
+        f"{body} 자회사인 케이씨환경서비스의 주요경영사항</document>",
+    )
+
+    events, stats = corporate_actions.prepare(str(tmp_path))
+
+    assert events.empty
+    assert stats["related_company_correction_excluded_count"] == 1
+
+
+def test_corrected_cash_dividend_uses_last_body_values_without_joining_numbers(
+    tmp_path,
+):
+    manifest = (
+        tmp_path / "corporate_actions/dart/manifests"
+        / "from=20260410/to=20260410/disclosures.json"
+    )
+    _write_json(manifest, [{
+        "stock_code": "005930",
+        "rcept_no": "20260410800001",
+        "rcept_dt": "20260410",
+        "report_nm": "[기재정정]현금ㆍ현물배당 결정",
+    }])
+    document = (
+        tmp_path / "corporate_actions/dart/documents/year=2026/corp=005930"
+        / "rcept=20260410800001.zip"
+    )
+    _write_document(document, """
+        <document>
+          <table class="correction">
+            <tr><td>정정전</td><td>1주당 배당금(원)</td>
+                <td>보통주식 300</td><td>정정후 500</td></tr>
+            <tr><td>배당기준일</td><td>2026-03-30</td>
+                <td>2026-03-31</td></tr>
+          </table>
+          <section class="corrected-body">
+            1. 배당구분 분기배당
+            3. 1 주당 배당금 ( 원 ) 보통주식 500 종류주식 -
+            6. 배당 기준일 : 2026 - 03 - 31
+            7. 배당금 지급 예정일자 : 2026.04.25
+          </section>
+        </document>
+    """)
+
+    events, _ = corporate_actions.prepare(str(tmp_path))
+
+    event = events.iloc[0]
+    assert event["cash_amount"] == pytest.approx(500)
+    assert event["record_date"] == date(2026, 3, 31)
+    assert event["payment_date"] == date(2026, 4, 25)
+    assert event["frequency"] == "quarterly"
 
 
 def test_common_issuer_events_are_inherited_by_preferred_share():

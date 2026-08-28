@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from pipeline.common import db
+from pipeline.silver.return_contract import invalidate_krx_total_return
 from pipeline.silver.assets import BENCHMARKS
 
 COLS = [
@@ -584,6 +585,21 @@ def publish(
         if n_ev:
             print(f"[prices] 조정이벤트 {n_ev}종목 소급조정 완료")
         _verify_adj_close_post_publish(conn, both, target_date)
+    published_krx_stock = (
+        n > 0
+        and "asset_type" in both
+        and "source" in both
+        and (
+            both["asset_type"].eq("stock")
+            & both["source"].eq("KRX")
+        ).any()
+    )
+    if published_krx_stock:
+        invalidate_krx_total_return(
+            conn,
+            reason="KRX_PRICE_PUBLISHED",
+            quality_run_id=quality_run_id,
+        )
     return n
 
 

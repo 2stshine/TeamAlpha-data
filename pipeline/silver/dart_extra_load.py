@@ -5,6 +5,8 @@ import argparse
 import hashlib
 from pathlib import Path
 
+import pandas as pd
+
 from pipeline.common import db
 from pipeline.common.paths import base_uri
 from pipeline.silver import corporate_actions, dividends, financials
@@ -53,10 +55,50 @@ def _exclude_unmapped(frame, allowed: set[str]) -> tuple[object, dict]:
     }
 
 
-def run(*, src: str = "local") -> None:
-    base = base_uri(src)
-    dividend_frame, dividend_stats = dividends.prepare(base)
+def _total_return_actions(frame):
+    """Keep only issuer dividend evidence consumed by the TR rebuild."""
+    if frame.empty:
+        return frame.copy()
+    return frame[
+        frame["event_type"].isin(("cash_dividend", "ex_dividend"))
+        & frame["action_scope"].eq("ISSUER")
+    ].reset_index(drop=True)
+
+
+def run(
+    *,
+    src: str = "local",
+    base_override: str | None = None,
+    total_return_actions_only: bool = False,
+) -> None:
+    """Publish a complete local DART snapshot into existing KRX Silver.
+
+    ``base_override`` is intended for an immutable temporary download used by
+    repair/audit jobs.  It does not change the configured Bronze root.
+    """
+    base = str(Path(base_override).resolve()) if base_override else base_uri(src)
+    if total_return_actions_only:
+        dividend_frame = pd.DataFrame(columns=dividends.COLUMNS)
+        dividend_stats = {
+            "input_rows": 0,
+            "transformed_rows": 0,
+            "excluded_rows": 0,
+            "rejected_rows": 0,
+            "duplicate_rows_removed": 0,
+            "source_file_count": 0,
+        }
+    else:
+        dividend_frame, dividend_stats = dividends.prepare(base)
     action_frame, action_stats = corporate_actions.prepare(base)
+    if total_return_actions_only:
+        before_filter = len(action_frame)
+        action_frame = _total_return_actions(action_frame)
+        action_stats = dict(action_stats)
+        action_stats.update({
+            "row_count": len(action_frame),
+            "total_return_action_input_rows": before_filter,
+            "total_return_action_excluded_rows": before_filter - len(action_frame),
+        })
     conn = db.connect()
     context = None
     results = []
@@ -94,10 +136,11 @@ def run(*, src: str = "local") -> None:
         print_summary(results)
         assert_publishable(results)
         with conn.transaction():
-            financials.publish(
-                conn, dividend_frame, identifier_map, context.run_id,
-                replace_scopes=True,
-            )
+            if not total_return_actions_only:
+                financials.publish(
+                    conn, dividend_frame, identifier_map, context.run_id,
+                    replace_scopes=True,
+                )
             corporate_actions.publish(
                 conn, action_frame, identifier_map, context.run_id,
             )
@@ -126,8 +169,24 @@ def run(*, src: str = "local") -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--src", choices=("local",), default="local")
+    parser.add_argument(
+        "--base",
+        help="전체 DART snapshot이 있는 로컬 root (기본: repo data/)",
+    )
+    parser.add_argument(
+        "--total-return-actions-only",
+        action="store_true",
+        help=(
+            "총수익 재구축에 필요한 ISSUER cash/ex-dividend action만 적재하고 "
+            "fundamental 배당 지표는 변경하지 않음"
+        ),
+    )
     args = parser.parse_args()
-    run(src=args.src)
+    run(
+        src=args.src,
+        base_override=args.base,
+        total_return_actions_only=args.total_return_actions_only,
+    )
 
 
 if __name__ == "__main__":

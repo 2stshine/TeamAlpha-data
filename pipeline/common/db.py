@@ -5,6 +5,7 @@ import json
 import os
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 
 def database_url() -> str:
@@ -35,8 +36,18 @@ def database_url() -> str:
 def connect():
     # 장시간 backfill 중 RDS 재시작·네트워크 단절이 생겨도 죽은 TCP 연결에서
     # 무기한 기다리지 않는다. 실패한 파티션은 영구 staging을 이용해 resume한다.
+    url = database_url()
+    host_override = os.environ.get("SILVER_DB_HOST_OVERRIDE")
+    port_override = os.environ.get("SILVER_DB_PORT_OVERRIDE")
+    if host_override or port_override:
+        params = conninfo_to_dict(url)
+        if host_override:
+            params["host"] = host_override
+        if port_override:
+            params["port"] = port_override
+        url = make_conninfo(**params)
     return psycopg.connect(
-        database_url(),
+        url,
         connect_timeout=15,
         keepalives=1,
         keepalives_idle=30,

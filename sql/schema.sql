@@ -213,6 +213,8 @@ CREATE TABLE IF NOT EXISTS corporate_action (
     status TEXT NOT NULL DEFAULT 'confirmed',
     confidence TEXT,
     filing_id TEXT,
+    report_name TEXT,
+    action_scope TEXT NOT NULL DEFAULT 'UNKNOWN',
     quality_run_id UUID REFERENCES dq_run(run_id),
     loaded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY(asset_id, source, action_key)
@@ -222,6 +224,10 @@ ALTER TABLE corporate_action
     ADD COLUMN IF NOT EXISTS adjusted_cash_amount NUMERIC(28,8);
 ALTER TABLE corporate_action
     ADD COLUMN IF NOT EXISTS frequency TEXT;
+ALTER TABLE corporate_action
+    ADD COLUMN IF NOT EXISTS report_name TEXT;
+ALTER TABLE corporate_action
+    ADD COLUMN IF NOT EXISTS action_scope TEXT DEFAULT 'UNKNOWN';
 CREATE INDEX IF NOT EXISTS ix_corporate_action_event
     ON corporate_action(asset_id, ex_date, action_type);
 CREATE INDEX IF NOT EXISTS ix_corporate_action_dividend
@@ -232,9 +238,44 @@ CREATE INDEX IF NOT EXISTS ix_corporate_action_dividend
 CREATE OR REPLACE VIEW dividend_history AS
 SELECT asset_id, source, action_key, announcement_date, ex_date, record_date,
        payment_date, cash_amount, adjusted_cash_amount, currency, frequency,
-       status, confidence, filing_id, quality_run_id, loaded_at
+       status, confidence, filing_id, quality_run_id, loaded_at,
+       report_name, action_scope
 FROM corporate_action
 WHERE action_type = 'cash_dividend';
+
+-- KRX gross total-return derivation audit and certification contract.
+CREATE TABLE IF NOT EXISTS dividend_event_resolution (
+    asset_id BIGINT NOT NULL REFERENCES asset(asset_id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    action_key TEXT NOT NULL,
+    resolution_version TEXT NOT NULL,
+    is_canonical BOOLEAN NOT NULL,
+    excluded_reason TEXT,
+    resolved_ex_date DATE,
+    ex_date_basis TEXT,
+    applied_trade_date DATE,
+    raw_cash_amount NUMERIC(28,8),
+    adjusted_cash_amount NUMERIC(28,8),
+    quality_run_id UUID REFERENCES dq_run(run_id),
+    resolved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY(asset_id, source, action_key, resolution_version)
+);
+
+CREATE TABLE IF NOT EXISTS price_return_contract (
+    source TEXT NOT NULL,
+    asset_type TEXT NOT NULL,
+    field_name TEXT NOT NULL,
+    methodology_version TEXT NOT NULL,
+    dividend_treatment TEXT NOT NULL,
+    status TEXT NOT NULL,
+    coverage_start DATE,
+    coverage_end DATE,
+    quality_run_id UUID REFERENCES dq_run(run_id),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    certified_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY(source, asset_type, field_name)
+);
 
 -- Deterministic Critical/Error invariants are also enforced by RDS. The
 -- canonical deployed expressions live in migration 006_database_quality_guards.sql.

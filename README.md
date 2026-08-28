@@ -256,7 +256,7 @@ bronze 원칙:
 
 ## RDS Silver 구조
 
-핵심 silver는 PostgreSQL 테이블 5개로 구성됩니다.
+핵심 Silver 원천 테이블 5개와 파생 총수익 계약·감사 테이블로 구성됩니다.
 
 ```text
 asset
@@ -265,6 +265,8 @@ price_daily
 fundamental
 corporate_action
 dividend_history  # corporate_action의 cash_dividend 조회 view
+dividend_event_resolution  # 배당 정정·배당락일·적용일 감사
+price_return_contract      # total_return_close 방법론·인증 상태
 ```
 
 관계:
@@ -284,12 +286,21 @@ asset
 | `price_daily` | 주식·지수·FX·원자재 연속선물 일봉 | `(asset_id, source, trade_date)` |
 | `fundamental` | DART/FMP 재무계정 long format | `(asset_id, source, statement_type, data_basis, period_end, fiscal_period, fs_type, revision_key, metric)` |
 | `corporate_action` | 배당·분할·증자·감자 등 기업행사 | `(asset_id, source, action_key)` |
+| `dividend_event_resolution` | 원천 현금배당별 canonical/제외·배당락일·실제 적용일 감사 | `(asset_id, source, action_key, resolution_version)` |
+| `price_return_contract` | 자산군별 총수익 방법론과 현재 인증 상태 | `(source, asset_type, field_name)` |
 
 배당은 별도 물리 테이블을 추가하지 않는다. 이벤트 날짜·원/분할조정 주당배당금·통화·
 지급주기는 `corporate_action`에 저장하고 `dividend_history` view로 조회한다. DART
 정기보고서의 배당총액·배당성향·배당수익률은 `fundamental`의 `DIVIDEND` 지표로
 저장한다. 원천 가격과 결합해 다시 계산할 수 있는 시점별 배당수익률은
 `corporate_action`에 저장하지 않는다.
+
+KRX 주식 `total_return_close`는 `adj_close`에 ISSUER 현금배당을 gross 기준으로
+배당락일 종가 재투자해 계산한다. 명시된 배당락일이 없으면 KRX 결제 관행에 따라
+기준일 이전 두 번째 시장 세션을 사용하고, 모든 원천행의 선택·제외 근거는
+`dividend_event_resolution`에 남긴다. 새 KRX 가격이나 ISSUER 현금배당이 적재되면
+`price_return_contract`는 즉시 `BUILDING`으로 강등되며, 전체 재구축·행 parity가
+끝난 뒤에만 다시 `CERTIFIED`가 된다.
 
 FMP Silver 편입 대상은 NASDAQ·NYSE·AMEX에서 거래되는 common stock,
 preferred stock, ADR, REIT입니다. ETF, fund, ETN, warrant, unit, listed note는
@@ -307,6 +318,11 @@ FMP 원자재는 `asset_type=commodity`,
 유지하고, 거래 세션이 아닌 토요일 행과 OHLC 불일치 행은 Bronze에 보존하되
 Silver에서 제외해 `MODIFIED`로 기록합니다. 롤오버 가능 급변은 값을 고치지 않고
 warning으로 남깁니다.
+
+현재 2015~2026 원자재 이력은 2026년 일괄 백필이므로 과거 각 시점에 실제로
+가용했던 PIT 입력으로 간주하지 않는다. 또한 롤 조정/선물 총수익 계약이 없으므로
+팩터 연구의 hidden OOS·Gold 입력에는 바로 사용하지 않고, retrospective 진단이나
+향후 별도 PIT·롤 방법론을 구축하는 원천으로만 사용한다.
 
 컬럼별 상세 설계는 [schema_tables.md](schema_tables.md)와 [sql/schema.sql](sql/schema.sql)를 참고합니다.
 
@@ -511,6 +527,26 @@ uv run python -m pipeline.dart_silver_backfill_ecs --phase krx-gap
 `DIVIDEND/REPORTED` 행으로, 배당결정 공시는 `corporate_action`의
 `cash_dividend` 행으로 적재한다. 기존 KRX 식별자에 매핑되는 후보만 품질
 게이트를 통과시킨 뒤 source-scoped transaction으로 반영한다.
+
+KRX gross 배당재투자 총수익의 최초 구축·복구는 maintenance window에서 아래
+순서로 실행한다. 첫 preview는 로컬 complete Bronze와 RDS 가격을 DB-level
+read-only transaction으로 대조한다. 그 뒤 총수익에 필요한 ISSUER 현금배당·
+배당락만 Silver에 적재하고, 두 번째 preview가 같은 인증 snapshot으로 재현되는지
+확인한 후에만 `--apply`한다.
+
+```bash
+uv run python -m pipeline.silver_quality.migrate
+uv run python -m pipeline.silver.total_return_rebuild \
+  --actions-base /complete/dart/snapshot
+uv run python -m pipeline.silver.dart_extra_load \
+  --base /complete/dart/snapshot --total-return-actions-only
+uv run python -m pipeline.silver.total_return_rebuild
+uv run python -m pipeline.silver.total_return_rebuild --apply
+```
+
+기본 `total_return_rebuild`는 dry-run이고 `--apply`만 가격·감사·계약을 변경한다.
+새 KRX 주가 또는 ISSUER 현금배당이 들어오면 계약은 `BUILDING`이 되므로, 다음
+팩터 연구 전에 최신 complete action snapshot으로 위 재구축을 다시 완료해야 한다.
 
 완료된 `response.*`/`manifest.json` 파티션은 재호출하지 않으므로 같은 범위로
 재실행해도 이어서 진행합니다. 운영에서는 daily task와 겹치지 않도록 Scheduler를

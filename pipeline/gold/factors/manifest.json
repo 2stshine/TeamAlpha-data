@@ -1,0 +1,41 @@
+{
+  "market_leverage": {
+    "predicted_sign": 1,
+    "research_definition_hash": "34e619cb846843cc",
+    "sql": "pipeline/gold/factors/market_leverage.sql",
+    "value_contract": "raw_value_direction_adjusted_rank_v1"
+  },
+  "operating_return_on_capital_employed": {
+    "predicted_sign": 1,
+    "research_definition_hash": "aa11ccad9cfd19c6",
+    "sql": "pipeline/gold/factors/operating_return_on_capital_employed.sql",
+    "value_contract": "raw_value_direction_adjusted_rank_v1"
+  },
+  "paid_in_capital_ratio": {
+    "predicted_sign": -1,
+    "research_definition_hash": "8c82db0117290bcd",
+    "sql": "pipeline/gold/factors/paid_in_capital_ratio.sql",
+    "value_contract": "raw_value_direction_adjusted_rank_v1"
+  },
+  "trading_turnover_20d": {
+    "predicted_sign": -1,
+    "research_definition_hash": "c03efb8638407bd6",
+    "sql": "pipeline/gold/factors/trading_turnover_20d.sql",
+    "value_contract": "raw_value_direction_adjusted_rank_v1"
+  },
+  "return_kurtosis_24m": {
+    "allow_tolerance_equivalent_ranks": true,
+    "parity_atol": 0.000005,
+    "parity_rtol": 0.0000002,
+    "predicted_sign": -1,
+    "research_definition_hash": "be70b24e1222fb72",
+    "sql": "pipeline/gold/factors/return_kurtosis_24m.sql",
+    "value_contract": "raw_value_direction_adjusted_rank_v1"
+  },
+  "turnover_volatility_12m": {
+    "predicted_sign": -1,
+    "research_definition_hash": "07f156b1d7953440",
+    "sql": "pipeline/gold/factors/turnover_volatility_12m.sql",
+    "value_contract": "raw_value_direction_adjusted_rank_v1"
+  }
+}

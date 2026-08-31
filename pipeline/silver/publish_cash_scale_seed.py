@@ -66,19 +66,42 @@ def _manifest_payload(
     parents: pd.DataFrame,
     supports: pd.DataFrame,
 ) -> dict[str, object]:
-    parent_rows = evidence._canonical_rows(
-        parents,
-        columns=evidence.MANIFEST_ROW_COLUMNS,
-        order_by=("evidence_key",),
-    )
-    support_rows = evidence._canonical_rows(
-        supports,
-        columns=evidence.MANIFEST_SUPPORT_ACTION_COLUMNS,
-        order_by=(
-            "evidence_key", "support_action_source", "support_action_key",
-            "support_action_type",
-        ),
-    )
+    # Reproduce the builder's serialized representation, not merely its
+    # database-neutral digest representation.  The original overlap frame was
+    # sorted by asset/date and its numeric values were JSON numbers; persisted
+    # NUMERIC values otherwise arrive from psycopg as Decimal strings.
+    def original_row(row, columns) -> dict[str, object]:
+        rendered: dict[str, object] = {}
+        for column in columns:
+            value = getattr(row, column)
+            if value is None or pd.isna(value):
+                rendered[column] = None
+            elif column in evidence._DATE_COLUMNS:
+                rendered[column] = value.isoformat()[:10]
+            elif column in evidence._INTEGER_COLUMNS:
+                rendered[column] = int(value)
+            elif column in evidence._DECIMAL_PLACES:
+                rendered[column] = float(value)
+            else:
+                rendered[column] = str(value)
+        return rendered
+
+    parent_rows = [
+        original_row(row, evidence.MANIFEST_ROW_COLUMNS)
+        for row in parents.sort_values(
+            ["asset_id", "adjustment_trade_date"], kind="stable",
+        ).itertuples(index=False)
+    ]
+    support_rows = [
+        original_row(row, evidence.MANIFEST_SUPPORT_ACTION_COLUMNS)
+        for row in supports.sort_values(
+            [
+                "evidence_key", "support_action_source",
+                "support_action_key", "support_action_type",
+            ],
+            kind="stable",
+        ).itertuples(index=False)
+    ]
     parent_hashes = {
         str(row.evidence_key): str(row.manifest_row_sha256)
         for row in parents.itertuples(index=False)

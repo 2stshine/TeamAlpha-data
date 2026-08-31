@@ -21,6 +21,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 COPY pipeline/ ./pipeline/
+COPY tests/fixtures/kind/*.json ./pipeline/resources/kind/
 
 # 자격증명: 로컬 .env 아님. ECS Task Role(S3/RDS) + Secrets(KRX/DART 키) 로 주입.
 ENTRYPOINT ["uv", "run", "python", "-m", "pipeline.daily_full"]

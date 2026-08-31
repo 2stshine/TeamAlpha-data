@@ -23,6 +23,15 @@ _RECEIPT_PATTERN = re.compile(r"^[0-9]{14}$")
 _INTERVAL_PATTERN = re.compile(r"^[0-9]{8}$")
 
 
+def immutable_disclosure_changes(left: dict, right: dict) -> tuple[str, ...]:
+    """Return changed fields that OpenDART does not document as mutable."""
+    fields = set(left) | set(right)
+    return tuple(sorted(
+        key for key in fields
+        if key not in _MUTABLE_LIST_FIELDS and left.get(key) != right.get(key)
+    ))
+
+
 @dataclass(frozen=True)
 class DisclosureObservation:
     path: str

@@ -43,6 +43,7 @@ from pipeline.bronze.corporate_actions import (
 )
 from pipeline.bronze.dart_disclosure_observations import (
     canonicalize_disclosures,
+    immutable_disclosure_changes,
 )
 
 
@@ -1077,10 +1078,12 @@ def _load_fresh_snapshot(
         ticker = _ticker(_listed_disclosure_ticker(row, corp_to_stock))
         individual = _individual_disclosure_path(root, row, ticker)
         individual_row = _read_json(individual)
-        if individual_row != row:
+        immutable_changes = immutable_disclosure_changes(individual_row, row)
+        if immutable_changes:
             raise RuntimeError(
                 "individual/canonical DART disclosure mismatch: "
-                f"receipt={receipt} path={individual}"
+                f"receipt={receipt} fields={list(immutable_changes)} "
+                f"path={individual}"
             )
         manifest_path = Path(manifest_path_string)
         disclosures[receipt] = _DisclosureBind(

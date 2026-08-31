@@ -150,6 +150,8 @@ def _manifest_payload(
 
 def _component_request(root: Path) -> tuple[Path, Path]:
     resources = Path(__file__).resolve().parents[1] / "resources" / "kind"
+    if not resources.is_dir():
+        resources = Path.cwd() / "tests" / "fixtures" / "kind"
     reference = resources / "reference-requests-v2.json"
     component_v1 = json.loads(
         (resources / "component-requests-v1.json").read_text(encoding="utf-8")
@@ -169,6 +171,27 @@ def _component_request(root: Path) -> tuple[Path, Path]:
     destination = root / "component-requests-v2.json"
     destination.write_bytes(_canonical(component))
     return reference, destination
+
+
+def _restore_kind_seed(s3, bucket: str, root: Path) -> bool:
+    prefix = "corporate_actions/krx/kind/"
+    keys: list[str] = []
+    for page in s3.get_paginator("list_objects_v2").paginate(
+        Bucket=bucket, Prefix=prefix,
+    ):
+        keys.extend(
+            item["Key"] for item in page.get("Contents", [])
+            if not item["Key"].endswith("/")
+        )
+    if not keys:
+        return False
+    for key in keys:
+        destination = root / key
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        s3.download_file(bucket, key, str(destination))
+    krx_kind_reference.external_evidence_paths(root)
+    print(f"[cash-scale-seed] restored KIND objects={len(keys)}", flush=True)
+    return True
 
 
 def _price_payload(
@@ -298,8 +321,9 @@ def run() -> None:
             manifest.write_bytes(raw_manifest)
             price_manifest = root / evidence.PRICE_OBJECT_MANIFEST_RELATIVE_PATH
             price_manifest.write_bytes(_canonical(_price_payload(s3, bucket, parents)))
-            reference, component = _component_request(root)
-            builder.download_kind_evidence(root, reference, component)
+            if not _restore_kind_seed(s3, bucket, root):
+                reference, component = _component_request(root)
+                builder.download_kind_evidence(root, reference, component)
             kind_paths = krx_kind_reference.external_evidence_paths(root)
             for path in (*kind_paths, manifest, price_manifest):
                 _put_once(s3, bucket, root, path)

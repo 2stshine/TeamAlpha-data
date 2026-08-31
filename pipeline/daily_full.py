@@ -150,7 +150,21 @@ def main() -> None:
         )
 
 
-def _main_locked(certification_lock) -> None:
+def _main_locked(
+    certification_lock,
+    *,
+    allow_deferred_total_return: bool = False,
+    close_total_return: bool = True,
+    assert_final_freshness: bool = True,
+) -> None:
+    """Run one target day while the caller owns the certification epoch.
+
+    Normal daily execution uses the strict defaults.  The bounded gap replay
+    orchestrator may keep the return contract BUILDING between consecutive
+    dates while it holds this same session lock, then rebuild and certify once
+    on its final date.  No independent daily invocation can opt into that
+    behavior through an environment variable or CLI flag.
+    """
     bucket = os.environ["S3_BRONZE_BUCKET"]
     day = _target_day()
     ds = ymd_to_dash(day)
@@ -308,7 +322,10 @@ def _main_locked(certification_lock) -> None:
         # intentionally left the contract BUILDING.  Repair that exact existing
         # coverage before admitting another price day; otherwise repeated
         # scheduled failures would keep extending uncertified raw coverage.
-        if not contract_ready_before_action_collection:
+        if (
+            not contract_ready_before_action_collection
+            and not allow_deferred_total_return
+        ):
             print(
                 "[total-return] closing pre-existing uncertified coverage "
                 "before daily price publication",
@@ -318,6 +335,12 @@ def _main_locked(certification_lock) -> None:
                 coverage_end,
                 root=root,
                 certification_lock=certification_lock,
+            )
+        elif not contract_ready_before_action_collection:
+            print(
+                "[total-return] gap replay owns the certification epoch; "
+                "deferring pre-existing raw coverage closure",
+                flush=True,
             )
 
     print(
@@ -352,7 +375,7 @@ def _main_locked(certification_lock) -> None:
             conn=certification_lock,
         )
     )
-    if not contract_ready_after_incremental:
+    if not contract_ready_after_incremental and close_total_return:
         # The source transaction has deliberately demoted the label contract to
         # BUILDING.  The same ECS invocation must now validate the new raw-price
         # day against local actions, publish the exact action snapshot, rebuild
@@ -363,6 +386,11 @@ def _main_locked(certification_lock) -> None:
             coverage_end,
             root=root,
             certification_lock=certification_lock,
+        )
+    elif not contract_ready_after_incremental:
+        print(
+            f"[total-return] deferred closure after gap day={day}",
+            flush=True,
         )
 
     # FMP is a separate source transaction. KRX/DART remains committed if FMP
@@ -378,8 +406,11 @@ def _main_locked(certification_lock) -> None:
 
     # A BUILDING/drifted total-return contract or stale source is a task
     # failure.  Do not emit a false-green ECS exit after source publication.
-    fr = freshness.assert_fresh()
-    print(f"[freshness] ok {fr['sources']}", flush=True)
+    if assert_final_freshness:
+        fr = freshness.assert_fresh()
+        print(f"[freshness] ok {fr['sources']}", flush=True)
+    else:
+        print(f"[freshness] deferred after gap day={day}", flush=True)
 
 
 if __name__ == "__main__":

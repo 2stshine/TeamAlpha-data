@@ -26,9 +26,9 @@ KRX OpenAPI / OpenDART / marcap / FMP stable API
   source-aware 품질 게이트를 통과한 데이터만 publish합니다.
 - **gold**: 팩터 정의·버전·평가와 종목별 값·순위, 팩터 간 상관관계를 저장합니다.
   레거시 12-1 모멘텀과 여섯 연구 후보 계산 SQL이 있으며, 임시 모멘텀 값은 제거된 상태입니다.
-- **운영 스케줄**: 화~토 오전 08:30 KST cron을 사용합니다. 총수익 복구 기간에는
-  Scheduler를 `DISABLED`로 유지하며, 새 closed-flow 이미지의 실운영 one-off soak와
-  독립 audit을 통과한 뒤에만 별도 운영 승인으로 활성화합니다.
+- **운영 스케줄**: 화~토 오전 08:30 KST cron을 사용합니다. 전체 복구 작업 중에는
+  Scheduler를 일시 중지할 수 있지만, 정상 배포는 새 daily target을 등록한 뒤
+  Scheduler를 `ENABLED`로 복원합니다.
 - **자동 배포**: `main` 브랜치에 push하면 GitHub Actions가 ECR/ECS/Scheduler를 갱신합니다.
 - **결과 알림**: daily ECS task가 종료되면 SNS 이메일로 성공/실패 결과를 받습니다.
 
@@ -91,16 +91,16 @@ GitHub main push
   -> ECS task definition 새 revision 등록
      - 새 revision은 태그가 아니라 방금 push한 이미지의 SHA-256 digest를 바라봄
   -> EventBridge Scheduler target 갱신
-     - Scheduler가 이미 DISABLED일 때만 갱신
-     - 새 task definition target도 DISABLED로 유지
+     - 현재 상태를 검증하고 새 task definition으로 교체
+     - 정상 배포가 끝나면 Scheduler를 ENABLED로 복원
 ```
 
 즉, GitHub에 코드를 push하면 새 Docker 이미지가 ECR에 올라가고, ECS는 다음 실행부터 그 이미지를 받아 실행합니다.
 
 ### 스케줄 실행 흐름
 
-활성화가 승인된 뒤의 매일 실행은 EventBridge Scheduler가 시작합니다. 배포 workflow는
-Scheduler를 자동으로 활성화하지 않습니다.
+매일 실행은 EventBridge Scheduler가 시작합니다. 배포 workflow는 새 이미지와 task
+definition을 등록한 뒤 Scheduler를 자동으로 활성화합니다.
 
 ```text
 EventBridge Scheduler
@@ -820,9 +820,9 @@ bit-for-bit 동일한 digest가 나온다고 보장하지는 않는다. 공식 u
 3. `linux/amd64` Docker 이미지를 빌드합니다.
 4. ECR에 commit SHA 태그와 `latest` 태그를 push하고 image digest를 확인합니다.
 5. ECS task definition 새 revision을 digest URI로 등록합니다.
-6. 배포 전과 target 갱신 직전에 EventBridge Scheduler가 `DISABLED`인지 강제하고,
-   새 task definition target도 `DISABLED` 상태로만 등록합니다. 이 workflow는
-   Scheduler를 자동 재활성화하지 않습니다.
+6. EventBridge Scheduler의 현재 상태를 검증하고 새 task definition target으로
+   교체한 뒤 `ENABLED`로 복원합니다. PostgreSQL certification advisory lock과
+   Scheduler retry 0 정책이 이전 revision과 다음 실행의 중첩 쓰기를 차단합니다.
 
 필요한 GitHub secret:
 

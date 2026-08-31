@@ -45,26 +45,23 @@ def test_ecs_task_definition_uses_the_pushed_image_digest():
     assert ".ephemeralStorage.sizeInGiB == $ephemeral" in workflow
 
 
-def test_deploy_requires_and_preserves_fail_closed_disabled_scheduler():
+def test_deploy_reactivates_daily_scheduler_after_target_update():
     workflow = _read(".github/workflows/deploy.yml")
     preflight = workflow.split(
-        "- name: Require daily Scheduler to be disabled", 1
+        "- name: Inspect current daily Scheduler", 1
     )[1].split("- name: Log in to Amazon ECR", 1)[0]
     update_step = workflow.split(
         "- name: Update EventBridge Scheduler target", 1
     )[1].split("- name: Show deployed version", 1)[0]
 
     assert "aws scheduler get-schedule" in preflight
+    assert '== "ENABLED"' in preflight
     assert '== "DISABLED"' in preflight
-    assert "Refusing deploy while daily Scheduler" in preflight
+    assert "Unexpected daily Scheduler state" in preflight
     assert "aws scheduler get-schedule" in update_step
-    assert "CURRENT_SCHEDULE_STATE" in update_step
-    assert '== "DISABLED"' in update_step
-    assert "Scheduler changed during deploy" in update_step
-    assert "--state DISABLED" in update_step
-    assert '--state "${CURRENT_SCHEDULE_STATE}"' not in update_step
     assert '--group-name "${SCHEDULE_GROUP}"' in update_step
-    assert "--state ENABLED" not in update_step
+    assert "--state ENABLED" in update_step
+    assert "--state DISABLED" not in update_step
     assert ".EcsParameters.TaskCount = 1" in update_step
     assert '.RetryPolicy = {' in update_step
     assert '"MaximumRetryAttempts": 0' in update_step

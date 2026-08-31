@@ -89,7 +89,7 @@ jobs:
             echo "SCHEDULE_NAME=${SCHEDULE_NAME}"
           } >> "${GITHUB_ENV}"
 
-      - name: Require daily Scheduler to be disabled
+      - name: Inspect current daily Scheduler
         run: |
           set -euo pipefail
 
@@ -99,10 +99,11 @@ jobs:
               --query State \
               --output text
           )"
-          [[ "${CURRENT_SCHEDULE_STATE}" == "DISABLED" ]] || {
-            echo "Refusing deploy while daily Scheduler is ${CURRENT_SCHEDULE_STATE}. Disable it before replacing the task revision." >&2
+          [[ "${CURRENT_SCHEDULE_STATE}" == "ENABLED" || "${CURRENT_SCHEDULE_STATE}" == "DISABLED" ]] || {
+            echo "Unexpected daily Scheduler state: ${CURRENT_SCHEDULE_STATE}" >&2
             exit 1
           }
+          echo "Current daily Scheduler state: ${CURRENT_SCHEDULE_STATE}"
 
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
@@ -255,14 +256,9 @@ jobs:
             --output json > current-schedule.json
 
           jq '.Target' current-schedule.json > current-schedule-target.json
-          CURRENT_SCHEDULE_STATE="$(jq -r '.State' current-schedule.json)"
           SCHEDULE_GROUP="$(
             jq -r '.GroupName // "default"' current-schedule.json
           )"
-          [[ "${CURRENT_SCHEDULE_STATE}" == "DISABLED" ]] || {
-            echo "Scheduler changed during deploy: ${CURRENT_SCHEDULE_STATE}. Refusing target replacement." >&2
-            exit 1
-          }
 
           jq \
             --arg task_definition_arn "${TASK_DEFINITION_ARN}" \
@@ -289,7 +285,7 @@ jobs:
             --schedule-expression-timezone "${SCHEDULE_TIMEZONE}" \
             --flexible-time-window '{"Mode":"OFF"}' \
             --target file://new-schedule-target.json \
-            --state DISABLED
+            --state ENABLED
 
       - name: Show deployed version
         run: |

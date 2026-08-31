@@ -57,6 +57,8 @@ def run(from_day: str, to_day: str) -> None:
                 allow_deferred_total_return=index > 0,
                 close_total_return=final,
                 assert_final_freshness=final,
+                collect_financials=final,
+                full_year_financial_snapshot=final,
             )
             print(f"[gap-replay] complete day={day}", flush=True)
     finally:

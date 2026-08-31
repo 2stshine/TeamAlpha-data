@@ -48,6 +48,8 @@ def test_gap_replay_holds_one_epoch_and_only_certifies_final_day(monkeypatch):
                 "allow_deferred_total_return": False,
                 "close_total_return": False,
                 "assert_final_freshness": False,
+                "collect_financials": False,
+                "full_year_financial_snapshot": False,
             },
         ),
         (
@@ -56,6 +58,8 @@ def test_gap_replay_holds_one_epoch_and_only_certifies_final_day(monkeypatch):
                 "allow_deferred_total_return": True,
                 "close_total_return": False,
                 "assert_final_freshness": False,
+                "collect_financials": False,
+                "full_year_financial_snapshot": False,
             },
         ),
         (
@@ -64,6 +68,8 @@ def test_gap_replay_holds_one_epoch_and_only_certifies_final_day(monkeypatch):
                 "allow_deferred_total_return": True,
                 "close_total_return": True,
                 "assert_final_freshness": True,
+                "collect_financials": True,
+                "full_year_financial_snapshot": True,
             },
         ),
         ("release", lock),

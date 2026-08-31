@@ -156,6 +156,8 @@ def _main_locked(
     allow_deferred_total_return: bool = False,
     close_total_return: bool = True,
     assert_final_freshness: bool = True,
+    collect_financials: bool = True,
+    full_year_financial_snapshot: bool = False,
 ) -> None:
     """Run one target day while the caller owns the certification epoch.
 
@@ -180,21 +182,59 @@ def _main_locked(
     migrate.assert_current()
     stock_krxapi.run(day, day, "s3")
     index.run(day, day, "s3")
-    changed_financial_uris = financials.run(int(day[:4]), int(day[:4]), "s3", refresh_existing=True)
-    if os.environ.get("DART_DIVIDENDS_ENABLED", "true").lower() in {
+    if collect_financials:
+        changed_financial_uris = financials.run(
+            int(day[:4]), int(day[:4]), "s3", refresh_existing=True,
+        )
+    else:
+        changed_financial_uris = []
+        print("[daily] DART financial refresh deferred", flush=True)
+
+    financial_input_uris = changed_financial_uris
+    if full_year_financial_snapshot:
+        financial_snapshot_keys = _list_prefix(
+            bucket, f"financials/dart/year={day[:4]}/",
+        ) + _list_prefix(
+            bucket, f"financials/dart_full/year={day[:4]}/",
+        )
+        financial_snapshot_keys = sorted({
+            key for key in financial_snapshot_keys if key.endswith(".json")
+        })
+        financial_input_uris = [
+            f"{base_uri('s3')}/{key}" for key in financial_snapshot_keys
+        ]
+        print(
+            "[daily] full-year financial snapshot "
+            f"files={len(financial_snapshot_keys)}",
+            flush=True,
+        )
+
+    if collect_financials and os.environ.get(
+        "DART_DIVIDENDS_ENABLED", "true",
+    ).lower() in {
         "1", "true", "yes", "on",
     }:
         changed_dividend_uris = dividends.run_for_financial_paths(
-            changed_financial_uris,
+            financial_input_uris,
             "s3",
         )
     else:
         changed_dividend_uris = []
         print("[daily] DART regular-report dividends disabled", flush=True)
-    changed_financial_keys = [_key_from_s3_uri(uri) for uri in changed_financial_uris]
+    changed_financial_keys = [
+        _key_from_s3_uri(uri) for uri in financial_input_uris
+    ]
     changed_dividend_keys = [
         _key_from_s3_uri(uri) for uri in changed_dividend_uris
     ]
+    if full_year_financial_snapshot:
+        changed_dividend_keys = sorted({
+            key for key in _list_prefix(
+                bucket,
+                f"dividends/dart/alot-matter/year={day[:4]}/",
+            )
+            if key.endswith("/response.json")
+        })
     print(f"[daily] changed financial files={len(changed_financial_keys)}", flush=True)
     print(
         f"[daily] changed dividend files={len(changed_dividend_uris)}",

@@ -54,7 +54,8 @@ def run(from_day: str, to_day: str) -> None:
             )
             daily_full._main_locked(
                 lock,
-                allow_deferred_total_return=index > 0,
+                allow_deferred_total_return=True,
+                prepare_total_return=final,
                 close_total_return=final,
                 assert_final_freshness=final,
                 collect_financials=final,

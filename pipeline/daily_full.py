@@ -154,6 +154,7 @@ def _main_locked(
     certification_lock,
     *,
     allow_deferred_total_return: bool = False,
+    prepare_total_return: bool = True,
     close_total_return: bool = True,
     assert_final_freshness: bool = True,
     collect_financials: bool = True,
@@ -342,7 +343,7 @@ def _main_locked(
         p for p in local_paths if "/dividends/dart/alot-matter/" in p
     ]
 
-    if requires_total_return_closure:
+    if requires_total_return_closure and prepare_total_return:
         # Complete all network/filesystem evidence first.  A missing viewer,
         # correction family, frozen cash-scale body or v5 coverage interval
         # therefore stops the task before its KRX Silver transaction.
@@ -382,6 +383,17 @@ def _main_locked(
                 "deferring pre-existing raw coverage closure",
                 flush=True,
             )
+    elif requires_total_return_closure:
+        if not allow_deferred_total_return:
+            raise RuntimeError(
+                "total-return evidence preparation may only be deferred "
+                "inside a fenced gap replay"
+            )
+        print(
+            "[total-return] gap replay deferring complete evidence preflight "
+            "until its final day",
+            flush=True,
+        )
 
     print(
         f"[silver] incremental start day={day}, "

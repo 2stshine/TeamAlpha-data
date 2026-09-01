@@ -19,6 +19,7 @@ from botocore.exceptions import ClientError
 from psycopg.rows import dict_row
 
 from pipeline import dart_silver_backfill_ecs
+from pipeline.resources.kind_support_seed import BODY_SEEDS
 from pipeline.silver import (
     cash_adjustment_scale_builder as builder,
     cash_adjustment_scale_evidence as evidence,
@@ -324,8 +325,25 @@ def run() -> None:
             if not _restore_kind_seed(s3, bucket, root):
                 reference, component = _component_request(root)
                 builder.download_kind_evidence(root, reference, component)
+            support_seed_paths: list[Path] = []
+            for relative, payload in BODY_SEEDS.items():
+                expected = Path(relative).stem.removeprefix("sha256=")
+                if hashlib.sha256(payload).hexdigest() != expected:
+                    raise RuntimeError(
+                        f"bundled KIND support body digest drifted: {relative}"
+                    )
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if path.is_file() and path.read_bytes() != payload:
+                    raise RuntimeError(
+                        f"bundled KIND support body conflicts with S3: {relative}"
+                    )
+                path.write_bytes(payload)
+                support_seed_paths.append(path)
             kind_paths = krx_kind_reference.external_evidence_paths(root)
-            for path in (*kind_paths, manifest, price_manifest):
+            for path in (
+                *kind_paths, *support_seed_paths, manifest, price_manifest,
+            ):
                 _put_once(s3, bucket, root, path)
         print(
             f"[cash-scale-seed] complete parents={len(parents)} "

@@ -2120,7 +2120,7 @@ def audit(conn=None, *, use_existing_transaction: bool = False) -> dict:
                     action_disclosure_observation_audit
                     == snapshot_disclosure_observation_audit
                     and action_disclosure_observation_audit.get("contract")
-                    == "latest_manifest_coverage_end_mutable_list_fields_v1"
+                    == "latest_manifest_interval_mutable_list_fields_v2"
                     and re.fullmatch(
                         r"[0-9a-f]{64}",
                         str(action_disclosure_observation_audit.get(

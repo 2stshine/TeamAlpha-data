@@ -67,9 +67,10 @@ def canonicalize_disclosures(
 
     A receipt's identity/economic payload is immutable.  Only OpenDART list
     display fields known to change retrospectively may differ.  Those fields
-    use the observation with the latest manifest ``to=YYYYMMDD``; if two
-    observations have the same coverage end but disagree, there is no
-    content-derived ordering and the snapshot fails closed.
+    use the observation with the lexicographically latest explicit manifest
+    interval ``(to=YYYYMMDD, from=YYYYMMDD)``.  If two observations have the
+    same interval but disagree, there is no content-derived ordering and the
+    snapshot fails closed.
     """
     root = Path(audit_root).resolve() if audit_root is not None else None
 
@@ -127,6 +128,11 @@ def canonicalize_disclosures(
         latest = [
             item for item in observations if item.coverage_end == latest_end
         ]
+        latest_start = max(item.coverage_start for item in latest)
+        latest = [
+            item for item in latest
+            if item.coverage_start == latest_start
+        ]
         latest_payloads = {
             json.dumps(
                 item.row, ensure_ascii=False, sort_keys=True,
@@ -137,7 +143,8 @@ def canonicalize_disclosures(
         if len(latest_payloads) > 1:
             raise RuntimeError(
                 "conflicting DART disclosure payloads have the same latest "
-                f"coverage end: receipt={receipt} coverage_end={latest_end} "
+                f"interval: receipt={receipt} coverage_start={latest_start} "
+                f"coverage_end={latest_end} "
                 f"paths={[audit_path(item.path) for item in latest]}"
             )
         # Equivalent latest observations may come from multiple overlapping
@@ -152,6 +159,7 @@ def canonicalize_disclosures(
             conflict_receipts.append({
                 "receipt_no": receipt,
                 "changed_fields": sorted(changed),
+                "selected_coverage_start": selected.coverage_start,
                 "selected_coverage_end": selected.coverage_end,
                 "selected_path": audit_path(selected.path),
                 "observation_paths": sorted(
@@ -166,7 +174,7 @@ def canonicalize_disclosures(
         separators=(",", ":"),
     ).encode("utf-8")
     audit: dict[str, object] = {
-        "contract": "latest_manifest_coverage_end_mutable_list_fields_v1",
+        "contract": "latest_manifest_interval_mutable_list_fields_v2",
         "mutable_fields": sorted(_MUTABLE_LIST_FIELDS),
         "observation_count": observation_count,
         "unique_receipt_count": len(canonical),

@@ -1698,7 +1698,7 @@ def test_old_document_completion_marker_is_rejected(tmp_path):
         _collect(tmp_path)
 
 
-def test_same_latest_mutable_disclosure_conflict_fails_closed(tmp_path):
+def test_same_end_mutable_disclosure_uses_latest_start(tmp_path):
     receipt = "20211217000001"
     original = _stock_row(receipt, rm="original")
     _write_interval(
@@ -1709,8 +1709,8 @@ def test_same_latest_mutable_disclosure_conflict_fails_closed(tmp_path):
         tmp_path, [changed], start="20211215", end="20211231",
     )
 
-    with pytest.raises(RuntimeError, match="same latest coverage end"):
-        _collect(tmp_path)
+    result = _collect(tmp_path)
+    assert result
 
 
 def test_mutable_disclosure_uses_latest_coverage_and_binds_all_observations(

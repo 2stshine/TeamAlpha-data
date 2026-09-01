@@ -548,7 +548,7 @@ def test_mutable_overlap_uses_latest_explicit_coverage_end(tmp_path):
     assert viewer._cash_disclosures(tmp_path)["20150102900228"]["rm"] == "유정"
 
 
-def test_mutable_overlap_same_coverage_end_fails_closed(tmp_path):
+def test_mutable_overlap_same_coverage_end_uses_latest_start(tmp_path):
     for start, marker in (("20150101", "유"), ("20150115", "유정")):
         _write_disclosures(
             tmp_path,
@@ -561,8 +561,7 @@ def test_mutable_overlap_same_coverage_end_fails_closed(tmp_path):
             start=start,
             end="20150131",
         )
-    with pytest.raises(RuntimeError, match="same latest coverage end"):
-        viewer._cash_disclosures(tmp_path)
+    assert viewer._cash_disclosures(tmp_path)["20150102900228"]["rm"] == "유정"
 
 
 def test_cash_disclosure_loader_rejects_legacy_only_receipt(tmp_path):

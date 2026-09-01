@@ -321,7 +321,7 @@ jobs:
                 if .name == $container then
                   .entryPoint = [
                     "uv", "run", "python", "-m",
-                    "pipeline.silver.publish_cash_scale_seed"
+                    "pipeline.publish_kind_support_seed"
                   ]
                   | del(.command)
                 else . end

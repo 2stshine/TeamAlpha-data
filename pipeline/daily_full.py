@@ -344,40 +344,70 @@ def _main_locked(
     ]
 
     if requires_total_return_closure and prepare_total_return:
-        # Complete all network/filesystem evidence first.  A missing viewer,
-        # correction family, frozen cash-scale body or v5 coverage interval
-        # therefore stops the task before its KRX Silver transaction.
-        dart_silver_backfill_ecs.prepare_total_return_snapshot(
-            coverage_end,
-            bucket=bucket,
-            root=root,
-            certification_lock=certification_lock,
-        )
-        dart_silver_backfill_ecs.preview_total_return_actions(
-            coverage_end,
-            root=root,
-            conn=certification_lock,
-        )
-        assert_epoch()
-        # A prior task may have failed after its atomic raw-price publish and
-        # intentionally left the contract BUILDING.  Repair that exact existing
-        # coverage before admitting another price day; otherwise repeated
-        # scheduled failures would keep extending uncertified raw coverage.
+        current_snapshot_prepared = False
         if (
             not contract_ready_before_action_collection
             and not allow_deferred_total_return
         ):
+            # Repair the exact already-published raw price horizon before
+            # preparing the next day's action snapshot.  A future-dated local
+            # snapshot is deliberately rejected by the PIT rebuild contract.
+            inherited_coverage_end = (
+                dart_silver_backfill_ecs.certified_krx_price_coverage_end(
+                    conn=certification_lock,
+                )
+            )
+            if inherited_coverage_end > coverage_end:
+                raise RuntimeError(
+                    "certified KRX price coverage is ahead of the target day: "
+                    f"prices={inherited_coverage_end.isoformat()} "
+                    f"target={coverage_end.isoformat()}"
+                )
+            dart_silver_backfill_ecs.prepare_total_return_snapshot(
+                inherited_coverage_end,
+                bucket=bucket,
+                root=root,
+                publish=False,
+                certification_lock=certification_lock,
+            )
+            dart_silver_backfill_ecs.preview_total_return_actions(
+                inherited_coverage_end,
+                root=root,
+                conn=certification_lock,
+            )
+            assert_epoch()
             print(
                 "[total-return] closing pre-existing uncertified coverage "
                 "before daily price publication",
                 flush=True,
             )
             dart_silver_backfill_ecs.close_total_return_contract(
-                coverage_end,
+                inherited_coverage_end,
                 root=root,
                 certification_lock=certification_lock,
             )
-        elif not contract_ready_before_action_collection:
+            current_snapshot_prepared = inherited_coverage_end == coverage_end
+
+        # Complete all network/filesystem evidence first.  A missing viewer,
+        # correction family, frozen cash-scale body or v5 coverage interval
+        # therefore stops the task before its KRX Silver transaction.
+        if not current_snapshot_prepared:
+            dart_silver_backfill_ecs.prepare_total_return_snapshot(
+                coverage_end,
+                bucket=bucket,
+                root=root,
+                certification_lock=certification_lock,
+            )
+            dart_silver_backfill_ecs.preview_total_return_actions(
+                coverage_end,
+                root=root,
+                conn=certification_lock,
+            )
+            assert_epoch()
+        if (
+            not contract_ready_before_action_collection
+            and allow_deferred_total_return
+        ):
             print(
                 "[total-return] gap replay owns the certification epoch; "
                 "deferring pre-existing raw coverage closure",

@@ -99,6 +99,13 @@ def _stub_main(monkeypatch, *, events: list[str]) -> None:
         "total_return_contract_ready",
         lambda **kwargs: next(contract_readiness),
     )
+    monkeypatch.setattr(
+        daily_full.dart_silver_backfill_ecs,
+        "certified_krx_price_coverage_end",
+        lambda **kwargs: daily_full.datetime.strptime(
+            "20260810", "%Y%m%d",
+        ).date(),
+    )
     def incremental(*args, **kwargs):
         assert kwargs["action_coverage_start"].isoformat() == "2015-01-01"
         assert kwargs["action_coverage_end"].isoformat() == "2026-08-10"
@@ -429,6 +436,63 @@ def test_preexisting_building_contract_is_closed_before_another_price_day(
     assert events == [
         "prepare", "action-preview", "close-1", "silver-write", "close-2",
         "fmp", "freshness",
+    ]
+
+
+def test_preexisting_building_contract_uses_exact_existing_price_horizon(
+    monkeypatch,
+):
+    events: list[str] = []
+    _stub_main(monkeypatch, events=events)
+    monkeypatch.setenv("PIPELINE_DATE", "20260811")
+    monkeypatch.setattr(
+        daily_full.dart_silver_backfill_ecs,
+        "total_return_contract_ready",
+        lambda **kwargs: False,
+    )
+
+    def prepare(end, **kwargs):
+        events.append(f"prepare-{end.isoformat()}-{kwargs.get('publish', True)}")
+
+    def preview(end, **kwargs):
+        events.append(f"preview-{end.isoformat()}")
+
+    def close(end, **kwargs):
+        events.append(f"close-{end.isoformat()}")
+
+    monkeypatch.setattr(
+        daily_full.dart_silver_backfill_ecs,
+        "prepare_total_return_snapshot",
+        prepare,
+    )
+    monkeypatch.setattr(
+        daily_full.dart_silver_backfill_ecs,
+        "preview_total_return_actions",
+        preview,
+    )
+    monkeypatch.setattr(
+        daily_full.dart_silver_backfill_ecs,
+        "close_total_return_contract",
+        close,
+    )
+    monkeypatch.setattr(
+        daily_full.load,
+        "incremental",
+        lambda *args, **kwargs: events.append("silver-write"),
+    )
+
+    daily_full.main()
+
+    assert events == [
+        "prepare-2026-08-10-False",
+        "preview-2026-08-10",
+        "close-2026-08-10",
+        "prepare-2026-08-11-True",
+        "preview-2026-08-11",
+        "silver-write",
+        "close-2026-08-11",
+        "fmp",
+        "freshness",
     ]
 
 

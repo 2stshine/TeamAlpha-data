@@ -833,6 +833,18 @@ def total_return_contract_ready(*, conn=None) -> bool:
             connection.close()
 
 
+def certified_krx_price_coverage_end(*, conn=None) -> date:
+    """Return the exact raw KRX coverage that an inherited rebuild must close."""
+    owns_connection = conn is None
+    connection = conn or db.connect()
+    try:
+        _, coverage_end = total_return_rebuild._source_price_coverage(connection)
+        return coverage_end
+    finally:
+        if owns_connection:
+            connection.close()
+
+
 def invalidate_total_return_for_observed_action(
     coverage_end: date,
     *,

@@ -468,6 +468,97 @@ def _put_immutable_snapshot_object(
             ) from exc
 
 
+def _component_paths(root: Path, manifest_relative: Path) -> tuple[Path, ...]:
+    """Return one generated component manifest and its owned object paths."""
+    manifest = root / manifest_relative
+    payload = json.loads(manifest.read_bytes())
+    owned_prefix = manifest_relative.parent.as_posix() + "/"
+    rendered_paths: set[str] = set()
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+        elif isinstance(value, str) and value.startswith(owned_prefix):
+            rendered_paths.add(value)
+
+    visit(payload)
+    paths = {manifest}
+    for relative in rendered_paths:
+        candidate = Path(relative)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise RuntimeError(f"generated component path is invalid: {relative}")
+        path = root / candidate
+        if not path.is_file():
+            raise RuntimeError(f"generated component object is missing: {relative}")
+        paths.add(path)
+    return tuple(sorted(paths, key=lambda item: item == manifest))
+
+
+def _publish_component_checkpoint(
+    client,
+    bucket: str,
+    root: Path,
+    manifest_relative: Path,
+    *,
+    certification_lock,
+) -> None:
+    """Publish generated leaves first and CAS the retry checkpoint pointer."""
+    manifest = root / manifest_relative
+    paths = _component_paths(root, manifest_relative)
+    try:
+        previous = client.head_object(
+            Bucket=bucket, Key=manifest_relative.as_posix(),
+        )
+    except ClientError as exc:
+        if not _is_missing_object(exc):
+            raise
+        previous = None
+    for path in paths:
+        if path == manifest:
+            continue
+        relative = path.relative_to(root).as_posix()
+        digest = _sha256_path(path)
+        try:
+            with path.open("rb") as body:
+                client.put_object(
+                    Bucket=bucket,
+                    Key=relative,
+                    Body=body,
+                    ContentLength=path.stat().st_size,
+                    Metadata={"sha256": digest},
+                    IfNoneMatch="*",
+                )
+        except ClientError as exc:
+            if not _is_precondition_failure(exc):
+                raise
+            existing = client.get_object(Bucket=bucket, Key=relative)["Body"].read()
+            if hashlib.sha256(existing).hexdigest() != digest:
+                raise RuntimeError(
+                    f"generated component object collision: {relative}"
+                ) from exc
+    assert_daily_certification_lock(certification_lock)
+    conditions = (
+        {"IfMatch": str(previous["ETag"])}
+        if previous is not None else {"IfNoneMatch": "*"}
+    )
+    client.put_object(
+        Bucket=bucket,
+        Key=manifest_relative.as_posix(),
+        Body=manifest.read_bytes(),
+        ContentType="application/json",
+        **conditions,
+    )
+    print(
+        "[dart-silver-ecs] published retry checkpoint "
+        f"manifest={manifest_relative.as_posix()} objects={len(paths)}",
+        flush=True,
+    )
+
+
 def _publish_generated_snapshot(
     bucket: str,
     root: Path,
@@ -645,18 +736,44 @@ def prepare_total_return_snapshot(
         count += _download(bucket, price_keys, root)
     if count == 0:
         raise RuntimeError("no DART dividend/corporate-action Bronze objects")
-    dart_viewer_corrections.collect_viewer_corrections(
-        str(root),
-        coverage_start=dart_action_snapshot.DEFAULT_COVERAGE_START,
-        coverage_end=coverage_end,
-        apply=True,
-    )
-    dart_support_action_families.collect_support_action_families(
-        root,
-        coverage_start=dart_action_snapshot.DEFAULT_COVERAGE_START,
-        coverage_end=coverage_end,
-        apply=True,
-    )
+    try:
+        dart_viewer_corrections.verify_viewer_corrections(
+            str(root),
+            required_start=dart_action_snapshot.DEFAULT_COVERAGE_START,
+            required_end=coverage_end,
+        )
+        print("[dart-silver-ecs] reused viewer retry checkpoint", flush=True)
+    except RuntimeError:
+        dart_viewer_corrections.collect_viewer_corrections(
+            str(root),
+            coverage_start=dart_action_snapshot.DEFAULT_COVERAGE_START,
+            coverage_end=coverage_end,
+            apply=True,
+        )
+        _publish_component_checkpoint(
+            s3, bucket, root,
+            dart_viewer_corrections.MANIFEST_RELATIVE_PATH,
+            certification_lock=certification_lock,
+        )
+    try:
+        dart_support_action_families.verify_support_action_families(
+            root,
+            required_start=dart_action_snapshot.DEFAULT_COVERAGE_START,
+            required_end=coverage_end,
+        )
+        print("[dart-silver-ecs] reused support retry checkpoint", flush=True)
+    except RuntimeError:
+        dart_support_action_families.collect_support_action_families(
+            root,
+            coverage_start=dart_action_snapshot.DEFAULT_COVERAGE_START,
+            coverage_end=coverage_end,
+            apply=True,
+        )
+        _publish_component_checkpoint(
+            s3, bucket, root,
+            dart_support_action_families.MANIFEST_RELATIVE_PATH,
+            certification_lock=certification_lock,
+        )
     snapshot = dart_action_snapshot.build_snapshot_manifest(
         str(root), coverage_end=coverage_end,
     )

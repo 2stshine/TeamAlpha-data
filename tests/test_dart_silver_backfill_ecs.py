@@ -64,9 +64,24 @@ def test_prepare_snapshot_downloads_refreshes_builds_then_publishes(
         lambda *a, **k: calls.append(("viewer", a, k)),
     )
     monkeypatch.setattr(
+        ecs.dart_viewer_corrections,
+        "verify_viewer_corrections",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stale")),
+    )
+    monkeypatch.setattr(
         ecs.dart_support_action_families,
         "collect_support_action_families",
         lambda *a, **k: calls.append(("families", a, k)),
+    )
+    monkeypatch.setattr(
+        ecs.dart_support_action_families,
+        "verify_support_action_families",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stale")),
+    )
+    monkeypatch.setattr(
+        ecs,
+        "_publish_component_checkpoint",
+        lambda *a, **k: calls.append(("checkpoint", a, k)),
     )
     snapshot = SimpleNamespace(
         manifest_sha256="a" * 64,
@@ -114,7 +129,8 @@ def test_prepare_snapshot_downloads_refreshes_builds_then_publishes(
         tmp_path,
     )
     assert [call[0] for call in calls] == [
-        "restore", "viewer", "families", "snapshot", "publish",
+        "restore", "viewer", "checkpoint", "families", "checkpoint",
+        "snapshot", "publish",
     ]
 
 

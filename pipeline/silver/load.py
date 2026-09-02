@@ -151,6 +151,7 @@ def incremental(
     has_action_change: bool = False,
     action_coverage_start: date | None = None,
     action_coverage_end: date | None = None,
+    allow_bounded_action_scope: bool = False,
     conn=None,
 ) -> None:
     """Publish one daily Silver partition.
@@ -161,7 +162,12 @@ def incremental(
     continue on a different session and later race a stale certification.
     """
     target_date = _parse_day(day)
-    if action_coverage_start != DEFAULT_COVERAGE_START:
+    if action_coverage_start != DEFAULT_COVERAGE_START and not (
+        allow_bounded_action_scope
+        and action_coverage_start is not None
+        and action_coverage_end is not None
+        and action_coverage_start <= action_coverage_end
+    ):
         raise ValueError(
             "daily Silver requires the certified DART action coverage start "
             f"{DEFAULT_COVERAGE_START.isoformat()}"

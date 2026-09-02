@@ -83,16 +83,16 @@ def run(
             daily_full._main_locked(
                 lock,
                 allow_deferred_total_return=True,
-                # Silver validates the action evidence against each day's
-                # exact point-in-time horizon. Build that lightweight daily
-                # evidence snapshot on every replay day, while keeping the
-                # expensive persisted return preview/rebuild final-only.
-                prepare_total_return=True,
+                # Intermediate runs use the collector's exact bounded action
+                # evidence for price DQ and publication. The final run alone
+                # expands to the complete certified history and rebuilds TR.
+                prepare_total_return=final,
                 preview_total_return=final,
                 close_total_return=final,
                 assert_final_freshness=final,
                 collect_financials=final,
                 full_year_financial_snapshot=final,
+                bounded_action_scope=not final,
             )
             print(f"[gap-replay] complete day={day}", flush=True)
     finally:

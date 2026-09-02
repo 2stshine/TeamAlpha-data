@@ -176,6 +176,7 @@ def _main_locked(
     assert_final_freshness: bool = True,
     collect_financials: bool = True,
     full_year_financial_snapshot: bool = False,
+    bounded_action_scope: bool = False,
 ) -> None:
     """Run one target day while the caller owns the certification epoch.
 
@@ -282,6 +283,10 @@ def _main_locked(
         datetime.strptime(day, "%Y%m%d").date()
         - timedelta(days=CORPORATE_ACTION_EVIDENCE_LOOKBACK_DAYS)
     ).strftime("%Y%m%d")
+    if bounded_action_scope and not allow_deferred_total_return:
+        raise RuntimeError(
+            "bounded action scope is only allowed inside a fenced gap replay"
+        )
     # Record whether this task inherited an already-unusable return contract.
     # A new Bronze action is allowed to demote a previously healthy contract,
     # but it must not hide an older BUILDING failure by extending raw coverage.
@@ -474,8 +479,12 @@ def _main_locked(
         dividend_files=dividend_files,
         market_closed=market_closed,
         has_action_change=has_action_change,
-        action_coverage_start=DEFAULT_COVERAGE_START,
+        action_coverage_start=(
+            datetime.strptime(action_evidence_from, "%Y%m%d").date()
+            if bounded_action_scope else DEFAULT_COVERAGE_START
+        ),
         action_coverage_end=coverage_end,
+        allow_bounded_action_scope=bounded_action_scope,
         conn=certification_lock,
     )
     print(f"[silver] incremental complete day={day}", flush=True)

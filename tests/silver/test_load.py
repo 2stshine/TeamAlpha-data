@@ -155,6 +155,28 @@ def test_incremental_fails_before_db_when_action_coverage_is_not_exact(
         )
 
 
+def test_incremental_accepts_explicit_bounded_action_scope(monkeypatch):
+    finish_statuses = _stub_run_lifecycle(monkeypatch)
+
+    def _boom(*args, **kwargs):
+        raise _PassedSkipGuard()
+
+    monkeypatch.setattr(load, "_build_candidates", _boom)
+
+    with pytest.raises(_PassedSkipGuard):
+        load.incremental(
+            "20260815",
+            "local",
+            financial_files=[],
+            dividend_files=[],
+            action_coverage_start=date(2026, 2, 16),
+            action_coverage_end=date(2026, 8, 15),
+            allow_bounded_action_scope=True,
+        )
+
+    assert finish_statuses == ["FAILED"]
+
+
 def test_daily_candidate_filter_excludes_unmapped_actions_explicitly():
     bundle = CandidateBundle(
         actions=pd.DataFrame([

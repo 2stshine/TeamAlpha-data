@@ -2,6 +2,7 @@ from datetime import date
 import hashlib
 from io import BytesIO
 import json
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -27,11 +28,11 @@ def test_prepare_snapshot_downloads_refreshes_builds_then_publishes(
         "_restore_published_snapshot",
         lambda *args: calls.append(("restore", args, {})),
     )
-    def list_keys(s3, bucket, prefix):
+    def list_objects(s3, bucket, prefix):
         listed_prefixes.append(prefix)
-        return [prefix + "object"]
+        return [ecs._S3Object(prefix + "object", '"etag"', 1)]
 
-    monkeypatch.setattr(ecs, "_list_keys", list_keys)
+    monkeypatch.setattr(ecs, "_list_objects", list_objects)
     monkeypatch.setattr(ecs, "DATA_ROOT", tmp_path)
     manifest = (
         tmp_path
@@ -58,6 +59,13 @@ def test_prepare_snapshot_downloads_refreshes_builds_then_publishes(
         return len(keys)
 
     monkeypatch.setattr(ecs, "_download", download)
+    monkeypatch.setattr(
+        ecs,
+        "_download_changed",
+        lambda bucket, objects, root: (
+            downloads.append((bucket, list(objects), root)) or (len(objects), 0)
+        ),
+    )
     monkeypatch.setattr(
         ecs.dart_viewer_corrections,
         "collect_viewer_corrections",
@@ -171,6 +179,35 @@ def test_download_bounds_submitted_future_batches(monkeypatch, tmp_path):
         "bronze", [f"object-{index}" for index in range(1200)], tmp_path,
     ) == 1200
     assert submitted_batch_sizes == [512, 512, 176]
+
+
+def test_persistent_download_cache_fetches_only_new_or_changed_objects(
+    monkeypatch, tmp_path,
+):
+    downloads: list[str] = []
+
+    class FakeS3:
+        def download_file(self, bucket, key, destination):
+            assert bucket == "bronze"
+            downloads.append(key)
+            Path(destination).write_bytes(key.encode("utf-8"))
+
+    monkeypatch.setattr(ecs.boto3, "client", lambda service: FakeS3())
+    first = [
+        ecs._S3Object("immutable/a", '"one"', len("immutable/a")),
+        ecs._S3Object("mutable/b", '"two"', len("mutable/b")),
+    ]
+    assert ecs._download_changed("bronze", first, tmp_path) == (2, 0)
+    assert sorted(downloads) == ["immutable/a", "mutable/b"]
+
+    downloads.clear()
+    second = [
+        ecs._S3Object("immutable/a", '"one"', len("immutable/a")),
+        ecs._S3Object("mutable/b", '"changed"', len("mutable/b")),
+        ecs._S3Object("new/c", '"three"', len("new/c")),
+    ]
+    assert ecs._download_changed("bronze", second, tmp_path) == (2, 1)
+    assert sorted(downloads) == ["mutable/b", "new/c"]
 
 
 def test_close_total_return_contract_orders_both_previews_apply_and_audit(

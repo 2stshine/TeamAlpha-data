@@ -129,6 +129,7 @@ EventBridge Scheduler
 | ECR repository | ECS에서 실행할 Docker 이미지를 저장하는 repository |
 | ECS cluster | daily batch task를 실행하는 Fargate cluster |
 | ECS task definition | 파이프라인 컨테이너, role, secret 주입 설정 |
+| EFS pipeline cache | `/app/data`에 마운트해 인증된 DART 증빙을 보존하고 ETag가 바뀐 객체만 다시 받는 영구 캐시 |
 | Scheduler | daily ECS task를 시작하는 EventBridge Scheduler |
 | Scheduler 시간 | `cron(30 8 ? * TUE-SAT *)`, `Asia/Seoul` |
 | RDS PostgreSQL | `public` Silver와 `gold` 팩터 테이블을 함께 저장하는 private database |
@@ -149,6 +150,13 @@ AWS Secrets Manager 값으로 ECS의 `FMP_API_KEY`에 주입합니다. 새 task 
 이 secret이 없으면 배포 workflow가 중단됩니다.
 
 `.env`, API key, DB 비밀번호, 로컬 `data/`는 커밋하면 안 됩니다.
+
+운영 Fargate task의 `/app/data`는 암호화된 EFS에 마운트한다.
+`pipeline.dart_silver_backfill_ecs`는 S3 LIST에서 받은 ETag와 크기를
+`.teamalpha/s3_object_cache_v1.json`에 원자적으로 기록한다. 다음 task는 로컬
+파일·ETag·크기가 모두 일치하는 객체를 재사용하고 새로 생성되거나 변경된 객체만
+GET한다. 최종 action snapshot 생성은 재사용한 입력도 SHA-256으로 다시 묶으므로
+전송 캐시가 연구용 인증 검증을 우회하지 않는다.
 
 ## S3 Bronze 구조
 

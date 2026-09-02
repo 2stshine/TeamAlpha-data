@@ -9,7 +9,7 @@ import re
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import boto3
@@ -41,6 +41,8 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SNAPSHOT_POINTER_SCHEMA = "dart_total_return_snapshot_pointer_v1"
 _SNAPSHOT_PUBLISH_ROOT = "quality/dart-total-return-snapshots"
 _SNAPSHOT_CURRENT_KEY = f"{_SNAPSHOT_PUBLISH_ROOT}/current.json"
+_S3_CACHE_SCHEMA = "teamalpha_s3_object_cache_v1"
+_S3_CACHE_INDEX = Path(".teamalpha/s3_object_cache_v1.json")
 # Stable, distinct from RETURN_WRITER_LOCK_KEY.  Hold this session lock across
 # the entire Bronze-observation -> snapshot -> Silver rebuild epoch so two ECS
 # tasks cannot certify against different action generations.
@@ -53,6 +55,13 @@ class _PublishedSnapshotPointer:
     coverage_end: date
     action_manifest_sha256: str
     bundle_prefix: str
+
+
+@dataclass(frozen=True)
+class _S3Object:
+    key: str
+    etag: str
+    size: int
 
 
 def acquire_daily_certification_lock():
@@ -134,6 +143,143 @@ def _list_keys(s3, bucket: str, prefix: str) -> list[str]:
             if not item["Key"].endswith("/")
         )
     return keys
+
+
+def _list_objects(s3, bucket: str, prefix: str) -> list[_S3Object]:
+    """List object identities used by the persistent incremental cache."""
+    objects: list[_S3Object] = []
+    for page in s3.get_paginator("list_objects_v2").paginate(
+        Bucket=bucket, Prefix=prefix,
+    ):
+        for item in page.get("Contents", []):
+            key = str(item["Key"])
+            if key.endswith("/"):
+                continue
+            objects.append(_S3Object(
+                key=key,
+                etag=str(item.get("ETag") or ""),
+                size=int(item.get("Size", -1)),
+            ))
+    return objects
+
+
+def _cache_index_path(root: Path) -> Path:
+    return root.resolve() / _S3_CACHE_INDEX
+
+
+def _read_cache_index(root: Path) -> dict[str, dict]:
+    path = _cache_index_path(root)
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"persistent S3 cache index is invalid: {path}") from exc
+    objects = payload.get("objects")
+    if (
+        payload.get("schema_version") != _S3_CACHE_SCHEMA
+        or not isinstance(objects, dict)
+    ):
+        raise RuntimeError(f"persistent S3 cache index contract is invalid: {path}")
+    return objects
+
+
+def _write_cache_index(root: Path, objects: dict[str, dict]) -> None:
+    path = _cache_index_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": _S3_CACHE_SCHEMA,
+        "updated_at": datetime.now().astimezone().isoformat(),
+        "objects": objects,
+    }
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        temporary.write_bytes(_canonical_json(payload))
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _download_changed(
+    bucket: str,
+    objects: list[_S3Object],
+    root: Path,
+) -> tuple[int, int]:
+    """Download only new or changed S3 objects into a persistent data root.
+
+    The ETag/size pair comes from the same paginated LIST already required to
+    discover new Bronze keys. A local cache hit therefore needs no HEAD/GET.
+    Snapshot construction still hashes every selected research input, so a
+    damaged cached body remains fail-closed at certification time.
+    """
+    root = root.resolve()
+    client = boto3.client("s3")
+    index = _read_cache_index(root)
+    unique = {item.key: item for item in objects}
+    changed: list[_S3Object] = []
+    reused = 0
+    for key in sorted(unique):
+        item = unique[key]
+        destination = root / key
+        cached = index.get(key)
+        if (
+            cached == {"etag": item.etag, "size": item.size}
+            and destination.is_file()
+            and destination.stat().st_size == item.size
+        ):
+            reused += 1
+            continue
+        changed.append(item)
+
+    def one(item: _S3Object) -> None:
+        destination = root / item.key
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".download",
+            dir=destination.parent,
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            client.download_file(bucket, item.key, str(temporary))
+            if temporary.stat().st_size != item.size:
+                raise RuntimeError(
+                    f"S3 object size changed during download: {item.key}"
+                )
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    done = 0
+    chunk_size = 512
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        for start in range(0, len(changed), chunk_size):
+            chunk = changed[start:start + chunk_size]
+            futures = [executor.submit(one, item) for item in chunk]
+            for future in as_completed(futures):
+                future.result()
+                done += 1
+                if done % 500 == 0 or done == len(changed):
+                    print(
+                        "[dart-silver-ecs] cache delta downloaded="
+                        f"{done}/{len(changed)} reused={reused}",
+                        flush=True,
+                    )
+    for item in unique.values():
+        destination = root / item.key
+        if destination.is_file() and destination.stat().st_size == item.size:
+            index[item.key] = {"etag": item.etag, "size": item.size}
+    _write_cache_index(root, index)
+    print(
+        "[dart-silver-ecs] persistent cache complete "
+        f"downloaded={done} reused={reused} total={len(unique)}",
+        flush=True,
+    )
+    return done, reused
 
 
 def _download(bucket: str, keys: list[str], root: Path) -> int:
@@ -395,6 +541,12 @@ def _restore_published_snapshot(
             raise RuntimeError(
                 f"published DART snapshot path escaped root: {relative}"
             )
+        if (
+            destination.is_file()
+            and destination.stat().st_size == entry["content_length"]
+            and _sha256_path(destination) == entry["sha256"]
+        ):
+            return
         destination.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{destination.name}.", suffix=".download",
@@ -728,13 +880,16 @@ def prepare_total_return_snapshot(
         # only DART objects would make local manifest verification incomplete.
         "corporate_actions/krx/",
     )
-    keys = [key for prefix in prefixes for key in _list_keys(s3, bucket, prefix)]
-    count = _download(bucket, keys, root)
+    objects = [
+        item for prefix in prefixes
+        for item in _list_objects(s3, bucket, prefix)
+    ]
+    count, reused = _download_changed(bucket, objects, root)
     previous = _restore_published_snapshot(s3, bucket, root)
     price_keys = _cash_scale_price_keys(root)
     if price_keys:
         count += _download(bucket, price_keys, root)
-    if count == 0:
+    if count == 0 and reused == 0:
         raise RuntimeError("no DART dividend/corporate-action Bronze objects")
     try:
         dart_viewer_corrections.verify_viewer_corrections(

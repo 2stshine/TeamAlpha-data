@@ -1337,7 +1337,7 @@ def publish_assets(
                 key=lambda row: (
                     0
                     if row.identifier_type == "ticker"
-                    and pd.isna(row.valid_to)
+                    and not pd.isna(row.valid_to)
                     else 1
                     if row.identifier_type == "ticker"
                     else 2
@@ -1479,10 +1479,52 @@ def publish_assets(
                 )
                 existing = cur.fetchone()
                 if existing and existing[0] != asset_id:
-                    raise RuntimeError(
-                        "FMP identifier conflict: "
-                        f"type={row.identifier_type} identifier={row.identifier}"
+                    # A validated ticker-change chain can move into a ticker
+                    # that was previously used by another issuer. Close that
+                    # older open episode immediately before the new episode;
+                    # the bounded old leg selected above remains the identity
+                    # anchor for the changing security.
+                    if row.identifier_type != "ticker" or pd.isna(row.valid_from):
+                        raise RuntimeError(
+                            "FMP identifier conflict: "
+                            f"type={row.identifier_type} identifier={row.identifier}"
+                        )
+                    new_valid_from = row.valid_from
+                    if new_valid_from == date.min:
+                        raise RuntimeError(
+                            "FMP identifier conflict: "
+                            f"type={row.identifier_type} identifier={row.identifier}"
+                        )
+                    cur.execute(
+                        "SELECT valid_from FROM asset_identifier "
+                        "WHERE source=%s AND identifier_type=%s AND identifier=%s "
+                        "AND valid_to IS NULL AND asset_id=%s",
+                        (
+                            row.source, row.identifier_type,
+                            str(row.identifier), existing[0],
+                        ),
                     )
+                    existing_valid_from = cur.fetchone()
+                    close_to = new_valid_from - timedelta(days=1)
+                    if (
+                        existing_valid_from is None
+                        or existing_valid_from[0] > close_to
+                    ):
+                        raise RuntimeError(
+                            "FMP identifier conflict: "
+                            f"type={row.identifier_type} identifier={row.identifier}"
+                        )
+                    cur.execute(
+                        "UPDATE asset_identifier SET valid_to=%s, "
+                        "quality_run_id=%s, loaded_at=now() "
+                        "WHERE source=%s AND identifier_type=%s "
+                        "AND identifier=%s AND valid_to IS NULL AND asset_id=%s",
+                        (
+                            close_to, quality_run_id, row.source,
+                            row.identifier_type, str(row.identifier), existing[0],
+                        ),
+                    )
+                    existing = None
                 if existing:
                     # The partial unique index allows one current mapping,
                     # while the history PK also includes valid_from. Reusing

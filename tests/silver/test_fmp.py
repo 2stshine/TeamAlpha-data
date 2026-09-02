@@ -90,6 +90,51 @@ class _TickerChangeConnection:
         return self.cur
 
 
+class _ReassignedTickerCursor:
+    def __init__(self):
+        self._row = None
+        self.queries = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def execute(self, query, params=None):
+        normalized = " ".join(query.split())
+        self.queries.append((normalized, params))
+        self._row = None
+        if normalized.startswith("SELECT valid_from FROM asset_identifier"):
+            self._row = (date(2022, 2, 17),)
+        elif normalized.startswith(
+            "SELECT asset_id,valid_from FROM asset_identifier"
+        ):
+            if params[1] == "BNZI":
+                self._row = (88, date(2023, 12, 15))
+        elif normalized.startswith("SELECT asset_id FROM asset_identifier"):
+            identifier = params[-1]
+            if "valid_from=%s AND valid_to=%s" in normalized:
+                self._row = None
+            elif identifier == "BNZI":
+                self._row = (88,)
+            elif identifier == "PARA":
+                self._row = (55,)
+        elif normalized.startswith("INSERT INTO asset("):
+            raise AssertionError("validated ticker change created a new asset")
+
+    def fetchone(self):
+        return self._row
+
+
+class _ReassignedTickerConnection:
+    def __init__(self):
+        self.cur = _ReassignedTickerCursor()
+
+    def cursor(self):
+        return self.cur
+
+
 def _write(path: Path, payload: bytes):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(payload)
@@ -275,6 +320,40 @@ def test_symbol_change_noop_does_not_bound_current_ticker(tmp_path):
     assert len(ticker) == 1
     assert pd.isna(ticker.iloc[0]["valid_to"])
     assert ticker.iloc[0]["valid_from"] == date(2023, 1, 1)
+
+
+def test_declared_change_reassigns_a_reused_current_ticker():
+    assets = pd.DataFrame([{
+        "natural_key": "FMP:PARA", "name": "Banzai International, Inc.",
+        "asset_type": "stock", "instrument_type": "common_stock",
+        "exchange": "NASDAQ", "currency": "USD", "country_code": "US",
+        "base_currency": "USD", "listed_from": date(2023, 12, 15),
+        "listed_to": None,
+    }])
+    identifiers = pd.DataFrame([
+        {
+            "natural_key": "FMP:PARA", "source": "FMP",
+            "identifier": "BNZI", "identifier_type": "ticker",
+            "valid_from": date(2023, 12, 15), "valid_to": date(2026, 8, 6),
+        },
+        {
+            "natural_key": "FMP:PARA", "source": "FMP",
+            "identifier": "PARA", "identifier_type": "ticker",
+            "valid_from": date(2026, 8, 7), "valid_to": None,
+        },
+    ])
+    conn = _ReassignedTickerConnection()
+
+    mapping = fmp.publish_assets(conn, assets, identifiers, "quality-run")
+
+    assert mapping["FMP:PARA"] == 88
+    assert mapping["PARA"] == 88
+    assert any(
+        query.startswith("UPDATE asset_identifier SET valid_to=%s")
+        and params[0] == date(2026, 8, 6)
+        and params[-1] == 55
+        for query, params in conn.cur.queries
+    )
 
 
 def test_silver_filters_instruments_but_keeps_bronze_and_maps_price_semantics(tmp_path):

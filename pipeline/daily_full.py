@@ -14,6 +14,8 @@ import exchange_calendars as xcals
 from pipeline import dart_silver_backfill_ecs
 from pipeline.bronze import (
     corporate_actions,
+    dart_support_action_families,
+    dart_viewer_corrections,
     dividends,
     financials,
     fmp as fmp_bronze,
@@ -380,6 +382,33 @@ def _main_locked(
     dividend_files = [
         p for p in local_paths if "/dividends/dart/alot-matter/" in p
     ]
+
+    if bounded_action_scope:
+        # The common manifest pointer may currently hold a prior full-history
+        # checkpoint. Rebuild the exact rolling evidence scope locally before
+        # Silver validates this intermediate day. This avoids refreshing the
+        # entire 2015+ corpus on every gap date while preserving an exact,
+        # bounded provenance contract for price DQ and action publication.
+        bounded_start = datetime.strptime(
+            action_evidence_from, "%Y%m%d",
+        ).date()
+        dart_viewer_corrections.collect_viewer_corrections(
+            str(root),
+            coverage_start=bounded_start,
+            coverage_end=coverage_end,
+            apply=True,
+        )
+        dart_support_action_families.collect_support_action_families(
+            root,
+            coverage_start=bounded_start,
+            coverage_end=coverage_end,
+            apply=True,
+        )
+        print(
+            "[gap-replay] bounded action evidence prepared "
+            f"coverage={bounded_start.isoformat()}..{coverage_end.isoformat()}",
+            flush=True,
+        )
 
     if requires_total_return_closure and prepare_total_return:
         current_snapshot_prepared = False

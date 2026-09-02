@@ -11,6 +11,21 @@ def test_fmp_target_uses_completed_prior_weekday():
     assert _fmp_target_day("20260803") == "20260731"
 
 
+def test_pending_krx_sessions_excludes_existing_coverage():
+    parsed = daily_full.datetime.strptime
+    assert daily_full._pending_krx_sessions(
+        parsed("20260810", "%Y%m%d").date(),
+        parsed("20260811", "%Y%m%d").date(),
+    ) == [parsed("20260811", "%Y%m%d").date()]
+    assert daily_full._pending_krx_sessions(
+        parsed("20260807", "%Y%m%d").date(),
+        parsed("20260811", "%Y%m%d").date(),
+    ) == [
+        parsed("20260810", "%Y%m%d").date(),
+        parsed("20260811", "%Y%m%d").date(),
+    ]
+
+
 def test_daily_never_runs_legacy_partial_total_return_writer():
     source = inspect.getsource(daily_full)
     assert "from pipeline.silver import total_return" not in source
@@ -311,6 +326,28 @@ def test_daily_preflight_failure_happens_before_price_write(monkeypatch):
     with pytest.raises(RuntimeError, match="missing current v5 evidence"):
         daily_full.main()
     assert events == ["prepare-failed"]
+
+
+def test_daily_refuses_to_skip_multiple_certified_krx_sessions(monkeypatch):
+    events: list[str] = []
+    _stub_main(monkeypatch, events=events)
+    monkeypatch.setenv("PIPELINE_DATE", "20260811")
+    monkeypatch.setattr(
+        daily_full.dart_silver_backfill_ecs,
+        "certified_krx_price_coverage_end",
+        lambda **kwargs: daily_full.datetime.strptime(
+            "20260807", "%Y%m%d",
+        ).date(),
+    )
+    monkeypatch.setattr(
+        daily_full.stock_krxapi,
+        "run",
+        lambda *args: events.append("unexpected-mutation"),
+    )
+
+    with pytest.raises(RuntimeError, match="gap replay first"):
+        daily_full.main()
+    assert events == []
 
 
 def test_new_action_invalidates_contract_before_bronze_write_and_preflight(

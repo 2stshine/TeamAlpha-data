@@ -4,11 +4,12 @@ from __future__ import annotations
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import boto3
+import exchange_calendars as xcals
 
 from pipeline import dart_silver_backfill_ecs
 from pipeline.bronze import (
@@ -54,6 +55,21 @@ def _fmp_target_day(krx_day: str) -> str:
     while candidate.weekday() >= 5:
         candidate -= timedelta(days=1)
     return candidate.strftime("%Y%m%d")
+
+
+def _pending_krx_sessions(
+    last_price_day: date,
+    target_day: date,
+) -> list[date]:
+    """Return KRX sessions after persisted coverage through the target day."""
+    start = last_price_day + timedelta(days=1)
+    if target_day < start:
+        return []
+    calendar = xcals.get_calendar("XKRX")
+    return [
+        value.date()
+        for value in calendar.sessions_in_range(start, target_day)
+    ]
 
 
 def _key_from_s3_uri(uri: str) -> str:
@@ -173,6 +189,22 @@ def _main_locked(
     ds = ymd_to_dash(day)
     coverage_end = datetime.strptime(day, "%Y%m%d").date()
     root = Path("/app/data")
+
+    if not allow_deferred_total_return:
+        last_price_day = (
+            dart_silver_backfill_ecs.certified_krx_price_coverage_end(
+                conn=certification_lock,
+            )
+        )
+        pending_sessions = _pending_krx_sessions(last_price_day, coverage_end)
+        if len(pending_sessions) > 1:
+            raise RuntimeError(
+                "daily KRX target would skip certified sessions; run bounded "
+                "gap replay first: "
+                f"last={last_price_day.isoformat()} "
+                f"target={coverage_end.isoformat()} "
+                f"missing={[value.isoformat() for value in pending_sessions]}"
+            )
 
     def assert_epoch() -> None:
         dart_silver_backfill_ecs.assert_daily_certification_lock(

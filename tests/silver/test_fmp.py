@@ -135,6 +135,45 @@ class _ReassignedTickerConnection:
         return self.cur
 
 
+class _HistoricalDuplicateCursor:
+    def __init__(self):
+        self._row = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def execute(self, query, params=None):
+        normalized = " ".join(query.split())
+        self._row = None
+        if normalized.startswith(
+            "SELECT asset_id,valid_from FROM asset_identifier"
+        ):
+            self._row = None
+        elif normalized.startswith("SELECT asset_id FROM asset_identifier"):
+            identifier = params[-1]
+            if "valid_from=%s AND valid_to=%s" in normalized:
+                if identifier == "BELF":
+                    self._row = (7394,)
+            elif identifier == "BELFB":
+                self._row = (7395,)
+        elif normalized.startswith("INSERT INTO asset("):
+            raise AssertionError("current ticker should anchor the asset")
+
+    def fetchone(self):
+        return self._row
+
+
+class _HistoricalDuplicateConnection:
+    def __init__(self):
+        self.cur = _HistoricalDuplicateCursor()
+
+    def cursor(self):
+        return self.cur
+
+
 def _write(path: Path, payload: bytes):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(payload)
@@ -354,6 +393,35 @@ def test_declared_change_reassigns_a_reused_current_ticker():
         and params[-1] == 55
         for query, params in conn.cur.queries
     )
+
+
+def test_current_ticker_wins_over_duplicate_bounded_history():
+    assets = pd.DataFrame([{
+        "natural_key": "FMP:BELFB", "name": "Bel Fuse Inc.",
+        "asset_type": "stock", "instrument_type": "common_stock",
+        "exchange": "NASDAQ", "currency": "USD", "country_code": "US",
+        "base_currency": "USD", "listed_from": date(1998, 7, 10),
+        "listed_to": None,
+    }])
+    identifiers = pd.DataFrame([
+        {
+            "natural_key": "FMP:BELFB", "source": "FMP",
+            "identifier": "BELF", "identifier_type": "ticker",
+            "valid_from": date.min, "valid_to": date(2004, 11, 7),
+        },
+        {
+            "natural_key": "FMP:BELFB", "source": "FMP",
+            "identifier": "BELFB", "identifier_type": "ticker",
+            "valid_from": date(2004, 11, 8), "valid_to": None,
+        },
+    ])
+
+    mapping = fmp.publish_assets(
+        _HistoricalDuplicateConnection(), assets, identifiers, "quality-run",
+    )
+
+    assert mapping["FMP:BELFB"] == 7395
+    assert mapping["BELFB"] == 7395
 
 
 def test_silver_filters_instruments_but_keeps_bronze_and_maps_price_semantics(tmp_path):

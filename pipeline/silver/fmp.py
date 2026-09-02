@@ -1331,13 +1331,15 @@ def publish_assets(
     natural_to_id: dict[str, int] = {}
     with conn.cursor() as cur:
         for natural_key, group in identifier_candidates.groupby("natural_key", sort=False):
-            asset_id = None
+            current_asset_id = None
+            historical_asset_id = None
+            bridge_asset_id = None
             lookup_rows = sorted(
                 group.itertuples(index=False),
                 key=lambda row: (
                     0
                     if row.identifier_type == "ticker"
-                    and not pd.isna(row.valid_to)
+                    and pd.isna(row.valid_to)
                     else 1
                     if row.identifier_type == "ticker"
                     else 2
@@ -1366,6 +1368,8 @@ def publish_assets(
                         (row.identifier_type, str(row.identifier)),
                     )
                     found = cur.fetchone()
+                    if found and current_asset_id is None:
+                        current_asset_id = found[0]
                 else:
                     # Delisted primary tickers are stable only when the full
                     # validity interval matches the already-published episode.
@@ -1380,6 +1384,8 @@ def publish_assets(
                         ),
                     )
                     found = cur.fetchone()
+                    if found and historical_asset_id is None:
+                        historical_asset_id = found[0]
                     if found is None and row.identifier_type == "ticker":
                         # A declared ticker change first arrives while the old
                         # ticker is still the database's open identifier.  The
@@ -1394,9 +1400,19 @@ def publish_assets(
                             (str(row.identifier),),
                         )
                         found = cur.fetchone()
-                if found:
-                    asset_id = found[0]
-                    break
+                        if found:
+                            bridge_asset_id = found[0]
+                            break
+            # A still-open old leg is a newly declared transition and is the
+            # strongest identity evidence. Otherwise the established current
+            # ticker wins over potentially duplicated ancient history.
+            asset_id = (
+                bridge_asset_id
+                if bridge_asset_id is not None
+                else current_asset_id
+                if current_asset_id is not None
+                else historical_asset_id
+            )
             asset_row = asset_candidates[
                 asset_candidates["natural_key"].eq(natural_key)
             ].iloc[0]

@@ -243,6 +243,40 @@ def test_declared_ticker_change_reuses_and_closes_current_old_ticker():
     )
 
 
+def test_symbol_change_noop_does_not_bound_current_ticker(tmp_path):
+    _write(
+        tmp_path
+        / "stock/fmp/universe/profile-bulk/snapshot_date=2026-08-10/part=0/response.csv",
+        _csv([{
+            "symbol": "GOAI", "companyName": "Eva Live Inc.",
+            "exchange": "NASDAQ", "currency": "USD", "country": "US",
+            "isEtf": False, "isFund": False, "isAdr": False,
+            "isActivelyTrading": True, "industry": "Technology",
+            "ipoDate": "2023-01-01", "cik": "", "cusip": "", "isin": "",
+        }]),
+    )
+    _write(
+        tmp_path
+        / "stock/fmp/universe/symbol-change/snapshot_date=2026-08-10/response.json",
+        json.dumps([{
+            "date": "1969-12-31", "companyName": "Eva Live Inc.",
+            "oldSymbol": "GOAI", "newSymbol": "GOAI",
+        }]).encode(),
+    )
+
+    _, identifiers, _ = fmp.prepare_universe(
+        str(tmp_path), target_date=date(2026, 8, 10),
+    )
+
+    ticker = identifiers[
+        identifiers["identifier_type"].eq("ticker")
+        & identifiers["identifier"].eq("GOAI")
+    ]
+    assert len(ticker) == 1
+    assert pd.isna(ticker.iloc[0]["valid_to"])
+    assert ticker.iloc[0]["valid_from"] == date(2023, 1, 1)
+
+
 def test_silver_filters_instruments_but_keeps_bronze_and_maps_price_semantics(tmp_path):
     _universe(tmp_path)
     universe_path = (

@@ -418,6 +418,12 @@ def prepare_universe(
         changed = _parse_date(raw.get("date"))
         if not old or not new or not changed or new not in admitted:
             continue
+        # FMP occasionally emits a historical no-op row whose old and new
+        # symbols are identical (for example GOAI -> GOAI dated 1969-12-31).
+        # It is not a ticker transition and must not turn the current ticker
+        # into an impossible bounded interval.
+        if old == new:
+            continue
         suffix_reason = _non_equity_suffix_reason(old, symbol_names)
         if suffix_reason:
             excluded_change_identifiers += 1

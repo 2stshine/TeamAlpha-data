@@ -1326,10 +1326,6 @@ def publish_assets(
     with conn.cursor() as cur:
         for natural_key, group in identifier_candidates.groupby("natural_key", sort=False):
             asset_id = None
-            rendered_key = str(natural_key)
-            primary_ticker = rendered_key.removeprefix("FMP:")
-            if rendered_key.startswith("FMP:COMMODITY:"):
-                primary_ticker = rendered_key.removeprefix("FMP:COMMODITY:")
             lookup_rows = sorted(
                 group.itertuples(index=False),
                 key=lambda row: (
@@ -1347,13 +1343,9 @@ def publish_assets(
                 # Asset identity is anchored only by the validated ticker
                 # change chain. FMP historical CUSIP/ISIN values can be stale
                 # or recycled across unrelated securities.
-                if not (
-                    row.identifier_type in {"fx_pair", "commodity_symbol"}
-                    or (
-                        row.identifier_type == "ticker"
-                        and str(row.identifier) == primary_ticker
-                    )
-                ):
+                if row.identifier_type not in {
+                    "ticker", "fx_pair", "commodity_symbol",
+                }:
                     continue
                 if pd.isna(row.valid_to):
                     # A ticker may be reused by an unrelated issuer after a
@@ -1367,6 +1359,7 @@ def publish_assets(
                         "ORDER BY valid_from DESC LIMIT 1",
                         (row.identifier_type, str(row.identifier)),
                     )
+                    found = cur.fetchone()
                 else:
                     # Delisted primary tickers are stable only when the full
                     # validity interval matches the already-published episode.
@@ -1380,7 +1373,21 @@ def publish_assets(
                             row.valid_from, row.valid_to,
                         ),
                     )
-                found = cur.fetchone()
+                    found = cur.fetchone()
+                    if found is None and row.identifier_type == "ticker":
+                        # A declared ticker change first arrives while the old
+                        # ticker is still the database's open identifier.  The
+                        # bounded old leg is the authoritative bridge to that
+                        # existing asset; close it below instead of creating a
+                        # second asset that will collide on CUSIP/ISIN.
+                        cur.execute(
+                            "SELECT asset_id FROM asset_identifier "
+                            "WHERE source='FMP' AND identifier_type='ticker' "
+                            "AND identifier=%s AND valid_to IS NULL "
+                            "ORDER BY valid_from DESC LIMIT 1",
+                            (str(row.identifier),),
+                        )
+                        found = cur.fetchone()
                 if found:
                     asset_id = found[0]
                     break
@@ -1428,6 +1435,35 @@ def publish_assets(
 
         for row in identifier_candidates.itertuples(index=False):
             asset_id = natural_to_id[str(row.natural_key)]
+            if row.identifier_type == "ticker" and not pd.isna(row.valid_to):
+                cur.execute(
+                    "SELECT asset_id,valid_from FROM asset_identifier "
+                    "WHERE source=%s AND identifier_type='ticker' "
+                    "AND identifier=%s AND valid_to IS NULL "
+                    "ORDER BY valid_from DESC LIMIT 1",
+                    (row.source, str(row.identifier)),
+                )
+                existing_open = cur.fetchone()
+                if existing_open:
+                    if (
+                        existing_open[0] != asset_id
+                        or existing_open[1] > row.valid_to
+                    ):
+                        raise RuntimeError(
+                            "FMP ticker-change bridge conflict: "
+                            f"identifier={row.identifier}"
+                        )
+                    cur.execute(
+                        "UPDATE asset_identifier SET valid_to=%s, "
+                        "quality_run_id=%s, loaded_at=now() "
+                        "WHERE source=%s AND identifier_type='ticker' "
+                        "AND identifier=%s AND valid_to IS NULL",
+                        (
+                            row.valid_to, quality_run_id, row.source,
+                            str(row.identifier),
+                        ),
+                    )
+                    continue
             if row.identifier_type != "cik" and pd.isna(row.valid_to):
                 cur.execute(
                     "SELECT asset_id FROM asset_identifier "

@@ -48,6 +48,48 @@ class _ReusedTickerConnection:
         return self.cur
 
 
+class _TickerChangeCursor:
+    def __init__(self):
+        self._row = None
+        self.queries = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def execute(self, query, params=None):
+        normalized = " ".join(query.split())
+        self.queries.append((normalized, params))
+        self._row = None
+        if normalized.startswith(
+            "SELECT asset_id,valid_from FROM asset_identifier"
+        ):
+            if params[1] == "JAB":
+                self._row = (77, date(2026, 8, 5))
+        elif normalized.startswith("SELECT asset_id FROM asset_identifier"):
+            if "valid_from=%s AND valid_to=%s" in normalized:
+                self._row = None
+            else:
+                identifier = params[-1]
+                if identifier in {"JAB", "KYG500041036"}:
+                    self._row = (77,)
+        elif normalized.startswith("INSERT INTO asset("):
+            raise AssertionError("validated ticker change created a new asset")
+
+    def fetchone(self):
+        return self._row
+
+
+class _TickerChangeConnection:
+    def __init__(self):
+        self.cur = _TickerChangeCursor()
+
+    def cursor(self):
+        return self.cur
+
+
 def _write(path: Path, payload: bytes):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(payload)
@@ -154,6 +196,51 @@ def test_current_ticker_reuse_does_not_merge_with_closed_historical_asset():
         if query.startswith("SELECT asset_id FROM asset_identifier")
     )
     assert "valid_to IS NULL" in lookup
+
+
+def test_declared_ticker_change_reuses_and_closes_current_old_ticker():
+    assets = pd.DataFrame([{
+        "natural_key": "FMP:ATLQ",
+        "name": "JAB Acquisition Corp. I Class A",
+        "asset_type": "stock",
+        "instrument_type": "common_stock",
+        "exchange": "NASDAQ",
+        "currency": "USD",
+        "country_code": "US",
+        "base_currency": "USD",
+        "listed_from": date(2026, 8, 31),
+        "listed_to": None,
+    }])
+    identifiers = pd.DataFrame([
+        {
+            "natural_key": "FMP:ATLQ", "source": "FMP",
+            "identifier": "JAB", "identifier_type": "ticker",
+            "valid_from": date.min, "valid_to": date(2026, 8, 30),
+        },
+        {
+            "natural_key": "FMP:ATLQ", "source": "FMP",
+            "identifier": "ATLQ", "identifier_type": "ticker",
+            "valid_from": date(2026, 8, 31), "valid_to": None,
+        },
+        {
+            "natural_key": "FMP:ATLQ", "source": "FMP",
+            "identifier": "KYG500041036", "identifier_type": "isin",
+            "valid_from": date(2026, 8, 31), "valid_to": None,
+        },
+    ])
+    conn = _TickerChangeConnection()
+
+    mapping = fmp.publish_assets(conn, assets, identifiers, "quality-run")
+
+    assert mapping["FMP:ATLQ"] == 77
+    assert mapping["JAB"] == 77
+    assert mapping["ATLQ"] == 77
+    assert any(
+        query.startswith("UPDATE asset_identifier SET valid_to=%s")
+        and params[0] == date(2026, 8, 30)
+        and params[3] == "JAB"
+        for query, params in conn.cur.queries
+    )
 
 
 def test_silver_filters_instruments_but_keeps_bronze_and_maps_price_semantics(tmp_path):

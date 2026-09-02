@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timedelta
 
 from pipeline import daily_full, dart_silver_backfill_ecs
+from pipeline.silver_quality import freshness
 
 
 def _weekdays(from_day: str, to_day: str) -> list[str]:
@@ -24,7 +25,12 @@ def _weekdays(from_day: str, to_day: str) -> list[str]:
     return days
 
 
-def run(from_day: str, to_day: str) -> None:
+def run(
+    from_day: str,
+    to_day: str,
+    *,
+    resume_building: bool = False,
+) -> None:
     """Replay weekdays sequentially and certify total return on the last day.
 
     The contract must be healthy at entry.  Once the first raw partition
@@ -40,9 +46,31 @@ def run(from_day: str, to_day: str) -> None:
     previous_override = os.environ.get("PIPELINE_DATE")
     try:
         if not dart_silver_backfill_ecs.total_return_contract_ready(conn=lock):
-            raise RuntimeError(
-                "gap replay requires a CERTIFIED total-return contract at "
-                "entry; repair existing BUILDING coverage first"
+            if not resume_building:
+                raise RuntimeError(
+                    "gap replay requires a CERTIFIED total-return contract at "
+                    "entry; repair existing BUILDING coverage first"
+                )
+            report = freshness.total_return_contract_report(lock)
+            last_price_day = (
+                dart_silver_backfill_ecs.certified_krx_price_coverage_end(
+                    conn=lock,
+                )
+            )
+            first_replay_day = datetime.strptime(days[0], "%Y%m%d").date()
+            if (
+                report.get("status") != "BUILDING"
+                or report.get("coverage_end") != last_price_day.isoformat()
+                or first_replay_day <= last_price_day
+            ):
+                raise RuntimeError(
+                    "gap replay cannot safely resume the existing BUILDING "
+                    f"contract: report={report} first={first_replay_day}"
+                )
+            print(
+                "[gap-replay] resuming fenced BUILDING contract "
+                f"coverage_end={last_price_day.isoformat()}",
+                flush=True,
             )
         for index, day in enumerate(days):
             final = index == len(days) - 1
@@ -79,12 +107,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--from", dest="from_day", required=True)
     parser.add_argument("--to", dest="to_day", required=True)
+    parser.add_argument("--resume-building", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    run(args.from_day, args.to_day)
+    run(
+        args.from_day,
+        args.to_day,
+        resume_building=args.resume_building,
+    )
 
 
 if __name__ == "__main__":

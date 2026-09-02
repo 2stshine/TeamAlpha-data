@@ -171,6 +171,7 @@ def _main_locked(
     *,
     allow_deferred_total_return: bool = False,
     prepare_total_return: bool = True,
+    preview_total_return: bool = True,
     close_total_return: bool = True,
     assert_final_freshness: bool = True,
     collect_financials: bool = True,
@@ -402,11 +403,12 @@ def _main_locked(
                 publish=False,
                 certification_lock=certification_lock,
             )
-            dart_silver_backfill_ecs.preview_total_return_actions(
-                inherited_coverage_end,
-                root=root,
-                conn=certification_lock,
-            )
+            if preview_total_return:
+                dart_silver_backfill_ecs.preview_total_return_actions(
+                    inherited_coverage_end,
+                    root=root,
+                    conn=certification_lock,
+                )
             assert_epoch()
             print(
                 "[total-return] closing pre-existing uncertified coverage "
@@ -430,11 +432,12 @@ def _main_locked(
                 root=root,
                 certification_lock=certification_lock,
             )
-            dart_silver_backfill_ecs.preview_total_return_actions(
-                coverage_end,
-                root=root,
-                conn=certification_lock,
-            )
+            if preview_total_return:
+                dart_silver_backfill_ecs.preview_total_return_actions(
+                    coverage_end,
+                    root=root,
+                    conn=certification_lock,
+                )
             assert_epoch()
         if (
             not contract_ready_before_action_collection

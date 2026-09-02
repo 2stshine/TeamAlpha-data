@@ -46,7 +46,8 @@ def test_gap_replay_holds_one_epoch_and_only_certifies_final_day(monkeypatch):
             "20260814", lock,
             {
                 "allow_deferred_total_return": True,
-                "prepare_total_return": False,
+                "prepare_total_return": True,
+                "preview_total_return": False,
                 "close_total_return": False,
                 "assert_final_freshness": False,
                 "collect_financials": False,
@@ -57,7 +58,8 @@ def test_gap_replay_holds_one_epoch_and_only_certifies_final_day(monkeypatch):
             "20260817", lock,
             {
                 "allow_deferred_total_return": True,
-                "prepare_total_return": False,
+                "prepare_total_return": True,
+                "preview_total_return": False,
                 "close_total_return": False,
                 "assert_final_freshness": False,
                 "collect_financials": False,
@@ -69,6 +71,7 @@ def test_gap_replay_holds_one_epoch_and_only_certifies_final_day(monkeypatch):
             {
                 "allow_deferred_total_return": True,
                 "prepare_total_return": True,
+                "preview_total_return": True,
                 "close_total_return": True,
                 "assert_final_freshness": True,
                 "collect_financials": True,

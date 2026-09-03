@@ -6,7 +6,13 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from pipeline.silver import full_statements, investor_flows, ownership
+from pipeline.silver import (
+    full_statements,
+    industry_classifications,
+    investor_flows,
+    ownership,
+    short_balances,
+)
 
 
 def _write_json(path: Path, payload) -> str:
@@ -172,3 +178,75 @@ def test_alternative_schema_has_all_pit_tables():
     assert "CREATE TABLE IF NOT EXISTS ownership_disclosure_event" in migration
     assert "CREATE TABLE IF NOT EXISTS investor_flow_daily" in migration
     assert "CHECK (available_date = filed + 1)" in migration
+
+    migration_014 = (
+        Path(__file__).resolve().parents[2]
+        / "pipeline/silver_quality/migrations/014_industry_short_balance.sql"
+    ).read_text(encoding="utf-8")
+    assert "CREATE TABLE IF NOT EXISTS industry_classification_observation" in migration_014
+    assert "CREATE TABLE IF NOT EXISTS short_position_balance_observation" in migration_014
+    assert migration_014.count("CHECK (available_at = observed_at)") == 2
+
+
+def test_industry_observation_is_not_backdated(tmp_path: Path):
+    payload = {
+        "status": "000",
+        "corp_code": "00126380",
+        "stock_code": "005930",
+        "induty_code": "264",
+    }
+    raw = json.dumps(payload).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    root = (
+        tmp_path / "company_profiles/dart/corp=005930" / f"sha256={digest}"
+        / "observed_at=2026-09-03T120000p0000"
+    )
+    root.mkdir(parents=True)
+    response = root / "response.json"
+    response.write_bytes(raw)
+    (root / "manifest.json").write_text(json.dumps({
+        "schema_version": "dart-company-profile-observation-v1",
+        "sha256": digest,
+        "observed_at": "2026-09-03T12:00:00+00:00",
+    }), encoding="utf-8")
+
+    frame, stats = industry_classifications.prepare(files=[str(response)])
+
+    assert stats["rejected_rows"] == 0
+    assert frame.iloc[0]["natural_key"] == "00126380"
+    assert frame.iloc[0]["industry_code"] == "264"
+    assert frame.iloc[0]["effective_from"] is None
+    assert frame.iloc[0]["available_at"].isoformat() == "2026-09-03T12:00:00+00:00"
+
+
+def test_short_balance_uses_first_observed_vintage(tmp_path: Path):
+    source_frame = pd.DataFrame([{
+        "일자": "2020-01-02",
+        "종목코드": "005930",
+        "시장": "코스피",
+        "공매도순보유잔고수량": "1,000",
+        "상장주식수": "10,000",
+        "공매도순보유잔고금액": "50,000,000",
+        "시가총액": "500,000,000",
+        "공매도순보유잔고비중": "10.0%",
+    }])
+    raw = source_frame.to_csv(index=False).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    root = tmp_path / f"short_balances/krx/sha256={digest}"
+    root.mkdir(parents=True)
+    source = root / "source.csv"
+    source.write_bytes(raw)
+    (root / "manifest.json").write_text(json.dumps({
+        "schema_version": "krx-short-balance-export-v1",
+        "source": "KRX_DATA_MARKETPLACE_AUTHORIZED_EXPORT",
+        "authorization_id": "contract-456",
+        "sha256": digest,
+        "observed_at": "2026-09-03T12:00:00+00:00",
+    }), encoding="utf-8")
+
+    frame, _ = short_balances.prepare(files=[str(source)])
+
+    assert frame.iloc[0]["position_date"] == date(2020, 1, 2)
+    assert frame.iloc[0]["available_at"].isoformat() == "2026-09-03T12:00:00+00:00"
+    assert frame.iloc[0]["short_balance_quantity"] == 1000
+    assert frame.iloc[0]["short_balance_ratio"] == 10

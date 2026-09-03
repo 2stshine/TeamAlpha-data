@@ -42,7 +42,9 @@ forward label이다. bitemporal action vintage가 없으므로 당시 이용 가
 | DART 재무 | BS·IS ~3,071 | 2015-03-31 ~ | 표준 핵심계정 |
 | DART 전체 재무 원계정 | BS·IS·CIS·CF·SCE, CFS/OFS | 2015 ~ | 인증 백필 후 사용; 계정 의미는 팩터별 고정 필요 |
 | DART 지분공시 | 임원·주요주주·5% 보유 | 공식 API 제공기간 | 공시 이벤트이며 실제 체결 테이프가 아님 |
+| DART 업종코드 | 현재 기업개황 snapshot | 최초 인증 관측 이후 | 과거 업종 효력일은 제공되지 않음 |
 | KRX 투자자 수급 | 투자자유형별 종목 일별 | 계약 파일 범위 | 구매·활용승인 export만 적재 |
+| KRX 공매도 순보유잔고 | 종목별 수량·금액·비중 | 2016-06-30 ~ | 승인된 관측 vintage만; 보고기준 미만 잔고는 포함되지 않음 |
 | DART 배당 | ~1,903 | 2013-09-30 ~ | 정기보고서 |
 | FMP 재무 | BS·IS·CF ~8,490 | 2015 ~ | **벤더 신뢰(미검증)** |
 
@@ -50,8 +52,8 @@ forward label이다. bitemporal action vintage가 없으므로 당시 이용 가
 
 - **유동주식수(free float)** — `shares`는 총상장주식뿐
 - **호가(order book / bid-ask)**
-- **공매도 / 대차(short / securities lending)**
-- **PIT 과거 업종분류(sector history)** — 현재 시점 업종만 가능(미적재)
+- **최초 관측 이전 PIT 과거 업종분류** — 현재 DART 업종을 과거에 소급 적용 금지
+- **최초 승인 관측 이전 공매도 잔고 vintage 및 대차** — 오늘 받은 수정본을 과거에 소급 적용 금지
 
 > 위 항목이 필요한 팩터는 **만들 수 없다**(대체 필드로 우회 금지). 필요 시 벤더 조달 후 추가.
 
@@ -99,6 +101,15 @@ KRX 총수익의 배당 적용일은 인증 rebuild가 남긴 append-only
   증명하는 `authorization_id`가 있는 원본만 받는다. 웹 화면 자동수집 원본은 금지한다.
 - 세 테이블 모두 `quality_run_id`가 `CERTIFIED`인 행만 연구 입력으로 사용하고,
   `available_date/available_at <= :as_of`를 반드시 적용한다.
+
+### industry_classification_observation / short_position_balance_observation
+
+- DART 기업개황의 `induty_code`는 현재 분류만 제공하므로 최초 수집시각을
+  `available_at`으로 저장한다. 과거 시점 업종중립화에 현재 코드를 소급 적용하지 않는다.
+- KRX 공매도 순보유잔고는 보고의무 기준을 넘은 투자자의 잔고를 종목별로 합산한
+  데이터다. 보고 지연과 사후 정정이 있어 원본을 실제 받은 시각별로 보존한다.
+- 두 테이블 모두 과거 날짜가 적힌 파일을 오늘 받았다면 그 행은 오늘부터만
+  PIT-safe하다. 향후 일별 snapshot을 누적하면 prospective 연구 구간이 생긴다.
 
 ### corporate_action / dividend_history
 | 필드 | 의미 | 주의 |
@@ -148,6 +159,8 @@ ORDER BY asset_id, period_end, fs_type, metric,
 5. **극단 수익률은 대부분 진짜:** 동전주 ±수백% 등은 실제 이동 → **winsorize·유동성 필터 필수**(데이터 오류 아님).
 6. **배당 적용일 재추정 금지:** `record_date`로 배당락일을 다시 계산하는 휴리스틱은 인증 계약이 아니다. `dividend_event_resolution`에 고정된 적용일만 신뢰한다.
 7. **직접 배당 feature 금지:** `corporate_action`/`dividend_history`는 최신 정정 기준이며 bitemporal PIT 이력이 아니다.
+8. **현재 업종 소급 금지:** DART `induty_code` 관측 이전 날짜의 업종으로 간주하지 않는다.
+9. **공매도 잔고는 전시장 잔고가 아님:** 법정 보고기준 미만 포지션은 집계에 없고 후속 정정도 가능하다.
 
 ---
 
@@ -178,6 +191,8 @@ FMP 재무 정확성, 위 "제공 안 함" 항목.
 | 가치·퀄리티·투자·발생액(KR) | DART 핵심 + 인증된 `fundamental_statement_line` + `market_cap` | CFS/OFS 혼용, 이름 기반 임의 계정합산, FMP 혼용 |
 | 지분변화(KR) | `ownership_disclosure_event` | 체결일·체결가로 해석 금지 |
 | 외국인·기관수급(KR) | 인증된 `investor_flow_daily` | 무허가 웹수집, 가용시각 이전 사용 |
+| 업종중립화(KR) | `industry_classification_observation` | 최초 관측 이전으로 소급 금지 |
+| 공매도 잔고(KR) | `short_position_balance_observation` | 전체 시장 short interest로 해석 금지, 관측시각 이전 사용 금지 |
 | 유동성·규모 | `trading_value`, `market_cap`, `shares` | `shares`≠유동주식 |
 | US 팩터 | FMP price/fundamental | 벤더 신뢰 전제 |
 | float 가중·공매도·호가 기반 | — | **불가(미제공)** |

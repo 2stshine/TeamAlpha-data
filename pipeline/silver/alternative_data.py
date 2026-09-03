@@ -1,8 +1,8 @@
 """전체 재무·지분공시·승인된 투자자수급을 원자적으로 Silver에 적재한다.
 
 각 Bronze 원문은 먼저 메모리 후보로 변환한다. 모든 자연키가 기존 Silver 자산에
-정확히 매핑되고 입력 계약을 통과한 경우에만 세 데이터셋을 한 transaction으로
-upsert한다. 한 데이터셋이라도 실패하면 이번 run의 변경 전체를 rollback한다.
+정확히 매핑되고 입력 계약을 통과한 경우에만 요청 데이터셋을 한 transaction으로
+upsert한다. 하나라도 실패하면 이번 run의 변경 전체를 rollback한다.
 """
 from __future__ import annotations
 
@@ -14,7 +14,13 @@ from collections.abc import Iterable
 import pandas as pd
 
 from pipeline.common import db
-from pipeline.silver import full_statements, investor_flows, ownership
+from pipeline.silver import (
+    full_statements,
+    industry_classifications,
+    investor_flows,
+    ownership,
+    short_balances,
+)
 from pipeline.silver_quality import migrate, repository
 from pipeline.silver_quality.models import CheckResult, CheckStatus, Severity
 
@@ -141,6 +147,8 @@ def publish_files(
     full_statement_files: list[str] | None = None,
     ownership_files: list[str] | None = None,
     investor_flow_files: list[str] | None = None,
+    industry_files: list[str] | None = None,
+    short_balance_files: list[str] | None = None,
     conn=None,
 ) -> dict:
     """Transform and atomically publish the explicitly supplied Bronze files."""
@@ -148,6 +156,8 @@ def publish_files(
         "fundamental_statement_line": sorted(set(full_statement_files or [])),
         "ownership_disclosure_event": sorted(set(ownership_files or [])),
         "investor_flow_daily": sorted(set(investor_flow_files or [])),
+        "industry_classification_observation": sorted(set(industry_files or [])),
+        "short_position_balance_observation": sorted(set(short_balance_files or [])),
     }
     requested = {name: files for name, files in requested.items() if files}
     if not requested:
@@ -180,6 +190,20 @@ def publish_files(
             frames["investor_flow_daily"], stats["investor_flow_daily"] = (
                 investor_flows.prepare(files=requested["investor_flow_daily"])
             )
+        if "industry_classification_observation" in requested:
+            (
+                frames["industry_classification_observation"],
+                stats["industry_classification_observation"],
+            ) = industry_classifications.prepare(
+                files=requested["industry_classification_observation"],
+            )
+        if "short_position_balance_observation" in requested:
+            (
+                frames["short_position_balance_observation"],
+                stats["short_position_balance_observation"],
+            ) = short_balances.prepare(
+                files=requested["short_position_balance_observation"],
+            )
         results = _transform_checks(frames, stats, requested)
         blocking = [result for result in results if result.blocks_publish]
         if blocking:
@@ -189,7 +213,11 @@ def publish_files(
             )
 
         ticker_keys: set[str] = set()
-        for name in ("fundamental_statement_line", "investor_flow_daily"):
+        for name in (
+            "fundamental_statement_line",
+            "investor_flow_daily",
+            "short_position_balance_observation",
+        ):
             frame = frames.get(name)
             if frame is not None and not frame.empty:
                 ticker_keys.update(frame["natural_key"].astype(str))
@@ -197,10 +225,14 @@ def publish_files(
             connection, ticker_keys, source="KRX", identifier_type="ticker",
         )
         ownership_frame = frames.get("ownership_disclosure_event")
+        industry_frame = frames.get("industry_classification_observation")
+        corp_keys: set[str] = set()
+        for frame in (ownership_frame, industry_frame):
+            if frame is not None and not frame.empty:
+                corp_keys.update(frame["natural_key"].astype(str))
         corp_map = _asset_map(
             connection,
-            [] if ownership_frame is None or ownership_frame.empty
-            else ownership_frame["natural_key"].astype(str),
+            corp_keys,
             source="DART",
             identifier_type="corp_code",
         )
@@ -210,6 +242,8 @@ def publish_files(
             "fundamental_statement_line": 0,
             "ownership_disclosure_event": 0,
             "investor_flow_daily": 0,
+            "industry_classification_observation": 0,
+            "short_position_balance_observation": 0,
         }
         with connection.transaction():
             if "fundamental_statement_line" in frames:
@@ -226,6 +260,24 @@ def publish_files(
                 published["investor_flow_daily"] = investor_flows.publish(
                     connection, frames["investor_flow_daily"], ticker_map,
                     context.run_id,
+                )
+            if "industry_classification_observation" in frames:
+                published["industry_classification_observation"] = (
+                    industry_classifications.publish(
+                        connection,
+                        frames["industry_classification_observation"],
+                        corp_map,
+                        context.run_id,
+                    )
+                )
+            if "short_position_balance_observation" in frames:
+                published["short_position_balance_observation"] = (
+                    short_balances.publish(
+                        connection,
+                        frames["short_position_balance_observation"],
+                        ticker_map,
+                        context.run_id,
+                    )
                 )
             _save_metrics(connection, context.run_id, frames)
             repository.finish_run(
@@ -271,11 +323,15 @@ def main() -> None:
     parser.add_argument("--full-statement-file", action="append")
     parser.add_argument("--ownership-file", action="append")
     parser.add_argument("--investor-flow-file", action="append")
+    parser.add_argument("--industry-file", action="append")
+    parser.add_argument("--short-balance-file", action="append")
     args = parser.parse_args()
     publish_files(
         full_statement_files=args.full_statement_file,
         ownership_files=args.ownership_file,
         investor_flow_files=args.investor_flow_file,
+        industry_files=args.industry_file,
+        short_balance_files=args.short_balance_file,
     )
 
 

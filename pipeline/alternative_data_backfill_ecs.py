@@ -1,8 +1,8 @@
 """ECS에서 연구용 대체 입력의 Bronze 수집과 Silver 적재를 수행한다.
 
-OpenDART 전체 재무제표·지분공시는 공식 API로 수집한다. KRX 투자자수급은 이
-명령이 웹에서 수집하지 않으며, 별도로 승인된 export를 Bronze에 등록한 뒤
-``silver`` phase에서만 적재한다.
+OpenDART 전체 재무제표·지분공시·현재 업종은 공식 API로 수집한다. KRX
+투자자수급과 공매도 잔고는 이 명령이 웹에서 수집하지 않으며, 별도로 승인된
+export를 Bronze에 등록한 뒤 ``silver`` phase에서만 적재한다.
 """
 from __future__ import annotations
 
@@ -11,7 +11,11 @@ import os
 
 import boto3
 
-from pipeline.bronze import dart_full_statements, dart_ownership
+from pipeline.bronze import (
+    dart_company_profiles,
+    dart_full_statements,
+    dart_ownership,
+)
 from pipeline.silver import alternative_data
 from pipeline.silver_quality import migrate
 
@@ -27,7 +31,7 @@ def _list_response_uris(bucket: str, prefix: str) -> list[str]:
             for item in page.get("Contents", [])
             if item["Key"].endswith("/response.json")
             or (
-                prefix == "investor_flows/krx/"
+                prefix in {"investor_flows/krx/", "short_balances/krx/"}
                 and "/source." in item["Key"]
                 and not item["Key"].endswith("/manifest.json")
             )
@@ -63,6 +67,18 @@ def collect_ownership(
     )
 
 
+def collect_industries(
+    *,
+    refresh_existing: bool = False,
+    max_corps: int | None = None,
+) -> list[str]:
+    return dart_company_profiles.run(
+        "s3",
+        refresh_existing=refresh_existing,
+        max_corps=max_corps,
+    )
+
+
 def publish_existing() -> dict:
     bucket = os.environ.get("S3_BRONZE_BUCKET")
     if not bucket:
@@ -70,13 +86,23 @@ def publish_existing() -> dict:
     full_files = _list_response_uris(bucket, "financials/dart_statement_lines/")
     ownership_files = _list_response_uris(bucket, "ownership/dart/")
     investor_files = _list_response_uris(bucket, "investor_flows/krx/")
-    if not full_files and not ownership_files and not investor_files:
+    industry_files = _list_response_uris(bucket, "company_profiles/dart/")
+    short_balance_files = _list_response_uris(bucket, "short_balances/krx/")
+    if not any((
+        full_files,
+        ownership_files,
+        investor_files,
+        industry_files,
+        short_balance_files,
+    )):
         raise RuntimeError("no alternative-input Bronze objects found")
     migrate.run()
     return alternative_data.publish_files(
         full_statement_files=full_files,
         ownership_files=ownership_files,
         investor_flow_files=investor_files,
+        industry_files=industry_files,
+        short_balance_files=short_balance_files,
     )
 
 
@@ -84,7 +110,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--phase",
-        choices=("bronze-full", "bronze-ownership", "silver", "full"),
+        choices=(
+            "bronze-full",
+            "bronze-ownership",
+            "bronze-industry",
+            "silver",
+            "full",
+        ),
         required=True,
     )
     parser.add_argument("--from", dest="from_year", type=int, default=2015)
@@ -107,6 +139,11 @@ def main() -> None:
         )
     if args.phase in {"bronze-ownership", "full"}:
         collect_ownership(
+            refresh_existing=args.refresh_existing,
+            max_corps=args.max_corps,
+        )
+    if args.phase in {"bronze-industry", "full"}:
+        collect_industries(
             refresh_existing=args.refresh_existing,
             max_corps=args.max_corps,
         )

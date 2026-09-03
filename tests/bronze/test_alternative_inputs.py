@@ -5,9 +5,11 @@ import pandas as pd
 import pytest
 
 from pipeline.bronze import (
+    dart_company_profiles,
     dart_full_statements,
     dart_ownership,
     krx_investor_flows,
+    krx_short_balances,
 )
 
 
@@ -64,7 +66,7 @@ def test_krx_export_requires_provenance_and_flow_columns(tmp_path: Path):
 
 @pytest.mark.parametrize(
     "module",
-    [dart_full_statements, dart_ownership],
+    [dart_full_statements, dart_ownership, dart_company_profiles],
 )
 def test_dart_collectors_fail_before_request_without_api_key(
     monkeypatch, module,
@@ -72,3 +74,23 @@ def test_dart_collectors_fail_before_request_without_api_key(
     monkeypatch.setenv("DART_API_KEY", "  ")
     with pytest.raises(RuntimeError, match="DART_API_KEY is required"):
         module._api_key()
+
+
+def test_short_balance_export_requires_market_and_balance_fields():
+    raw = pd.DataFrame([{
+        "일자": "2026-08-31",
+        "종목코드": "005930",
+        "시장": "코스피",
+        "공매도순보유잔고수량": 100,
+        "공매도순보유잔고비중": 0.01,
+    }]).to_csv(index=False).encode("utf-8")
+
+    assert krx_short_balances.validate_export(raw, ".csv")["row_count"] == 1
+
+    missing_market = pd.DataFrame([{
+        "일자": "2026-08-31",
+        "종목코드": "005930",
+        "공매도순보유잔고수량": 100,
+    }]).to_csv(index=False).encode("utf-8")
+    with pytest.raises(ValueError, match="market"):
+        krx_short_balances.validate_export(missing_market, ".csv")

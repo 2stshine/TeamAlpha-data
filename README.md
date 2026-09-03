@@ -205,10 +205,21 @@ ownership/dart/
     sha256=<원문해시>/response.json
     latest.json
 
+company_profiles/dart/corp=<ticker>/
+  sha256=<원문해시>/
+    response.json
+    manifest.json  # 최초 관측시각·DART 업종코드
+  latest.json
+
 investor_flows/krx/
   sha256=<원문해시>/
     source.csv
     manifest.json  # 구매·활용승인 ID 및 SHA-256
+
+short_balances/krx/
+  sha256=<원문해시>/
+    source.csv
+    manifest.json  # 구매·활용승인 ID·최초 관측시각·SHA-256
 
 corporate_actions/
   dart/
@@ -306,6 +317,8 @@ fundamental
 fundamental_statement_line  # DART 전체 숫자 원계정
 ownership_disclosure_event  # 임원·주요주주·5% 보유 공시
 investor_flow_daily         # 승인된 KRX 투자자별 종목 수급
+industry_classification_observation  # 관측시각이 고정된 DART 현재 업종
+short_position_balance_observation   # 승인된 KRX 공매도 잔고 vintage
 corporate_action
 dividend_history  # corporate_action의 cash_dividend 조회 view
 dart_action_snapshot_contract  # v5 action/source-evidence snapshot 계약
@@ -325,6 +338,8 @@ asset
   -> fundamental_statement_line  # DART BS/IS/CIS/CF/SCE 원계정
   -> ownership_disclosure_event  # DART 지분 공시
   -> investor_flow_daily         # KRX 투자자별 일별 수급
+  -> industry_classification_observation  # DART 현재 업종 관측 이력
+  -> short_position_balance_observation   # KRX 공매도 잔고 관측 이력
   -> corporate_action  # DART/FMP 배당·분할·자본변동
 ```
 
@@ -337,6 +352,8 @@ asset
 | `fundamental_statement_line` | DART 전체 숫자 원계정 및 공시 revision | `(asset_id, source, filing_id, fs_type, line_key)` |
 | `ownership_disclosure_event` | 임원·주요주주·5% 보유 공시 이벤트 | `(asset_id, source, event_key)` |
 | `investor_flow_daily` | 승인된 KRX 투자자유형별 종목 일별 수급 | `(asset_id, source, trade_date, market, investor_type)` |
+| `industry_classification_observation` | DART 현재 업종코드의 관측 vintage | `(asset_id, source, taxonomy, observation_key)` |
+| `short_position_balance_observation` | 승인된 KRX 종목별 공매도 잔고 vintage | `(asset_id, source, position_date, market, observation_key)` |
 | `corporate_action` | 배당·분할·증자·감자 등 기업행사 | `(asset_id, source, action_key)` |
 | `dividend_source_receipt` | DART 현금배당 접수 원문·정정 family·PIT 매핑의 append-only 영수증 | `(quality_run_id, receipt_no)` |
 | `dart_action_snapshot_contract` | v5 원문·receipt·게시 action·scale evidence snapshot | `quality_run_id` |
@@ -581,9 +598,12 @@ uv run python -m pipeline.bronze.financials_full \
   --scope 004990:2015:11011:CFS --dest s3
 uv run python -m pipeline.bronze.dart_full_statements --from 2015 --to 2026 --dest s3
 uv run python -m pipeline.bronze.dart_ownership --dest s3
+uv run python -m pipeline.bronze.dart_company_profiles --dest s3
 # KRX 웹 자동수집 금지: 구매·활용승인 파일만 등록
 uv run python -m pipeline.bronze.krx_investor_flows \
   --source-file ./authorized.csv --authorization-id <계약식별자> --dest s3
+uv run python -m pipeline.bronze.krx_short_balances \
+  --source-file ./authorized-short.csv --authorization-id <계약식별자> --dest s3
 # 운영 S3 기업행사 직접 publication은 금지됩니다. pipeline.daily_full의
 # fail-closed invalidation -> recertification 경로만 사용합니다.
 uv run python -m pipeline.bronze.dividends --from 2015 --to 2026 --dest s3 --reports annual
@@ -612,8 +632,9 @@ uv run python -m pipeline.alternative_data_backfill_ecs \
 uv run python -m pipeline.alternative_data_backfill_ecs --phase silver
 ```
 
-OpenDART 수집은 content-addressed pointer로 재개된다. 투자자수급 수집기는 KRX
-웹페이지를 스크레이핑하지 않으며 승인 원본과 취득근거가 없으면 fail-closed한다.
+OpenDART 수집은 content-addressed pointer로 재개된다. 투자자수급·공매도 수집기는
+KRX 웹페이지를 스크레이핑하지 않으며 승인 원본과 취득근거가 없으면 fail-closed한다.
+현재 DART 업종과 오늘 받은 과거 공매도 파일은 최초 관측시각 이전으로 소급하지 않는다.
 
 원자재 28종 전체 백필은 GitHub Actions의
 [`commodity-backfill.yml`](.github/workflows/commodity-backfill.yml)을 수동 실행할

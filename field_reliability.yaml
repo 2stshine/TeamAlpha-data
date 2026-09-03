@@ -12,7 +12,9 @@ coverage:
   dart_fundamental: {from: "2015-03-31"}
   dart_full_statement_lines: {from: "2015-01-01", availability: "after certified backfill"}
   dart_ownership_disclosures: {availability: "after certified backfill"}
+  dart_industry_observation: {availability: "current snapshot forward; no historical effective dates"}
   krx_investor_flow: {availability: "licensed export only"}
+  krx_short_balance: {from: "2016-06-30", availability: "licensed observed vintages only"}
   dart_dividend: {from: "2013-09-30"}
   fmp_fundamental: {from: "2015-01-02"}
 
@@ -20,9 +22,9 @@ coverage:
 not_provided:
   - free_float_shares
   - order_book
-  - short_selling
+  - historical_short_balance_vintages_before_first_authorized_observation
   - securities_lending
-  - sector_classification_pit
+  - historical_sector_classification_pit_before_first_dart_observation
 
 sources:
   krx: {trust: internally_validated}
@@ -129,6 +131,21 @@ tables:
     unsafe_for: [unlicensed_scraped_inputs, same_close_use_before_available_at]
     note: "Populated only from a purchased/approved KRX export with authorization_id and source SHA-256."
 
+  industry_classification_observation:
+    pit_field: available_at
+    validated: conditional
+    safe_for: [prospective_industry_grouping, current_cross_section_grouping]
+    unsafe_for: [retroactive_historical_sector_neutralization_before_available_at]
+    note: "DART company overview current induty_code; the API does not provide a historical effective date."
+
+  short_position_balance_observation:
+    pit_field: available_at
+    validated: conditional
+    provenance_required: KRX_DATA_MARKETPLACE_AUTHORIZED_EXPORT
+    safe_for: [prospective_short_balance_features, source_audit]
+    unsafe_for: [retroactive_use_before_observed_at, interpreting_as_total_market_short_interest]
+    note: "KRX aggregates reportable short net positions and may receive later corrections; first-observed vintage is preserved."
+
   corporate_action:
     feature_pit_certified: false
     action_vintage:
@@ -201,6 +218,8 @@ factor_guidance:
   value_quality_kr: {use: [fundamental.dart.bs, fundamental.dart.is, fundamental_statement_line, market_cap], avoid: [unfrozen_account_name_mapping, fmp_mixing]}
   ownership_change_kr: {use: [ownership_disclosure_event], note: "disclosure timing only; not exact trade execution"}
   foreign_flow_kr: {use: [investor_flow_daily], note: "only after licensed-export certification"}
+  sector_neutralization_kr: {use: [industry_classification_observation], note: "only on/after the observation available_at"}
+  short_balance_kr: {use: [short_position_balance_observation], note: "reported-threshold aggregate, not complete market short interest"}
   liquidity_size: {use: [trading_value, market_cap, shares], note: "shares != free float"}
   us_factors: {use: [fmp_price, fmp_fundamental], note: "vendor-trusted"}
   float_short_orderbook_based: {buildable: false, reason: not_provided}

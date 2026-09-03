@@ -12,6 +12,8 @@ erDiagram
     asset ||--o{ fundamental_statement_line : reports
     asset ||--o{ ownership_disclosure_event : discloses
     asset ||--o{ investor_flow_daily : trades
+    asset ||--o{ industry_classification_observation : classified_as
+    asset ||--o{ short_position_balance_observation : short_balance
     asset ||--o{ corporate_action : has
 ```
 
@@ -127,6 +129,19 @@ OpenDART `elestock`과 `majorstock`의 임원·주요주주 및 5% 보유 공시
 매도·매수·순매수 거래량/거래대금을 저장한다. 원본 SHA-256과 인증 DQ run을
 보존하며, 매수-매도=순매수 산술이 맞지 않으면 전체 적재를 rollback한다.
 
+## 4e. industry_classification_observation
+
+DART 기업개황의 현재 `induty_code`를 최초로 관측한 시각과 함께 저장한다. DART API는
+과거 업종 효력일을 주지 않으므로 `effective_from`을 추정하지 않는다. 연구 시점에는
+반드시 `available_at <= as_of`인 최신 관측만 사용한다.
+
+## 4f. short_position_balance_observation
+
+승인된 KRX 원본의 종목별 공매도 순보유잔고 수량·금액·비중을 원본 SHA와 최초
+관측시각별로 저장한다. 기준일이 오래됐더라도 오늘 처음 받은 파일은 오늘 이전
+시점에서 사용할 수 없다. 이 값은 법정 보고기준을 넘은 포지션 합계이며 전체 시장의
+완전한 short interest가 아니다.
+
 ## 5. corporate_action
 
 | 컬럼 | 설명 |
@@ -217,6 +232,8 @@ Critical/Error 조건을 DB에서도 차단한다. 중복·참조 무결성은 �
 | DART 전체 재무 원계정 | `financials/dart_statement_lines` |
 | DART 임원·주요주주·5% 보유 | `ownership/dart` |
 | KRX 투자자별 종목 수급 | `investor_flows/krx` 승인 export |
+| DART 현재 업종코드 | `company_profiles/dart` |
+| KRX 공매도 순보유잔고 | `short_balances/krx` 승인 export |
 | FMP 재무 | `financials/fmp` bulk·종목별 원문 |
 | 국내 기업행사 | `corporate_actions/dart` |
 | 국내 배당 지표 | `dividends/dart/alot-matter` |

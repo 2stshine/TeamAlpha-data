@@ -36,6 +36,13 @@ class DartRequestError(RuntimeError):
     """Secret-free OpenDART request failure."""
 
 
+def _api_key() -> str:
+    value = os.environ.get("DART_API_KEY", "").strip()
+    if not value:
+        raise RuntimeError("DART_API_KEY is required")
+    return value
+
+
 def _list_major_uris(base: str, from_year: int, to_year: int) -> list[str]:
     if base.startswith("s3://"):
         import boto3
@@ -110,7 +117,7 @@ def _request_scope(
     tries: int = 4,
 ) -> tuple[bytes, dict]:
     params = {
-        "crtfc_key": os.environ["DART_API_KEY"],
+        "crtfc_key": _api_key(),
         "corp_code": corp_code,
         "bsns_year": str(year),
         "reprt_code": report_code,

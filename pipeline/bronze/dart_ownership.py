@@ -35,6 +35,13 @@ class DartOwnershipRequestError(RuntimeError):
     """Secret-free OpenDART ownership request failure."""
 
 
+def _api_key() -> str:
+    value = os.environ.get("DART_API_KEY", "").strip()
+    if not value:
+        raise RuntimeError("DART_API_KEY is required")
+    return value
+
+
 def _request(
     endpoint_name: str,
     endpoint_url: str,
@@ -43,7 +50,7 @@ def _request(
     tries: int = 4,
 ) -> tuple[bytes, dict]:
     params = {
-        "crtfc_key": os.environ["DART_API_KEY"],
+        "crtfc_key": _api_key(),
         "corp_code": corp_code,
     }
     failure: tuple[str, int | None] | None = None

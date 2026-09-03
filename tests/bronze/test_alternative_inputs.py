@@ -4,7 +4,11 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from pipeline.bronze import dart_full_statements, krx_investor_flows
+from pipeline.bronze import (
+    dart_full_statements,
+    dart_ownership,
+    krx_investor_flows,
+)
 
 
 def test_full_statement_scope_discovery_uses_only_real_major_account_scopes(
@@ -56,3 +60,15 @@ def test_krx_export_requires_provenance_and_flow_columns(tmp_path: Path):
     }]).to_csv(index=False).encode("utf-8")
     with pytest.raises(ValueError, match="volume_or_value_fields"):
         krx_investor_flows.validate_export(missing_flow, ".csv")
+
+
+@pytest.mark.parametrize(
+    "module",
+    [dart_full_statements, dart_ownership],
+)
+def test_dart_collectors_fail_before_request_without_api_key(
+    monkeypatch, module,
+):
+    monkeypatch.setenv("DART_API_KEY", "  ")
+    with pytest.raises(RuntimeError, match="DART_API_KEY is required"):
+        module._api_key()
